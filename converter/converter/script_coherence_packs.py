@@ -757,21 +757,11 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     return False
 
 
-# The server-attr write the pack injects, in the shapes it has emitted:
-#   - legacy literal: ``<recv>:SetAttribute("has" .. itemName, true)``
-#   - ``_flag`` local: ``local _flag = "has" .. itemName`` followed by
-#     ``<recv>:SetAttribute(_flag, true)``
-#   - CURRENT sanitized form: ``local _flag = "has" .. (itemName:gsub(...))``
-#     (the name is sanitized to ``[%w_]`` before concatenation; see
-#     ``core.flag_names``).
-# Matching the ``"has" .. itemName`` concat directly (rather than any
-# ``SetAttribute("has"...)``) avoids false-skipping Pickups that init
-# unrelated has-flags before firing. The ``_flag = "has" .. itemName``
-# assignment is the unique marker of the rewrite/inject output; without
-# this alternative the guard never recognizes an already-converted Pickup,
-# so re-running the pack appends duplicate ``has<X>`` blocks. The trailing
-# ``itemName`` may now be wrapped in the ``(itemName:gsub(...))`` sanitizer,
-# so the ``itemName`` token is matched with an optional ``(`` prefix.
+# Idempotency marker: matches the ``"has" .. itemName`` concat (in both the
+# direct SetAttribute and the ``_flag = "has" .. itemName`` shapes) so a
+# re-run recognizes an already-converted Pickup and doesn't append duplicate
+# ``has<X>`` blocks. ``itemName`` may be wrapped in ``(itemName:gsub(...))``
+# (name sanitized via ``core.flag_names``), so an optional ``(`` prefix is allowed.
 _PICKUP_HAS_ATTR_INJECTED_RE = re.compile(
     r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*\(?\s*itemName\b'
     r'|'
@@ -1805,17 +1795,6 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
     return fixes
 
 
-# NOTE: A previous ``turret_spawn_from_weapon_cframe`` pack rewrote
-# ``spawnAt(..., getCFrame(tOrigin))`` to source from ``tWeapon`` instead.
-# That fix is now obsolete — replaced by a generic converter-level wrap
-# in ``scene_converter._wrap_geometry_with_children_into_model``: when a
-# Unity node has both visual geometry AND child transforms, the converter
-# emits a ``Model`` with the geometry as an inner child, so
-# ``Model:PivotTo`` propagates rotation to all descendants (including
-# ``tOrigin``). The Turret script's ``getCFrame(tOrigin)`` then returns
-# the correctly-aimed CFrame without a per-game patch.
-
-
 # ---------------------------------------------------------------------------
 # Pack: door_module_player_to_attribute
 # ---------------------------------------------------------------------------
@@ -1838,15 +1817,9 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
 # from the Player-instance attribute that the pickup pack writes.
 
 # Match the helper definition for any "does the player hold X" probe.
-# The AI transpiler emits at least three variants:
-#   * ``playerHasKey(playerInstance)``  — Unity-style helper, two-arg
-#   * ``playerHasKey()``                — bare/no-arg
-#   * ``getPlayerHasKey()``             — get-prefixed accessor
-# The earlier regex anchored the name at ``player[Hh]as``, which
-# silently rejected the ``getPlayerHas*`` shape and the door bug
-# survived (door never opened in PR #121's fresh-transpile validation).
-# ``(?:get)?[pP]layer[Hh]as\w+`` covers all three; the ``\w*`` for the
-# parameter list still tolerates zero args.
+# ``(?:get)?[pP]layer[Hh]as\w+`` covers the three AI variants
+# (``playerHasKey(playerInstance)`` / ``playerHasKey()`` /
+# ``getPlayerHasKey()``); the ``\w*`` parameter list tolerates zero args.
 _DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
     r"local function (?P<fn>(?:get)?[pP]layer[Hh]as\w+)\s*\(\s*\w*\s*\)"
     r"(?P<body>.*?)"
@@ -1860,18 +1833,10 @@ def _detect_door_module_player_lookup(scripts: list["RbxScript"]) -> bool:
         if s.name != "Door":
             continue
         src = s.source or ""
-        # Cheap detector: any ``playerHas*`` OR ``getPlayerHas*`` helper
-        # paired with one of three Player-resolution shapes the AI
-        # transpiler picks between:
-        #   1. ``getPlayerMod()`` helper
-        #   2. ``PlayerScripts.Player`` lookup
-        #   3. ``script.Parent:FindFirstChild("Player")`` sibling-module
-        #      ``require`` (the third shape the AI emits more recently;
-        #      previously the detector missed it because of the
-        #      ``"playerHas"`` substring being case-sensitive against
-        #      ``getPlayerHasKey``).
-        # ``casefold()`` lets us catch both ``playerHas`` and
-        # ``PlayerHas`` without enumerating every spelling.
+        # Cheap detector: a ``playerHas*``/``getPlayerHas*`` helper paired
+        # with one of three Player-resolution shapes (``getPlayerMod()``,
+        # ``PlayerScripts.Player``, or a ``FindFirstChild("Player")``
+        # sibling-module require). ``casefold()`` catches every spelling.
         lower = src.casefold()
         helper_hit = "playerhas" in lower
         resolution_hit = (
@@ -1991,26 +1956,14 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
 # Pack: door_direct_character_attribute
 # ---------------------------------------------------------------------------
 #
-# Third AI-transpile shape for Unity's ``other.GetComponent<Player>().hasKey``
-# probe (after ``_G.Player.hasKey`` and the ``getPlayerMod()`` helper).
-# The AI sometimes emits a direct character-attribute read:
-#
-#   if char:GetAttribute("HasKey") then ... end
-#
-# Same coupling failure as the other two shapes:
-#   1. Pickup's coherence pack writes ``player:SetAttribute("has"..itemName, true)``
-#      on the Players[] instance (replicates server-side). It does NOT
-#      write to the character Model.
-#   2. ``HasKey`` (capital H) doesn't match what the Pickup pack writes
-#      (``hasKey``, lowercase). Even if the read target were right,
-#      the attribute name would mismatch.
-#
-# Rewrite to derive the Player instance from the character and read
-# the (lowercase) ``has<Suffix>`` attribute Pickup actually writes.
+# Third AI-transpile shape for the ``hasKey`` probe (after ``_G.Player.hasKey``
+# and the ``getPlayerMod()`` helper): a direct ``char:GetAttribute("HasKey")``
+# read. Pickup writes the lowercase ``has<X>`` attribute on the replicating
+# Player instance, not the character Model — so rewrite to derive the Player
+# from the character and read the lowercase attribute.
 
-# Capture the H/h prefix separately so we can distinguish the AI's
-# capital-Has emission (``HasKey``) from our own lowercase rewrite
-# (``hasKey``). Group 2 is the leading H/h; group 3 is the suffix word.
+# Capture the H/h prefix separately (group 2) to distinguish the AI's
+# capital-Has emission from our lowercase rewrite; group 3 is the suffix word.
 _DOOR_DIRECT_ATTR_RE = re.compile(
     r'([a-zA-Z_]\w*)\s*:\s*GetAttribute\(\s*"([Hh])as(\w+)"\s*\)'
 )
@@ -2026,12 +1979,9 @@ def _detect_door_direct_character_attribute(scripts: list["RbxScript"]) -> bool:
         if s.name != "Door":
             continue
         src = s.source or ""
-        # Only fire when the attribute name carries the AI's capital ``Has``
-        # prefix (``HasKey``). Lowercase ``hasX`` reads are the canonical
-        # post-rewrite shape and must not be rematched — otherwise the pack
-        # would re-wrap its own output on every coherence pass and produce
-        # nested ``GetPlayerFromCharacter(player)`` IIFEs that always return
-        # nil (the door never opens even with the key).
+        # Only fire on the AI's capital ``Has`` prefix; lowercase ``hasX`` is
+        # the canonical post-rewrite shape and must not be rematched, or the
+        # pack re-wraps its own output into always-nil nested IIFEs.
         for m in _DOOR_DIRECT_ATTR_RE.finditer(src):
             if m.group(2) == "H":
                 return True
@@ -2096,25 +2046,12 @@ def _fix_door_direct_character_attribute(scripts: list["RbxScript"]) -> int:
 # Pack: door_strip_ai_rotation
 # ---------------------------------------------------------------------------
 #
-# Unity's Door.cs::ToggleDoor only calls ``doorAnim.SetBool("open", value)``
-# — the Animator clip (``open.anim``) does the actual movement, which is
-# a +4m Y translation. The animation phase emits ``Anim_<Prefab>_door_open``
-# in ServerScriptService that listens to the ``open`` attribute and tweens
-# +14.28 studs Y.
-#
-# But the AI transpiler often *invents* its own door motion in Door.luau:
-# a ``tweenDoor`` helper that rotates the door 90° around Y via
-# ``CFrame.Angles``, captured against a ``doorBaseCF`` baseline. That
-# rotation fights the translation tween from ``Anim_*_door_open`` —
-# two TweenService tweens on the same ``door.CFrame`` overwrite each
-# other every frame, and the user sees the door spin in place / jitter
-# instead of sliding up.
-#
-# Strip the AI-invented rotation so the only motion comes from the
-# animation driver (or, when none exists, from the ``door_tween_open``
-# pack's injected fallback). The visible ``door:SetAttribute("open",
-# value)`` write is preserved — both the animation driver and the
-# fallback rely on it firing.
+# Door motion comes from the animation driver (``Anim_<Prefab>_door_open``,
+# which tweens the door on the ``open`` attribute). But the AI transpiler
+# often invents its own ``tweenDoor`` rotation (``doorBaseCF * CFrame.Angles``)
+# that fights the driver's translation tween on the same ``door.CFrame``,
+# making the door spin/jitter. Strip the AI-invented rotation; preserve the
+# ``door:SetAttribute("open", value)`` write the driver/fallback rely on.
 
 _DOOR_BASE_CF_DECL_RE = re.compile(
     r"^local doorBaseCF\s*=\s*nil\s*\n", re.MULTILINE,
@@ -2852,20 +2789,11 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
 # Pack: door_machine_signal_listener
 # ---------------------------------------------------------------------------
 #
-# Unity's Machine.cs opens gated doors via
-# ``doors[i].SendMessage("ToggleDoor", true, SendMessageOptions.DontRequireReceiver)``
-# — a runtime reflection call into the Door MonoBehaviour. Roblox has no
-# SendMessage; the converter translates the Machine side to
-# ``door:SetAttribute("ToggleDoor", value)`` on the target Door Model.
-# But Door.luau only emits the Touched / ``hasKey`` path — it never
-# listens for the ``ToggleDoor`` attribute write. Result: items go onto
-# the Machine, ``placeItem`` runs, ``ToggleDoor`` flips, and nothing
-# happens. The Machine→Door progression that SimpleFPS is built around
-# is silently dead.
-#
-# Add a listener so the attribute write actually drives the local
-# ``toggleDoor(value)`` function (which sets the ``open`` attribute the
-# tween/animator picks up). Idempotent via the ``_AutoMachineDoorSignal``
+# Machine.cs's ``doors[i].SendMessage("ToggleDoor", true)`` is transpiled to
+# ``door:SetAttribute("ToggleDoor", value)``, but Door.luau only emits the
+# Touched/``hasKey`` path and never listens for that write — so the
+# Machine→Door progression is silently dead. Add a listener that drives the
+# local ``toggleDoor(value)``. Idempotent via the ``_AutoMachineDoorSignal``
 # sentinel comment.
 
 _DOOR_MACHINE_SIGNAL_BLOCK = """
@@ -2947,24 +2875,15 @@ def _inject_door_machine_signal(scripts: list["RbxScript"]) -> int:
 # Pack: machine_item_check_and_door_lookup
 # ---------------------------------------------------------------------------
 #
-# Unity's Machine.cs opens gated doors by checking the player's hasItems
-# list when they enter the machine's trigger and routing items to
-# inspector-wired doors[i]. The AI transpiles this into Machine.luau with
-# two bugs that together make the door progression silently dead:
-#
-#  1. ``player:GetAttribute("hasItems")`` reads a comma-separated string —
-#     but Player.luau runs as a LocalScript and writes that attribute on
-#     LocalPlayer, which DOES NOT replicate to the server. Pickup writes
-#     per-item server-side booleans (``hasBattery``, ``hasSmallBattery``,
-#     etc.); the Machine has to read those instead.
-#  2. ``doorNames`` defaults to ``{"Door1", "Door2"}`` because the scene
-#     pipeline doesn't propagate Machine's serialized doors array yet.
-#     Real scene names follow Unity's duplicated-instance convention
-#     (``"Door (1)"``, ``"Door (2)"``), so the lookup misses every door.
-#
-# Patch both: rewrite the hasItems iteration to check per-item server
-# booleans, and add ``Door (N)`` / ``DoorN`` fallbacks alongside the
-# persisted-name lookup. Idempotent via the ``_AutoMachineFix`` sentinel.
+# The AI transpile of Machine.cs's door progression has two bugs that make it
+# silently dead:
+#  1. it reads the client-only ``hasItems`` string (Player.luau writes it on
+#     LocalPlayer, which doesn't replicate) instead of Pickup's per-item
+#     server-side ``has<Item>`` booleans;
+#  2. ``doorNames`` defaults to ``{"Door1", "Door2"}``, missing scenes whose
+#     doors are duplicated prefab instances named ``Door (1)``/``Door (2)``.
+# Patch both: read the server booleans and add ``Door (N)``/``DoorN``
+# fallbacks. Idempotent via the ``_AutoMachineFix`` sentinel.
 
 _MACHINE_HASITEMS_RE = re.compile(
     r'\n    -- Player\.luau \(LocalScript\) mirrors hasItems[\s\S]*?'
@@ -3055,27 +2974,11 @@ def _fix_machine_item_check_and_door_lookup(scripts: list["RbxScript"]) -> int:
 # Pack: bullet_physics_raycast
 # ---------------------------------------------------------------------------
 #
-# Unity's bullet scripts (``TurretBullet.cs``, ``PlaneBullet.cs``) use
-# ``rb.AddRelativeForce(Vector3.forward * force, Impulse)`` plus
-# ``OnCollisionEnter`` for hit detection. The AI transpile maps that
-# to ``rootPart:ApplyImpulse(impulseDir * force * mass)`` plus
-# ``Touched``. Three bugs stack in the converted output:
-#
-#  1. ``force=60`` is in Unity m/s but Roblox impulses are in stud-units.
-#     1 Unity m ≈ 3.571 studs, so the bullet flies 5.7x too slow.
-#  2. Roblox gravity is 196 studs/s², equivalent to ~55 m/s² (vs Unity's
-#     9.81 m/s²) — ~5.6x stronger. Bullets nose-dive into the ground.
-#  3. ``Touched`` events tunnel past targets at high speed (3+ studs per
-#     frame at typical bullet velocities), so even when the bullet
-#     reaches the player the hit doesn't register.
-#
-# Fix: replace the bullet's ``Start``-like body and ``Touched`` handler
-# with raycast-based hit detection that:
-#   - Sets ``AssemblyLinearVelocity = forward * force * STUDS_PER_METER``
-#   - Adds an anti-gravity ``VectorForce`` (``force = gravity * mass``)
-#   - Raycasts each ``Heartbeat`` from the previous frame's position to
-#     the current to catch tunnel-through hits
-#   - Adds a visible ``Trail`` so the trajectory reads in-game
+# The AI transpile of Unity's bullet scripts (impulse + ``Touched``) stacks
+# three bugs: m/s force read as studs (too slow), Roblox's ~5.6x stronger
+# gravity (nose-dives), and ``Touched`` tunnelling past fast targets. Fix:
+# rebuild the body with stud-space ``AssemblyLinearVelocity``, an anti-gravity
+# ``VectorForce``, and per-Heartbeat raycast hit detection (plus a ``Trail``).
 
 # Match ANY local-variable ApplyImpulse / AssemblyLinearVelocity write —
 # the AI transpile of Unity's bullet scripts uses different local names
@@ -3107,13 +3010,9 @@ def _detect_bullet_unity_transpile(scripts: list["RbxScript"]) -> bool:
     return False
 
 
-# Per-bullet defaults derived from the canonical Unity sources
-# (``TurretBullet.cs``, ``PlaneBullet.cs``). Codex round-1 caught a
-# regression: applying ``TurretBullet``'s defaults (3/60, direct-hit
-# only) to ``PlaneBullet`` silently dropped PlaneBullet's 6-second
-# fade, 200-force velocity, and ~2-stud OverlapSphere splash damage.
-# ``splash_radius`` of 0 means direct-hit only (turret); >0 enables
-# the splash branch with an ``OverlapParams`` proximity check.
+# Per-bullet defaults from the canonical Unity sources. Per-name (not shared)
+# so PlaneBullet keeps its 6s fade / 200 force / splash and TurretBullet stays
+# direct-hit. ``splash_radius`` 0 = direct-hit only; >0 enables the splash branch.
 _BULLET_DEFAULTS = {
     "TurretBullet": {"fadeTime": 3, "force": 60, "damage": 10, "splash_radius": 0},
     "PlaneBullet": {"fadeTime": 6, "force": 200, "damage": 10, "splash_radius": 2},
@@ -3131,15 +3030,10 @@ def _build_bullet_replacement(name: str) -> str:
     splash_radius = defaults["splash_radius"]
     splash_branch = ""
     if splash_radius > 0:
-        # Splash damage: at impact, find players within ``splash_radius``
-        # studs * STUDS_PER_METER (Unity OverlapSphere works in meters)
-        # and apply damage to each.
-        # Explosion VFX (codex round-5 [P3]): Unity ``PlaneBullet.cs``
-        # instantiates an ``explosion`` GameObject on every collision.
-        # Clone the ``Explosion`` template from
-        # ``ReplicatedStorage.Templates`` if present so the converted
-        # output preserves the VFX/audio feedback. No-op when the
-        # template is absent (older outputs without prefab packages).
+        # Splash damage: find players within ``splash_radius`` * STUDS_PER_METER
+        # (Unity OverlapSphere works in meters) and damage each. Also clone the
+        # ``Explosion`` template (PlaneBullet.cs spawns explosion VFX on every
+        # collision) when present; no-op without prefab packages.
         splash_branch = f'''
 local _ReplicatedStorage = game:GetService("ReplicatedStorage")
 local _explosionTemplate = (function()
@@ -3171,23 +3065,12 @@ local function applyAreaDamage(originPos)
     end
 end
 '''
-    # Direct-hit path (Humanoid model raycast hit).
-    #
-    # Splash bullets (PlaneBullet): Unity's ``OnCollisionEnter`` runs
-    # ``OverlapSphere(2)`` and applies damage to every Player within
-    # the radius — including the directly-hit one. Splash bullets
-    # therefore use ``applyAreaDamage`` as their ONLY damage source,
-    # matching Unity's single-pass behavior.
-    #
-    # Direct-hit-only bullets (TurretBullet): no splash in Unity, so
-    # the only damage source is the direct attribute write.
-    #
-    # Codex round-5 [P1]: splash centers on the raycast ``result``'s
-    # ``Position`` (the actual collision point), NOT
-    # ``rootPart.Position``. At ``force=200``+ a tunneling frame can
-    # put rootPart 10-12 studs past the collision point — larger than
-    # the 7-stud splash radius — so a wall-hit beside a player would
-    # miss entirely.
+    # Direct-hit path (Humanoid model raycast hit). Splash bullets use
+    # ``applyAreaDamage`` as their ONLY damage source (Unity's single-pass
+    # OverlapSphere); direct-hit bullets use the attribute write. Splash
+    # centers on the raycast ``result.Position`` (the collision point), not
+    # ``rootPart.Position`` — a tunnelling frame can put rootPart past the
+    # radius, missing a wall-hit beside a player.
     if splash_radius > 0:
         apply_hit_body = (
             '    _spawnExplosionAt(impactPos)\n'

@@ -1,33 +1,17 @@
-"""bridge_emit -- Phase 2b post-transpile, pre-pack bridge emitter.
+"""bridge_emit -- post-transpile, pre-pack bridge emitter.
 
-This module is the slice 3 deliverable site. Slice 2 lands ONE function
-here (``synthesize_listener_id``) so the enrichment pass that runs inside
-``_maybe_run_topology_prepass`` can stamp deterministic
-``bridge_member_scripts[*].ref`` values for the synthesized server
-listener role. Slice 3 will import THE SAME helper from inside the actual
-emitter so the id slice 2 writes into the topology artifact and the id
-slice 3 stamps onto the emitted Roblox ``Script`` instance agree by
-construction -- not by parallel reinvention.
+Owns ``synthesize_listener_id``: the enrichment pass (inside
+``_maybe_run_topology_prepass``) and the later emitter both call this ONE
+helper, so the id written into ``bridge_member_scripts[*].ref`` and the id
+stamped onto the emitted Roblox ``Script`` instance agree by construction,
+not by parallel reinvention.
 
-Per Claude arch review risk #2 (2026-05-30): if slice 2 invented its own
-id shape and slice 3 invented a different one, the
-``bridge_member_scripts[*].ref`` in the artifact would point at a script
-that doesn't exist; the candidate-`ref`-validity invariant added in
-slice 2 would catch the breakage on slice 3 builds, but only AFTER
-silently shipping a stale artifact on slice 2-only builds. Centralizing
-the synthesis here prevents that drift.
-
-Slice 2 R2 (2026-05-31): the bridge direction matters. A
-client-originated edge needs a SERVER listener (``:FireServer`` ->
-``OnServerEvent``); a server-originated edge needs a CLIENT listener
-(``:FireClient``/``:FireAllClients`` -> ``OnClientEvent``). The
-listener-id helper takes an explicit ``direction`` so slice 3 emits the
-correct ``RbxScript`` script_type at the correct DataModel location and
-the candidate-`ref`-validity invariant recognizes BOTH synthesized
-prefixes.
-
-Slice 3 will add the rest of the module (the actual rewriter +
-RemoteEvent/Script synthesizers). Slice 2 is intentionally minimal.
+Bridge direction matters. A client-originated edge needs a SERVER listener
+(``:FireServer`` -> ``OnServerEvent``); a server-originated edge needs a
+CLIENT listener (``:FireClient``/``:FireAllClients`` -> ``OnClientEvent``).
+The helper takes an explicit ``direction`` so the emitter picks the correct
+``RbxScript`` script_type + DataModel location and the
+candidate-``ref``-validity invariant recognizes BOTH synthesized prefixes.
 """
 
 from __future__ import annotations
@@ -42,9 +26,8 @@ from typing import Literal
 # Unity GUIDs or planner-derived ``<stem>-<idx>`` strings), so collision
 # with a legitimate script id is impossible by construction.
 #
-# Slice 2 R2: two distinct prefixes (one per direction) so the invariant
-# can recognize either shape, and so dumps make the direction visible
-# at a glance during triage.
+# Two distinct prefixes (one per direction) so the invariant can recognize
+# either shape, and so dumps make the direction visible during triage.
 SYNTHESIZED_SERVER_LISTENER_ID_PREFIX = "__bridge_listener_server__"
 SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX = "__bridge_listener_client__"
 
@@ -65,8 +48,8 @@ def synthesize_listener_id(
     *,
     direction: BridgeDirection,
 ) -> str:
-    """Return the deterministic script_id for the listener that
-    ``slice 3``'s emitter will synthesize for ``event_name``.
+    """Return the deterministic script_id for the listener that the
+    emitter will synthesize for ``event_name``.
 
     ``direction``:
       - ``"client_to_server"`` (client producer -> server listener):

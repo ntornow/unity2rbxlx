@@ -15,6 +15,7 @@ The generated script:
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -32,6 +33,10 @@ from core.roblox_types import (
     RbxUIElement,
 )
 from roblox.materials import MATERIAL_NAME_TO_TOKEN
+from converter.roster_assembly import (
+    resolve_roster_container_name,
+    strip_member_scripts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +92,7 @@ def _luau_str(s: str) -> str:
 def _mat_enum(mat: str | int) -> str:
     """Convert material to Enum.Material.X."""
     if isinstance(mat, int):
-        # Reverse-lookup from token value is complex; just use Plastic
+        # No reverse-lookup for int tokens; default to Plastic.
         return "Enum.Material.Plastic"
     name = mat if mat in MATERIAL_NAME_TO_TOKEN else "Plastic"
     return f"Enum.Material.{name}"
@@ -161,6 +166,7 @@ def generate_place_luau(
     b.line("local RS=game:GetService('ReplicatedStorage')")
     b.line("local SP=game:GetService('StarterPlayer')")
     b.line("local SG=game:GetService('StarterGui')")
+    b.line("local CS=game:GetService('CollectionService')")
     b.line("local WS=game.Workspace")
     b.line("local terrain=WS.Terrain")
     b.line()
@@ -289,13 +295,22 @@ def generate_place_luau(
 
     b.line()
 
+    # --- ReplicatedStorage roster container (Addressables Unit 4 / Phase 1) ---
+    # Parity with rbxlx_writer: materialize a SECOND instance per by_label
+    # member under a dedicated, reserved-name-deduped container Folder, then
+    # CollectionService:AddTag(root, label) (root only) + SetAttribute identity.
+    # The luau path is encoding-INDEPENDENT (AddTag takes the plain string).
+    roster_container_name = _emit_roster_members(b, place, mesh_cache, part_counter)
+    b.line()
+
     # --- Auto-create RemoteEvents referenced by scripts -----------------
     # Mirror rbxlx_writer's auto-create scan: scripts reference cross-
     # trust-boundary RemoteEvents (e.g. PickupItemEvent) via
     # ``ReplicatedStorage:FindFirstChild/WaitForChild("Foo")``. Without
     # creating them here, FireClient/OnClientEvent silently no-op on the
     # headlessly-published place even though the rbxlx file works in Studio.
-    _emit_remote_events(b, place)
+    # The roster container name is reserved so no same-named RemoteEvent shadows it.
+    _emit_remote_events(b, place, reserved_extra=roster_container_name)
     b.line()
 
     # --- Scripts ---
@@ -501,11 +516,9 @@ def _emit_part(
         # Additional MeshPart properties
         _emit_part_extras(b, part, var)
 
-        # Note: part.size already has the correct final size from the converter.
-        # The mkMesh function sets mp.Size = sz (the pre-computed size).
-        # The _ScaleX/Y/Z attributes are only used by the MeshLoader runtime
-        # fallback where mp.Size starts as MeshSize (native) and needs scaling.
-        # Here we DON'T apply _Scale — it would double the scaling.
+        # part.size is already the final size; DON'T apply _ScaleX/Y/Z here
+        # (that would double-scale). _Scale is only for the MeshLoader runtime
+        # fallback, where mp.Size starts as native MeshSize and needs scaling.
 
         # TextureID
         if part.texture_id:
@@ -577,6 +590,101 @@ def _emit_part(
         b.end()
 
 
+def _collect_reserved_rs_names(place) -> set[str]:
+    """Reserved ReplicatedStorage names (Templates / templates / ModuleScripts).
+
+    The basis both the roster-container naming and the RemoteEvent auto-create
+    scan key off, so the container name a member is parented under is never
+    shadowed by an auto-created RemoteEvent.
+    """
+    reserved: set[str] = set()
+    if getattr(place, "replicated_templates", None):
+        reserved.add("Templates")
+        for tmpl in place.replicated_templates:
+            tname = getattr(tmpl, "name", None)
+            if tname:
+                reserved.add(tname)
+    all_scripts: list = list(getattr(place, "scripts", None) or [])
+    def _walk(parts):
+        for p in parts or []:
+            all_scripts.extend(getattr(p, "scripts", None) or [])
+            _walk(getattr(p, "children", None) or [])
+    _walk(getattr(place, "workspace_parts", None) or [])
+    _walk(getattr(place, "server_storage_parts", None) or [])
+    _walk(getattr(place, "replicated_templates", None) or [])
+    for s in all_scripts:
+        if getattr(s, "script_type", None) == "ModuleScript":
+            tn = getattr(s, "name", None)
+            if tn:
+                reserved.add(tn)
+    return reserved
+
+
+def _emit_roster_members(
+    b: _LuauBuilder,
+    place,
+    mesh_cache: dict[str, str],
+    counter: list[int],
+) -> str | None:
+    """Materialize the roster surface on the headless path (parity with rbxlx).
+
+    For each ``place.rosters`` member, builds a SECOND instance (deep-copied
+    template tree, identity attributes on the root) under a dedicated container
+    Folder, then ``CollectionService:AddTag(root, label)`` (root only) +
+    SetAttribute identity. Returns the chosen container name (so the caller can
+    reserve it against RemoteEvent shadowing), or ``None`` if no member emits.
+    """
+    rosters = getattr(place, "rosters", None) or []
+    templates_by_name: dict[str, RbxPart] = {
+        t.name: t for t in (getattr(place, "replicated_templates", None) or [])
+    }
+    # Collect (template, label, attributes) per emittable member.
+    members: list[tuple[RbxPart, str, dict]] = []
+    for roster in rosters:
+        for member in getattr(roster, "members", None) or []:
+            tmpl = templates_by_name.get(member.template_name)
+            if tmpl is None:
+                continue
+            members.append((tmpl, member.tag, member.attributes))
+    if not members:
+        return None
+
+    container_name = resolve_roster_container_name(_collect_reserved_rs_names(place))
+    b.block("do")
+    b.line("local RC=Instance.new('Folder')")
+    b.line(f"RC.Name={_luau_str(container_name)}")
+    b.line("RC.Parent=RS")
+    for tmpl, label, attrs in members:
+        b.block("do")
+        # Build a SECOND instance (distinct live subtree) into the container.
+        copied = copy.deepcopy(tmpl)
+        # Strip the template's transpiled Script children from the copy — a
+        # roster member is a clone-SOURCE, not a live actor; those scripts are
+        # inert under RS (the host binds on workspace clones, never on the
+        # roster copy). Parity with the rbxlx path; avoids N x script bloat.
+        strip_member_scripts(copied)
+        # Merge identity attributes onto the root (the _RosterTag marker is NOT
+        # emitted on the luau side — AddTag carries the label directly).
+        copied.attributes = {**(copied.attributes or {}), **attrs}
+        _emit_part(b, copied, "RC", mesh_cache, counter)
+        # The member root is the only child _emit_part just parented to RC.
+        b.line("local member=RC:GetChildren()[#RC:GetChildren()]")
+        # Single tag-emit site: union {Unity m_TagString} ∪ {roster label},
+        # dedup, AddTag once per distinct tag (parity with the rbxlx Tags codec
+        # which merges both into one element). luau is encoding-independent.
+        member_tags: list[str] = []
+        unity_tag = (copied.attributes or {}).get("Tag")
+        if isinstance(unity_tag, str) and unity_tag and unity_tag != "Untagged":
+            member_tags.append(unity_tag)
+        if label and label not in member_tags:
+            member_tags.append(label)
+        for t in member_tags:
+            b.line(f"CS:AddTag(member,{_luau_str(t)})")
+        b.end()
+    b.end()
+    return container_name
+
+
 _REMOTE_EVENT_SKIP = {
     "PlayerGui", "HUD", "Module", "ItemModule", "Pause", "Crosshair",
     "Health", "Fill", "Ammo", "Cur", "Back", "CurHealth", "Label",
@@ -589,12 +697,17 @@ _REMOTE_EVENT_SKIP = {
 }
 
 
-def _emit_remote_events(b: _LuauBuilder, place) -> None:
+def _emit_remote_events(
+    b: _LuauBuilder, place, reserved_extra: str | None = None
+) -> None:
     """Auto-create RemoteEvents in ReplicatedStorage that scripts reference.
 
     Mirrors the scan in rbxlx_writer.py so FireClient / OnClientEvent
     pairs across server Scripts and LocalScripts (e.g. PickupItemEvent)
     actually have an instance to bind to in the headless publish path.
+
+    ``reserved_extra`` (the roster-container name) is added to the reserved set
+    so no same-named RemoteEvent shadows the container Folder.
     """
     import re as _re
 
@@ -627,6 +740,8 @@ def _emit_remote_events(b: _LuauBuilder, place) -> None:
             tn = getattr(s, "name", None)
             if tn:
                 reserved.add(tn)
+    if reserved_extra:
+        reserved.add(reserved_extra)
 
     # BindableEvents created via ``Instance.new("BindableEvent"); ev.Name="X"``
     bindables: set[str] = set()
@@ -1174,14 +1289,3 @@ def generate_place_luau_chunked(
         max_chunk_bytes / (1024 * 1024),
     )
     return [full_script]
-
-
-def _validate_output(script: str) -> None:
-    """Basic sanity checks on generated output."""
-    size = len(script.encode("utf-8"))
-    if size > _MAX_SCRIPT_BYTES:
-        log.warning(
-            "Generated script is %.1f MB, exceeds 4 MB limit. "
-            "Large projects may need multiple execution batches.",
-            size / (1024 * 1024),
-        )

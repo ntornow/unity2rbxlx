@@ -12,8 +12,8 @@ the driver is the MB whose C# writes that param name via
 ``Set{Bool,Trigger,Float,Integer}("<param>", …)`` on an Animator-bound
 receiver.
 
-This module owns that extraction. It is a TWO-STEP, receiver-bound match
-(D13), NOT a flat param-name regex:
+This module owns that extraction. It is a TWO-STEP, receiver-bound match,
+NOT a flat param-name regex:
   1. Bind the set of identifiers declared as ``Animator`` in the source
      (field / ``[SerializeField]`` field / property / local-var
      ``GetComponent<Animator>()`` assignment).
@@ -24,7 +24,7 @@ This module owns that extraction. It is a TWO-STEP, receiver-bound match
 Input contract: comment-stripped, **string-literal-preserving** C#
 source (from ``module_domain._load_cs_source_preserving_strings``).
 Input is deterministic Unity C# SOURCE, not LLM output, so the
-regex-on-AI-output fragility rule does not apply (D13).
+regex-on-AI-output fragility rule does not apply.
 """
 
 from __future__ import annotations
@@ -37,9 +37,9 @@ _ANIMATOR_PARAM_SETTERS: frozenset[str] = frozenset(
     {"SetBool", "SetTrigger", "SetFloat", "SetInteger"}
 )
 
-# C# keywords that must never be bound as an Animator-typed identifier
-# (codex PD-F1): ``where T : Animator`` would otherwise capture ``class``
-# from ``public class Foo where T : Animator``. A keyword bind is harmless
+# C# keywords that must never be bound as an Animator-typed identifier:
+# ``where T : Animator`` would otherwise capture ``class`` from
+# ``public class Foo where T : Animator``. A keyword bind is harmless
 # in practice (it needs a same-named ``.Set*("<observed>")`` write to
 # mislead, and keywords never have one), but reject it anyway.
 _CS_KEYWORDS: frozenset[str] = frozenset({
@@ -79,11 +79,11 @@ _ANIMATOR_LOCAL_RE = re.compile(
 
 
 def _bind_animator_identifiers(cs_source: str) -> frozenset[str]:
-    """Step 1 (D13): bind the set of identifiers declared as ``Animator``.
+    """Step 1: bind the set of identifiers declared as ``Animator``.
 
     Unions field / property / ``[SerializeField]`` field declarations with
     local-var ``GetComponent<Animator>()`` assignments. C# keywords are
-    rejected (codex PD-F1: ``where T : Animator`` must not bind ``class``).
+    rejected (``where T : Animator`` must not bind ``class``).
     """
     names: set[str] = set()
     for m in _ANIMATOR_DECL_RE.finditer(cs_source):
@@ -103,7 +103,7 @@ def extract_animator_param_writes(cs_source: str) -> frozenset[str]:
     Animator parameter NAMES written via ``Set{Bool,Trigger,Float,
     Integer}("<param>", …)`` on an Animator-bound receiver.
 
-    Two-step, receiver-bound (D13):
+    Two-step, receiver-bound:
       1. Bind the set of identifiers declared as ``Animator`` in this
          source (field, ``[SerializeField]`` field, property, local-var
          ``GetComponent<Animator>()`` assignment).
@@ -113,10 +113,10 @@ def extract_animator_param_writes(cs_source: str) -> frozenset[str]:
 
     Empty input → empty set. Param-by-hash / param-by-variable
     (``SetBool(Animator.StringToHash("open"), …)`` /
-    ``SetBool(OpenParam, …)``) are out of scope (FU1) and yield no entry
+    ``SetBool(OpenParam, …)``) are out of scope and yield no entry
     (degrade to server fallback). Anonymous-receiver writes
     (``GetComponent<Animator>().SetBool("x")``, no bound identifier) are
-    intentionally not matched (OO3).
+    intentionally not matched.
     """
     if not cs_source:
         return frozenset()

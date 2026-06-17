@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .state_diff import StateDiffResult
+from .visual_diff import quality_label
 
 logger = logging.getLogger(__name__)
 
@@ -41,19 +42,6 @@ class ComparisonReport:
     def __post_init__(self) -> None:
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
-
-
-def _quality_label(ssim: float) -> str:
-    """Return a human-readable quality label for the given SSIM score."""
-    if ssim >= 0.95:
-        return "Excellent"
-    if ssim >= 0.85:
-        return "Good"
-    if ssim >= 0.70:
-        return "Fair"
-    if ssim >= 0.50:
-        return "Poor"
-    return "Very Poor"
 
 
 def generate_report(
@@ -102,7 +90,7 @@ def generate_report(
     lines.append("")
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
-    lines.append(f"| SSIM Score | {report.visual_score:.4f} ({_quality_label(report.visual_score)}) |")
+    lines.append(f"| SSIM Score | {report.visual_score:.4f} ({quality_label(report.visual_score)}) |")
     lines.append(f"| Matched Objects | {state_diff.matched_objects} |")
     lines.append(f"| Unmatched (Unity only) | {len(state_diff.unmatched_unity)} |")
     lines.append(f"| Unmatched (Roblox only) | {len(state_diff.unmatched_roblox)} |")

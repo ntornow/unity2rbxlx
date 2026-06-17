@@ -448,3 +448,243 @@ class TestAutoRemoteEventReservedNames:
             "Auto-RemoteEvent generator must skip names that match an "
             "emitted ModuleScript. Got: %r" % children
         )
+
+
+# ---------------------------------------------------------------------------
+# Addressables Unit-4 roster surface (Phase 1) — AC4/AC7/AC11/AC12/AC13
+# ---------------------------------------------------------------------------
+
+import base64 as _b64
+import struct as _struct
+
+from tests._roster_fixtures import (  # noqa: E402
+    CHAR_NAME, LABEL, TEMPLATE_NAME, UNITY_TAG,
+    make_place_with_roster,
+)
+from converter.roster_assembly import (  # noqa: E402
+    DEFAULT_ROSTER_CONTAINER, ROSTER_TAG_MARKER,
+)
+
+
+def _decode_tags(binstr_text):
+    """Decode a Roblox Tags BinaryString: base64 -> split on NUL."""
+    raw = _b64.b64decode(binstr_text)
+    return set(raw.decode("utf-8").split("\0")) if raw else set()
+
+
+def _decode_attributes(binstr_text):
+    """Decode an AttributesSerialize blob into {key: value} (str/num/bool)."""
+    raw = _b64.b64decode(binstr_text)
+    out = {}
+    off = 0
+    (count,) = _struct.unpack_from("<I", raw, off); off += 4
+    for _ in range(count):
+        (klen,) = _struct.unpack_from("<I", raw, off); off += 4
+        key = raw[off:off + klen].decode("utf-8"); off += klen
+        tid = raw[off]; off += 1
+        if tid == 0x02:  # String
+            (vlen,) = _struct.unpack_from("<I", raw, off); off += 4
+            val = raw[off:off + vlen].decode("utf-8"); off += vlen
+        elif tid == 0x03:  # Bool
+            val = bool(raw[off]); off += 1
+        elif tid == 0x06:  # Float64
+            (val,) = _struct.unpack_from("<d", raw, off); off += 8
+        else:
+            raise AssertionError(f"unexpected attr type {tid}")
+        out[key] = val
+    return out
+
+
+def _find_rs(root):
+    for item in root.iter("Item"):
+        if item.get("class") == "ReplicatedStorage":
+            return item
+    return None
+
+
+def _rs_named_children(root, name):
+    """Direct ReplicatedStorage Item children whose Name property == name,
+    returned as {class_name: count}."""
+    rs = _find_rs(root)
+    assert rs is not None
+    out = {}
+    for item in rs.findall("Item"):
+        nm = None
+        props = item.find("Properties")
+        if props is not None:
+            for s in props.findall("string"):
+                if s.get("name") == "Name":
+                    nm = s.text
+        if nm == name:
+            out[item.get("class")] = out.get(item.get("class"), 0) + 1
+    return out
+
+
+def _container_folder(root):
+    """Return the roster-container Folder Item under ReplicatedStorage."""
+    rs = _find_rs(root)
+    assert rs is not None
+    for item in rs.findall("Item"):
+        if item.get("class") != "Folder":
+            continue
+        props = item.find("Properties")
+        nm = None
+        if props is not None:
+            for s in props.findall("string"):
+                if s.get("name") == "Name":
+                    nm = s.text
+        if nm and nm.startswith(DEFAULT_ROSTER_CONTAINER):
+            return item, nm
+    return None, None
+
+
+def _member_roots(container):
+    """Direct member-root Items inside the container (its immediate children)."""
+    return container.findall("Item")
+
+
+def _props_binstrings(item):
+    """Map {name: text} of BinaryString props on an Item."""
+    out = {}
+    props = item.find("Properties")
+    if props is not None:
+        for b in props.findall("BinaryString"):
+            out[b.get("name")] = b.text
+    return out
+
+
+class TestRosterEmit:
+    def test_ac4_model_rooted_member_emits_decodable_tags(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        place = make_place_with_roster()
+        out = tmp_path / "roster.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+        container, cname = _container_folder(root)
+        assert container is not None, "roster container Folder missing"
+        members = _member_roots(container)
+        assert len(members) == 1
+        member = members[0]
+        # The member root is a Model (Model-rooted multi-part case).
+        assert member.get("class") == "Model"
+        bins = _props_binstrings(member)
+        assert "Tags" in bins, "Model-rooted member must emit a Tags element"
+        decoded = _decode_tags(bins["Tags"])
+        assert LABEL in decoded
+        # Attributes decode to characterName, with NO _RosterTag marker.
+        attrs = _decode_attributes(bins["AttributesSerialize"])
+        assert attrs.get("characterName") == CHAR_NAME
+        assert ROSTER_TAG_MARKER not in attrs
+
+    def test_ac4_descendants_not_tagged(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        place = make_place_with_roster()
+        out = tmp_path / "roster.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+        container, _ = _container_folder(root)
+        member = _member_roots(container)[0]
+        # Descendant Parts of the member must NOT carry the label tag.
+        for sub in member.findall("Item"):
+            bins = _props_binstrings(sub)
+            if "Tags" in bins:
+                assert LABEL not in _decode_tags(bins["Tags"])
+
+    def test_ac11_single_tags_element_with_union(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        # Root ALSO carries a Unity tag → union {Unity tag} ∪ {label}, one elem.
+        place = make_place_with_roster(with_unity_tag=True)
+        out = tmp_path / "roster.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+        container, _ = _container_folder(root)
+        member = _member_roots(container)[0]
+        props = member.find("Properties")
+        tags_elems = [b for b in props.findall("BinaryString")
+                      if b.get("name") == "Tags"]
+        assert len(tags_elems) == 1, "exactly one Tags element per member"
+        decoded = _decode_tags(tags_elems[0].text)
+        assert decoded == {UNITY_TAG, LABEL}
+
+    def test_ac12_referent_uniqueness_and_intra_member_part1(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        place = make_place_with_roster()
+        out = tmp_path / "roster.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+        # (a) every referent in the whole document is unique
+        referents = [it.get("referent") for it in root.iter("Item")
+                     if it.get("referent")]
+        assert len(referents) == len(set(referents)), "duplicate referents!"
+        # (b) the member's constraint Part1 resolves to a part INSIDE the copy
+        container, _ = _container_folder(root)
+        member = _member_roots(container)[0]
+        member_referents = {it.get("referent") for it in member.iter("Item")
+                            if it.get("referent")}
+        part1_refs = []
+        for ref in member.iter("Ref"):
+            if ref.get("name") == "Part1" and ref.text:
+                part1_refs.append(ref.text)
+        assert part1_refs, "member constraint should have a Part1"
+        for r in part1_refs:
+            assert r in member_referents, "Part1 must resolve within the copy"
+        # (c) the source template's referents are disjoint from the copy's
+        # (no aliasing) — find the Templates folder member.
+        rs = _find_rs(root)
+        templates = None
+        for item in rs.findall("Item"):
+            if item.get("class") == "Folder":
+                props = item.find("Properties")
+                nm = None
+                if props is not None:
+                    for s in props.findall("string"):
+                        if s.get("name") == "Name":
+                            nm = s.text
+                if nm == "Templates":
+                    templates = item
+        assert templates is not None
+        tmpl_referents = {it.get("referent") for it in templates.iter("Item")
+                          if it.get("referent")}
+        assert member_referents.isdisjoint(tmpl_referents)
+
+    def test_ac13_container_reserved_name_disambiguated(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        from core.roblox_types import RbxScript
+        place = make_place_with_roster()
+        # Occupy the default container name with a ModuleScript so the writer
+        # must suffix-disambiguate AND reserve the chosen name.
+        place.scripts.append(RbxScript(
+            name=DEFAULT_ROSTER_CONTAINER,
+            source="return {}",
+            script_type="ModuleScript",
+        ))
+        out = tmp_path / "roster.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+        container, cname = _container_folder(root)
+        assert container is not None
+        assert cname != DEFAULT_ROSTER_CONTAINER  # disambiguated
+        assert cname.startswith(DEFAULT_ROSTER_CONTAINER + "_")
+        # No RemoteEvent of the chosen container name was minted.
+        siblings = _rs_named_children(root, cname)
+        assert "RemoteEvent" not in siblings
+        assert siblings.get("Folder", 0) == 1
+
+    def test_no_roster_no_container(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        place = RbxPlace()
+        out = tmp_path / "empty.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+        container, _ = _container_folder(root)
+        assert container is None
+
+    def test_canonical_template_unchanged(self, tmp_path):
+        """The source template's attributes must not gain the roster marker."""
+        place = make_place_with_roster()
+        before = dict(place.replicated_templates[0].attributes)
+        from roblox.rbxlx_writer import write_rbxlx
+        write_rbxlx(place, tmp_path / "roster.rbxlx")
+        after = dict(place.replicated_templates[0].attributes)
+        assert ROSTER_TAG_MARKER not in after
+        assert before == after

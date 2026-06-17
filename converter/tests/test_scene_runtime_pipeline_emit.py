@@ -748,3 +748,106 @@ class TestAssetRefRewriteAndScriptableObjectsMap:
             f"scriptable_objects map must carry guid -> dotted module path; "
             f"got {so_map!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# static_channels emitted from the REAL C# static-event analysis
+# (reproduce from source, not a hand-edited rbxlx).
+# ---------------------------------------------------------------------------
+
+from tests._project_paths import SIMPLEFPS_PATH, is_populated  # noqa: E402
+
+
+class TestStaticChannelsFromCsAnalysis:
+
+    def test_player_four_static_events_become_channels(self, tmp_path):
+        """Drive ``_build_static_event_channels`` through the subphase with a
+        REAL guid_index over SimpleFPS's Player.cs. The 4 C# ``static event``
+        members must surface as same-domain channels on the plan — derived
+        from source (the C# parse), never a hand-edited artifact."""
+        if not is_populated(SIMPLEFPS_PATH):
+            pytest.skip("SimpleFPS project not available")
+        from unity.guid_resolver import build_guid_index
+
+        guid_index = build_guid_index(SIMPLEFPS_PATH)
+        # Find Player.cs's canonical script id (its .cs GUID).
+        player_guid = None
+        for guid, entry in guid_index.guid_to_entry.items():
+            if entry.asset_path.suffix == ".cs" and entry.asset_path.stem == "Player":
+                player_guid = guid
+                break
+        assert player_guid is not None, "Player.cs GUID not found in SimpleFPS"
+
+        plan = {
+            "modules": {
+                player_guid: {
+                    "stem": "Player",
+                    "runtime_bearing": True,
+                    "domain": "client",
+                    "container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage.Player",
+                    "character_attached": False,
+                    "is_loader": False,
+                },
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.state.guid_index = guid_index
+
+        # Call the channel builder directly (the full subphase also emits the
+        # host scripts; we assert the channel half here).
+        p._build_static_event_channels(plan)
+        channels = plan.get("static_channels")
+        assert channels is not None, "static_channels not emitted"
+        fields = {c["field_name"] for c in channels}
+        assert fields == {
+            "HealthUpdate", "AmmoUpdate", "ItemUpdate", "PauseEvent",
+        }, fields
+        for c in channels:
+            assert c["module_id"] == player_guid
+            assert c["channel_name"] == c["field_name"]
+            assert c["parent_path"] == "ReplicatedStorage"
+            assert c["module_path"] == "ReplicatedStorage.Player"
+            assert c["domain"] == "client"
+            # The per-module folder is dot-free (parent_path is split on ".") and
+            # shared across one module's channels (same module_id → same folder).
+            assert "." not in c["module_folder"]
+        assert len({c["module_folder"] for c in channels}) == 1
+
+    def test_channels_embedded_in_emitted_plan_module(self, tmp_path):
+        """End-to-end through the full subphase: the emitted SceneRuntimePlan
+        ModuleScript carries the static_channels (host allowlist includes it)."""
+        if not is_populated(SIMPLEFPS_PATH):
+            pytest.skip("SimpleFPS project not available")
+        from unity.guid_resolver import build_guid_index
+
+        guid_index = build_guid_index(SIMPLEFPS_PATH)
+        player_guid = next(
+            (g for g, e in guid_index.guid_to_entry.items()
+             if e.asset_path.suffix == ".cs" and e.asset_path.stem == "Player"),
+            None,
+        )
+        assert player_guid is not None
+        plan = {
+            "modules": {
+                player_guid: {
+                    "stem": "Player", "runtime_bearing": True, "domain": "client",
+                    "container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage.Player",
+                    "character_attached": False, "is_loader": False,
+                },
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.state.guid_index = guid_index
+        p.ctx.scene_runtime = plan
+        p._subphase_inject_scene_runtime()
+        plan_scripts = [
+            s for s in p.state.rbx_place.scripts if s.name == "SceneRuntimePlan"
+        ]
+        assert plan_scripts, "SceneRuntimePlan not emitted"
+        src = plan_scripts[0].source
+        assert "static_channels" in src
+        assert "AmmoUpdate" in src and "HealthUpdate" in src

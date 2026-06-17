@@ -67,16 +67,10 @@ _SERVER_ONLY_PATTERNS = [
 
 
 def _module_require_body(name: str) -> str:
-    """Return the body of a ``require(...)`` lookup that survives the storage
-    classifier's split between ReplicatedStorage and ServerStorage.
-
-    The classifier (``storage_classifier.classify_storage``) parents a
-    ModuleScript in ServerStorage when only server-side callers require it,
-    so a hardcoded ``ReplicatedStorage:FindFirstChild`` lookup returns nil
-    and ``require(nil)`` raises at runtime. The fallback chain covers both
-    containers; a client script that erroneously asks for a server-only
-    module still gets nil (visible failure) rather than reaching a
-    forbidden container.
+    """Return a ``require(...)`` lookup body that searches both
+    ReplicatedStorage and ServerStorage, surviving the storage classifier's
+    split. A client asking for a server-only module gets nil (visible
+    failure) rather than reaching a forbidden container.
     """
     return (
         f'game:GetService("ReplicatedStorage"):FindFirstChild("{name}", true)'
@@ -152,23 +146,9 @@ def inject_require_calls(
                 target.script_type = "ModuleScript"
                 log.info("  Reclassified '%s' from %s to ModuleScript (required by '%s')",
                          dep, old_type, s.name)
-                # Add return statement if missing.
-                #
-                # Detect an existing module return at column 0 (the
-                # terminal `return <expr>` of a Luau module). A previous
-                # implementation only scanned the last 3 lines, which
-                # missed a multi-line table return —
-                #     return {
-                #         foo = foo,
-                #         bar = bar,
-                #     }
-                # pushes the `return` keyword >3 lines from the end, so
-                # the heuristic appended a SECOND `return <dep>` and
-                # produced `Expected <eof>, got 'return'` (a top-level
-                # statement after a return is illegal in Luau). A
-                # column-0 `^return\b` match is robust to table bodies
-                # of any length and won't false-match indented guard
-                # returns inside if-blocks/functions.
+                # Add return statement if missing. Match a column-0
+                # `^return\b` so a multi-line table return is detected and
+                # we don't append a second illegal top-level `return`.
                 stripped_source = target.source.rstrip()
                 has_return = bool(
                     re.search(r'^return\b', stripped_source, re.MULTILINE)
@@ -370,23 +350,15 @@ def fix_require_classifications(
     from converter.script_coherence_packs import run_packs
     fixes += run_packs(scripts)
 
-    # Pass 17: Remove require(Player) from scripts that reference it —
-    # Player is now a LocalScript, not in ReplicatedStorage.
+    # Remove require(Player) from scripts that reference it — Player is
+    # now a LocalScript, not in ReplicatedStorage.
     fixes += _remove_stale_player_requires(scripts)
 
-    # Pass 19: Expose ``<Table>.<Event> = <Bindable>.Event`` cross-script.
-    # Producer parents its BindableEvents to ``script`` with matching Name;
-    # consumers rewrite ``<var>.<Key>:Connect`` to
-    # ``<var>:WaitForChild("<Key>").Event:Connect``. Without this, the
-    # consumer indexes the producer LocalScript Instance for a non-existent
-    # property and crashes ("X is not a valid member of LocalScript").
+    # Expose ``<Table>.<Event> = <Bindable>.Event`` cross-script. Producer
+    # parents its BindableEvents to ``script``; consumers rewrite
+    # ``<var>.<Key>:Connect`` to ``<var>:WaitForChild("<Key>").Event:Connect``
+    # so they don't index the producer LocalScript for a missing property.
     fixes += _expose_local_script_events(scripts)
-
-    # Passes 18 (FPS default-controls disable) and 20 (OnTriggerStay
-    # polling) moved to script_coherence_packs.py. They are project-
-    # specific patches that auto-enable on detection of FPS controllers
-    # / converter-emitted turret AI helpers, so non-FPS projects skip
-    # them. Both already ran via run_packs() above.
 
     return fixes
 
@@ -750,10 +722,7 @@ def _stub_unavailable_sdks(scripts: list[RbxScript]) -> int:
             decl_pattern = rf'^(local\s+{re.escape(mod_name)}\s*=\s*require\(.+\))$'
             match = re.search(decl_pattern, s.source, re.MULTILINE)
             if match:
-                stub = (f'\n{mod_name} = {mod_name} or '
-                        f'{{Instance = {{}}}}  -- Stub: SDK not available on Roblox')
-                # Add stub after the declaration line
-                # Use setmetatable so any method call returns a no-op
+                # setmetatable stub so any .Instance method call returns a no-op.
                 stub = (f'\nif not {mod_name} then {mod_name} = '
                         f'setmetatable({{Instance = setmetatable({{}}, '
                         f'{{__index = function() return function() end end}})}}, '
@@ -1161,17 +1130,6 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
     ("PlayerScripts"):WaitForChild("Player")``. Then stub out
     ``require(NAME)`` since LocalScripts cannot be required.
 
-    Historical note: the verbose ``Players.LocalPlayer.PlayerScripts``
-    path used to exist specifically to dodge the regex in
-    ``pipeline._disable_unbound_scripts`` that matched
-    ``local \w+ = script.Parent\b`` and silently added a BasePart guard
-    to LocalScripts routed to PlayerScripts. That guard is now gated on
-    :attr:`RbxScript.requires_part_parent` (Phase 2 of the Option D
-    refactor on 2026-05-21), so ``script.Parent:WaitForChild("Player")``
-    would now work just as well. The verbose form is preserved for
-    output stability — existing test fixtures and project conversions
-    expect this exact shape, and the runtime behavior is identical.
-
     Restricted to LocalScripts only — server-side code has no LocalPlayer.
     """
     fixes = 0
@@ -1226,9 +1184,9 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
             indent = bind_match.group("indent")
             # Redirect the binding to the actual LocalScript location at runtime.
             # Use the LocalPlayer.PlayerScripts path (works for any sibling
-            # LocalScript). See the docstring's historical note — under
-            # Option D Phase 2 ``script.Parent`` would also be safe here,
-            # but the verbose form is preserved for output stability.
+            # LocalScript). The verbose form is intentional and must not be
+            # simplified: test fixtures and project conversions expect this exact
+            # emitted shape (output stability), though runtime behavior is identical.
             s.source = re.sub(
                 r'^\s*local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)[^\n]*$',
                 f'{indent}local {varname} = game:GetService("Players").LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")',
@@ -1384,12 +1342,10 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
     # inside the producer.
     if not producers:
         return fixes
-    # Match both ``local <var> = require(...XShared)`` and the
-    # ``<var> = require(...XShared)`` shape-B assignment the
-    # ``_AutoLocalScriptShim``'s descendant-loop rewrite emits.
-    # The ``(?:local\s+)?`` makes ``local`` optional so codex [P2] is
-    # closed: previously shape-B consumers slipped past the detector
-    # and crashed at runtime on ``shim_table.HealthUpdate:Connect``.
+    # Match both ``local <var> = require(...XShared)`` and the bare
+    # ``<var> = require(...XShared)`` shape the ``_AutoLocalScriptShim``'s
+    # descendant-loop rewrite emits (``(?:local\s+)?`` makes ``local``
+    # optional so shape-B consumers aren't missed).
     shim_require_re = re.compile(
         r'^[ \t]*(?:local\s+)?(?P<var>\w+)\s*=\s*require\([^\n]*WaitForChild'
         r'\(\s*["\'](?P<mod>\w+)Shared["\']\s*\)[^\n]*\)',
@@ -1403,8 +1359,7 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
     # character-attached routes it to ``StarterCharacterScripts``
     # instead. The Roblox runtime mirrors those into
     # ``LocalPlayer.PlayerScripts`` or character-rooted ``Character``,
-    # respectively. Codex [P2] flagged the previous hardcoded
-    # ``PlayerScripts`` chain as broken for any non-default routing.
+    # respectively.
     def _runtime_lookup_for_producer(prod_name: str) -> str:
         # Find the producer script's parent_path among the input set.
         prod_script = next((p for p in scripts if p.name == prod_name), None)
@@ -1426,16 +1381,9 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
             f'("PlayerScripts"):WaitForChild({prod_name!r})'
         )
 
-    # ``producer_local_name`` keeps the identifier we hoist the runtime
-    # lookup into per consumer. Hoisting matters: the runtime-lookup
-    # chain begins with ``game:GetService(...)``, so a naive
-    # ``(<chain>):Connect(...)`` rewrite emits lines that START with
-    # ``(``. Luau then sees the previous statement's trailing ``)``
-    # followed by ``(`` and raises an "ambiguous syntax" parse error
-    # ("this looks like an argument list for a function call, but
-    # could also be a start of new statement"). Hoisting to a local
-    # makes every rewritten Connect start with an identifier, which
-    # Luau parses unambiguously.
+    # Hoist the runtime lookup into a local per consumer so every rewritten
+    # Connect starts with an identifier, not ``(`` — otherwise Luau reads the
+    # previous statement's trailing ``)`` + ``(`` as an ambiguous-call parse.
     def _producer_local_name(prod: str) -> str:
         return f"_AutoProducer_{prod}"
 

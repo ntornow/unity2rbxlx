@@ -289,36 +289,6 @@ def _find_root_anchor_part(
     preserves prior behaviour for those shapes — the heuristic is
     unreliable when there is no clear "wrapped root" signal.
     """
-    """Pick the BasePart that represents the prefab root's geometry.
-
-    Order of preference:
-      1. A direct child named ``<root_name>_Mesh`` — the wrapped root
-         geometry inserted by
-         ``scene_converter._wrap_geometry_with_children_into_model``
-         when a Unity node has both a mesh AND child transforms.
-      2. A direct non-marker BasePart child — MeshPart, or a Part with
-         primitive shape / visible transparency. Excludes invisible
-         marker Parts (Origin, Muzzle, Spawn, …).
-      3. Any non-marker descendant BasePart, depth-first.
-      4. Any descendant BasePart at all (markers included) as a
-         last-resort fallback.
-
-    Returns ``None`` for an empty Model OR a single-part template
-    (no descendants). The caller falls through to the legacy
-    wipe-to-identity in that case — single-part templates' cframe
-    is the part's CFrame (not a Model WorldPivot), and the wipe lets
-    callers ``:Clone()`` and parent at origin without inheriting the
-    template's authored source position.
-
-    Known limitation: when a runtime script assigns
-    ``clone.PrimaryPart = ...`` before ``clone:PivotTo(...)``, Roblox
-    derives the pivot from ``PrimaryPart.CFrame * PrimaryPart.PivotOffset``
-    and ignores the WorldPivot written here. Full resolution requires
-    emitting an explicit ``Model.PrimaryPart`` referent and writing
-    ``PivotOffset`` on that part — the rbxlx writer does not currently
-    support either, so a small per-part drift remains for templates
-    whose runtime callers set PrimaryPart eagerly.
-    """
     direct = part.children or []
     # Candidates for the wrapped root child's name: the prefab's
     # current name AND the pre-rename root GameObject name. The wrap
@@ -549,31 +519,19 @@ def generate_prefab_packages(
         # distinct. For a non-colliding prefab ``child_name == name``.
         part.name = child_name
         emitted_base_names.add(name)
-        # Prefab template pivot:
-        # - Legacy (default-off, env ``U2R_LEGACY_PREFAB_PIVOT=1``):
-        #   wipe to identity. Studio's runtime then falls back to the
-        #   geometric centroid for ``Model:GetPivot()``.
-        # - New (default-on): set ``WorldPivot.Position`` to a root-
-        #   geometry anchor's world position. ``Model:GetPivot()``
-        #   then returns where the rendered root geometry sits, which
-        #   matches Unity ``Instantiate(prefab, target)`` for the
-        #   common case where the prefab root's Unity local is
-        #   ``(0, 0, 0)`` and FBX baking adds the only offset.
+        # Prefab template pivot. Legacy (``U2R_LEGACY_PREFAB_PIVOT=1``):
+        # wipe to identity. New (default-on): set ``WorldPivot.Position``
+        # to a root-geometry anchor's world position so ``Model:GetPivot()``
+        # matches Unity ``Instantiate(prefab, target)``.
         #
-        # Known limitations (full resolution requires per-part Unity-
-        # local-position tracking and PrimaryPart emission, neither of
-        # which the converter currently has):
-        # 1. When the anchor child has a non-zero Unity local position
-        #    (rare for typical wrapped prefabs), ``Model:PivotTo()``
-        #    lands the rendered geometry on the target instead of the
-        #    Unity root. The exact formula
-        #    ``WorldPivot = roblox_world - unity_local * scale``
-        #    requires threading Unity local positions through the
-        #    ``RbxPart`` tree, which the converter does not yet carry.
-        # 2. When a runtime script assigns ``clone.PrimaryPart =``
-        #    before ``clone:PivotTo(...)``, Roblox derives the pivot
-        #    from PrimaryPart and ignores this WorldPivot. The rbxlx
-        #    writer does not currently emit ``Model.PrimaryPart``
+        # Known limitations (no per-part Unity-local tracking, no PrimaryPart emission):
+        # 1. A non-zero Unity local position on the anchor child (rare for wrapped
+        #    prefabs) lands geometry on the target, not the Unity root; the exact
+        #    ``WorldPivot = roblox_world - unity_local * scale`` fix needs Unity locals
+        #    threaded through the ``RbxPart`` tree, which the converter does not carry.
+        # 2. A runtime script that assigns ``clone.PrimaryPart =`` before
+        #    ``clone:PivotTo(...)`` makes Roblox derive the pivot from PrimaryPart and
+        #    ignore this WorldPivot. The rbxlx writer does not emit ``Model.PrimaryPart``
         #    referents, so we can't pre-pin a sane PrimaryPart.
         from core.roblox_types import RbxCFrame
         if legacy_prefab_pivot:

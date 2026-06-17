@@ -51,7 +51,7 @@ class StrippedComponentRecord:
     fileID that becomes the prefab-local instance_id in the subplan.
     """
     file_id: str             # scene-local stripped fileID (e.g. "137514649")
-    class_id: int            # 114 for MonoBehaviour (the only kind Phase 3 acts on)
+    class_id: int            # 114 for MonoBehaviour (the only kind the planner bridges)
     source_object_file_id: str    # m_CorrespondingSourceObject.fileID -> prefab-local component fileID
     source_object_guid: str       # m_CorrespondingSourceObject.guid -> the source .prefab guid
     prefab_instance_file_id: str  # m_PrefabInstance.fileID -> the placement's pi fileID
@@ -100,7 +100,7 @@ class ParsedScene:
     render_settings: dict[str, Any] = field(default_factory=dict)
     parse_warnings: list[str] = field(default_factory=list)
     # scene-local stripped fileID -> identity record. Only classID 114
-    # (MonoBehaviour) records are populated in Phase 3; the planner consumes
+    # (MonoBehaviour) records are populated; the planner consumes
     # these to resolve same-scene fileID-only refs to stripped prefab-instance
     # components. Empty for binary scenes (no YAML docs).
     stripped_components: dict[str, StrippedComponentRecord] = field(default_factory=dict)

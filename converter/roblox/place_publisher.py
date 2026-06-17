@@ -361,8 +361,8 @@ def publish_place_file(
                     api_key, universe_id, place_id, script, timeout="300s",
                 )
                 if result is None:
-                    # Codex round-10 [P2]: a timed-out batch may still
-                    # be ``PROCESSING`` on Roblox's side. Every batch
+                    # A timed-out batch may still be ``PROCESSING`` on
+                    # Roblox's side. Every batch
                     # script ends with ``SavePlaceAsync()``, so a
                     # late-completing earlier batch could clobber a
                     # later batch's save with a stale snapshot. ABORT

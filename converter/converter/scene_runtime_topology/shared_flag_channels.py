@@ -1,20 +1,15 @@
-"""shared_flag_channels — Phase 2b reframe (2026-06-01), Class 2.
+"""shared_flag_channels — record the dynamic shared-flag (Class 2) channel.
 
-The empirical whole-plan review (design doc §"Phase 2b — cross-domain
-authority (two bridge classes)") split cross-domain authority into two
-bridge classes. This module records the **Class 2 — dynamic shared-flag**
-channel: an attribute whose NAME is computed at runtime
+A shared flag is an attribute whose NAME is computed at runtime
 (``"has" .. itemName``) and routed through ONE funnel RemoteEvent
-(``PlayerSetSharedFlag``).
-
-Topology cannot OWN each individual runtime write — the name does not
-exist until runtime. So topology GATES + RECORDS the *channel*: the set
-of literal flag names READ across the domain boundary, the domains that
-read them, and the canonical store the funnel writes. The funnel itself
-(the ``_GENERIC_RUNTIME_PROMPT`` ``mirrorFlag`` guidance + the autogen
+(``PlayerSetSharedFlag``). Topology cannot own each individual runtime
+write (the name doesn't exist until runtime), so it GATES + RECORDS the
+*channel*: the literal flag names READ across the domain boundary, the
+reader domains, and the canonical store the funnel writes. The funnel
+itself (the ``mirrorFlag`` prompt guidance + the autogen
 ``PlayerSetSharedFlag`` ``OnServerEvent`` listener) is the irreducible
-runtime mechanism — it STAYS. This module produces the fact; step 2 /
-slice 3 gates the autogen injection on it.
+runtime mechanism and STAYS; this module produces the fact that step 2 /
+slice 3 gates the autogen injection on.
 
 **Schema (one funnel = one record).**
 
@@ -49,13 +44,10 @@ slice 3 gates the autogen injection on it.
     a FRESH transpile. The gate (step 2) injects the funnel iff this is
     true.
 
-**Recompute-only / NOT persisted.** Like ``caller_graph``'s recompute
-path (and the cross-domain edge fields), this fact is recomputed every
-run from the live ``transpilation_result`` reader scan. It rides on
-``TopologyInputs`` and is forwarded into the artifact, but it is never
-read back from a prior on-disk plan as authoritative — there is no
-``preserved_shared_flag_channels`` path. (This is the fix for the
-slice-2 drift where ``cross_domain_edge_candidates`` WAS persisted.)
+**Recompute-only / NOT persisted.** Recomputed every run from the live
+``transpilation_result`` reader scan; forwarded into the artifact but
+never read back from a prior on-disk plan as authoritative (there is no
+``preserved_shared_flag_channels`` path).
 
 **Resume — FAIL OPEN.** On a no-transpile resume
 (``transpilation_result is None``) the reader scan source is ABSENT, so a
@@ -113,26 +105,19 @@ _FUNNEL_WRITER_DOMAIN = "client"
 # (<=64) is enforced below. The closing quote is back-referenced to the
 # opening one so mismatched quote styles don't span across args.
 #
-# SUPERSEDES the slice-2 R4 broadening (``[^"']+?``, restored at R2): that
-# change recorded impossible attribute names (spaces/hyphens) the funnel's
-# ``^[%w_]+$`` filter can never deliver, making the fact claim runtime
-# coverage that doesn't exist. Codex R2 P2, 2026-06-01.
 # Also matches ``:GetAttributeChangedSignal("name")`` — a server reader
 # whose ONLY shared-flag access is the *signal* form (waits for the flag
 # to change rather than reading its current value) is just as much a
-# cross-domain reader as the literal ``:GetAttribute("name")`` form, and
-# Phase 3 deliverable #2 explicitly lists ``GetAttributeChangedSignal``
-# readers. The optional ``ChangedSignal`` group keeps one regex for both;
-# the ``[A-Za-z0-9_]+`` charset + <=64 cap + quote backreference are
-# unchanged in intent (Roblox attribute-name constraint == the funnel's
-# ``^[%w_]+$`` filter). Claude R1 P2, 2026-06-01.
+# cross-domain reader as the literal ``:GetAttribute("name")`` form. The
+# optional ``ChangedSignal`` group keeps one regex for both; the charset +
+# <=64 cap + quote backreference are unchanged in intent.
 _GET_ATTR_RE = re.compile(
     r""":GetAttribute(?:ChangedSignal)?\(\s*(?P<q>['"])(?P<attr>[A-Za-z0-9_]+)(?P=q)\s*\)""",
 )
 
 # Mirror the funnel listener's length cap (``#flagName > 64``): a captured
 # name longer than this is dropped by the runtime, so the fact must not
-# record it. Codex R2 P2, 2026-06-01.
+# record it.
 _MAX_FLAG_NAME_LEN = 64
 
 
@@ -224,8 +209,7 @@ def compute_shared_flag_channels(
         # Early skip: ``:GetAttribute`` is the shared prefix of BOTH the
         # literal read (``:GetAttribute(``) and the signal form
         # (``:GetAttributeChangedSignal(``) the regex now matches. Using
-        # the prefix (no trailing ``(``) keeps both in scope. Claude R1
-        # P2, 2026-06-01.
+        # the prefix (no trailing ``(``) keeps both in scope.
         if ":GetAttribute" not in ts.luau_source:
             continue
         reader_sid = _script_id_for_transpiled(ts, script_id_by_name)
@@ -240,23 +224,13 @@ def compute_shared_flag_channels(
             # NOT add to ``read_names`` (no domain to attribute it to), so
             # the name set stays unpolluted.
             #
-            # Codex R2↔R3 OSCILLATION resolved 2026-06-01: R2 P3 asked to
-            # skip fail-open for ``LocalScript`` readers (provably client →
-            # same-domain → over-reports otherwise); R3 P2 showed that
-            # ``TranspiledScript.script_type`` here is PRE-COHERENCE and
-            # NOT authoritative (``script_coherence._fix_client_server_classification``
-            # can flip LocalScript→Script for server-only APIs), so trusting
-            # it to SUPPRESS fail-open can wrongly drop a real server reader.
-            # The two asks point opposite directions on the same signal.
-            # Resolution: do NOT decide on the non-authoritative pre-coherence
-            # type — fail open on ANY unmappable reader with a qualifying
-            # read. Fail-open is conservative: it keeps the funnel, which is
-            # harmless-if-unused and is exactly today's unconditional
-            # behavior (strictly no worse). Over-reporting ``present`` for a
-            # genuinely-client unmappable reader (R2 P3's concern) is the
-            # lesser evil vs wrongly suppressing a reclassified-to-server
-            # reader (R3 P2). The authoritative-domain fix belongs with the
-            # pre-vs-post-coherence root issue (see TODO.md follow-up).
+            # Fail open on ANY unmappable reader with a qualifying read; do
+            # NOT use ``TranspiledScript.script_type`` to suppress it — that
+            # type is PRE-COHERENCE and NOT authoritative (coherence can flip
+            # LocalScript→Script), so trusting it could wrongly drop a real
+            # server reader. Fail-open is conservative: it keeps the funnel
+            # (harmless-if-unused), which is exactly today's unconditional
+            # behavior (strictly no worse).
             if _GET_ATTR_RE.search(ts.luau_source):
                 fail_open_present = True
             continue
@@ -265,9 +239,8 @@ def compute_shared_flag_channels(
         # writer side. A NON_RUNTIME reader domain (``""``/``"helper"``/
         # ``"excluded"``/``"legacy"``) is never emitted at runtime, so it
         # must NOT pollute ``read_names`` or set ``present`` — it cannot
-        # actually read the flag at runtime. Codex R1 P2-A, 2026-06-01.
-        # (``not reader_domain`` is subsumed since ``"" in
-        # NON_RUNTIME_DOMAINS``; behavior is equivalent.)
+        # actually read the flag at runtime. (``not reader_domain`` is
+        # subsumed since ``"" in NON_RUNTIME_DOMAINS``; equivalent.)
         if (reader_domain in NON_RUNTIME_DOMAINS
                 or reader_domain == _FUNNEL_WRITER_DOMAIN):
             continue
@@ -275,7 +248,7 @@ def compute_shared_flag_channels(
             attr = match.group("attr")
             # Mirror the funnel's ``#flagName > 64`` cap: a longer name is
             # dropped by the runtime listener, so the fact must not record
-            # it. Codex R2 P2, 2026-06-01.
+            # it.
             if len(attr) > _MAX_FLAG_NAME_LEN:
                 continue
             read_names.add(attr)
@@ -287,7 +260,7 @@ def compute_shared_flag_channels(
             reader_domains=sorted(reader_domains),
             canonical_stores=sorted(CANONICAL_STORES),
             # ``present`` from mapped readers OR the fail-open signal for
-            # an unmappable-but-qualifying reader (Codex R1 P3).
+            # an unmappable-but-qualifying reader.
             present=bool(read_names) or fail_open_present,
         ),
     }

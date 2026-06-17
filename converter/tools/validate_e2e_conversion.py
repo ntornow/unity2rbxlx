@@ -157,15 +157,13 @@ def main() -> int:
         return 1
     print("OK   mesh IDs match snapshot")
 
-    # 5) generic-mode fail-closed gate (Fix #15 Root A)
+    # 5) generic-mode fail-closed gate
     #    Pipeline.run_all() does NOT raise when a runtime-bearing
     #    module survives reprompt still broken -- it stamps
     #    "scene-runtime contract failed closed" onto ctx.errors and
-    #    writes the rbxlx anyway. Without this gate, /e2e-test would
-    #    only surface the breakage as a confusing cascade in the
-    #    gameplay-fixture half. The old pytest harness enforced this
-    #    via ``ctx.errors`` inspection; the validator reads the same
-    #    list from ``conversion_context.json``.
+    #    writes the rbxlx anyway. This gate reads that list from
+    #    ``conversion_context.json`` so the breakage surfaces here
+    #    rather than as a cascade in the gameplay-fixture half.
     if mode == "generic":
         try:
             assert_no_contract_failures(output_dir)

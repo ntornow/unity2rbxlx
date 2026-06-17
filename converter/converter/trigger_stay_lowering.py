@@ -46,23 +46,15 @@ EXACT, BINDING-LOCAL match (BLOCKING design requirement):
   * Idempotent: the rewritten call has no ``"Touched"`` literal and no longer
     matches, so a second pass is a no-op.
 
-The matcher is string-span / structural (consistent with the other facet
-transforms). A line-local regex finds only the call HEAD
-(``self.host:connectGameObjectSignal(``); ``_find_touched_separator`` then scans
-forward for the first CODE-LEVEL ``, "Touched",`` separator -- skipping any
-``"Touched"`` buried inside the go expression's own short string, Luau
-long-bracket string, or ``--`` comment -- so ``<go>`` is the whole first
-argument (a name, an index, or a call -- not just ``self.gameObject``, and may
-itself carry a long-string literal) and is preserved verbatim. The captured
-``<go>`` is balance-checked (``_is_balanced_first_arg``: type-matched bracket
-stack + short/long-string aware) and the rewrite ABSTAINS on any unbalanced /
-mismatched fragment -- the safe degrade, never a corrupt rewrite.
-
-Two further abstain guards stop a rewrite whose HEAD itself sits inside a Lua
-string/comment: ``_luau_pos_is_code`` skips short quoted strings and ``--``
-line comments (line-local), and ``_luau_pos_in_long_bracket`` skips multi-line
-long-bracket strings (``[[ ... ]]``/``[=[ ... ]=]``) and block comments
-(``--[[ ... ]]``) opened on an earlier line.
+The matcher is string-span / structural: a line-local regex finds only the call
+HEAD; ``_find_touched_separator`` then scans structurally for the first
+CODE-LEVEL ``, "Touched",`` separator (the captured-``<go>`` rationale lives at
+``_CONNECT_HEAD_RE``). The captured ``<go>`` is balance-checked
+(``_is_balanced_first_arg``) and the rewrite ABSTAINS on any unbalanced fragment
+-- the safe degrade, never a corrupt rewrite. Two further guards skip a HEAD that
+itself sits inside a string/comment: ``_luau_pos_is_code`` (short strings + ``--``
+line comments, line-local) and ``_luau_pos_in_long_bracket`` (multi-line
+long-bracket strings/block comments opened on an earlier line).
 """
 
 from __future__ import annotations
@@ -125,24 +117,14 @@ def _is_balanced_first_arg(go: str) -> bool:
     (no unterminated string), and no Luau long-bracket string is left open --
     delimiters inside string literals (short OR long) ignored.
 
-    The widened ``.+?`` go-capture anchors on the *first* ``, "Touched",`` it
-    sees. If the go expression itself contains an internal ``, "Touched",``
-    (e.g. ``self:pick("foo", "Touched", x)``), the non-greedy capture stops at
-    the INTERNAL anchor and over-captures a short, UNBALANCED fragment
-    (``self:pick("foo"``). Rewriting that fragment drops the wrong ``"Touched"``
-    and corrupts the call. Guarding on balance lets the real captures
-    (``self.gameObject``, ``self.parts[1]``, ``self:getTriggerPart()``,
-    ``self:pick("Touched", x)``, ``self:pick([[foo, "Touched", bar]], x)``)
-    through while the pathological internal-anchor fragment -- which is
-    necessarily unbalanced -- ABSTAINS (bias-to-abstain: the safe degrade,
-    never corrupt).
+    Guards against an over-captured fragment from an internal ``, "Touched",``
+    (``self:pick("foo", "Touched", x)``): the pathological prefix is necessarily
+    unbalanced and ABSTAINS, while the real captures pass.
 
     Two correctness properties beyond a naive depth counter:
       * Long-string aware: a Luau long-bracket literal (``[[ ... ]]`` and
-        leveled ``[=[ ... ]=]``) is a STRING -- its contents (including any
-        ``, "Touched",`` or stray brackets) are skipped, reusing
-        ``_long_bracket_open_level`` so a balanced go carrying a long-string
-        does not false-abstain. An UNCLOSED long string is unbalanced.
+        leveled ``[=[ ... ]=]``) is a STRING -- its contents are skipped (reusing
+        ``_long_bracket_open_level``); an UNCLOSED long string is unbalanced.
       * Type-matched stack: each closer must match the most-recent opener's
         type, so ``(1]`` is unbalanced rather than netting to depth zero.
     """
@@ -297,12 +279,8 @@ def _find_touched_separator(source: str, start: int) -> int | None:
     physical line.
 
     "Code-level" means NOT inside a short string, a Luau long-bracket string, or
-    a ``--`` comment (line OR ``--[=*[`` block). A naive first-textual-``"Touched"``
-    anchor (the old non-greedy regex) lands on a ``"Touched"`` buried inside the
-    go expression's own string/comment payload (e.g. a long-string first arg
-    ``[[foo, "Touched", bar]]``) and truncates the go mid-literal -> false-abstain
-    or, worse, the wrong separator. Skipping string/comment spans anchors on the
-    real separator instead.
+    a ``--`` comment (line OR ``--[=*[`` block) -- skipping those spans anchors on
+    the real separator, not a ``"Touched"`` buried in the go's own payload.
 
     The scan is LINE-LOCAL (stops at the first newline): the transpiler always
     emits the ``connect...(<go>, "Touched",`` head on a single physical line, so
@@ -311,9 +289,7 @@ def _find_touched_separator(source: str, start: int) -> int | None:
     NOTE: bracket depth is intentionally NOT tracked. The FIRST code-level
     ``, "Touched",`` is taken as the separator even when it sits inside a nested
     call (``self:pick(a, "Touched", x)``); the resulting prefix go is then
-    unbalanced and the caller's balance guard ABSTAINS. This bias-to-abstain on
-    an ambiguous nested ``, "Touched",`` is the safe degrade -- never a corrupt
-    rewrite -- and keeps the round-2 short-string case abstaining.
+    unbalanced and the caller's balance guard ABSTAINS -- the safe degrade.
     """
     i = start
     n = len(source)
@@ -481,11 +457,9 @@ def lower_trigger_stay(scripts: list[_HasLuauSource]) -> int:
     host method ``connectGameObjectSignalStay(go, fn)``. Returns the number of
     scripts modified.
 
-    GENERAL rule: keyed on the guaranteed ``-- OnTriggerStay`` origin comment
-    immediately above the binding, NEVER on ``s.name`` -- it applies to any
-    OnTriggerStay binding, not just the turret. OnTriggerEnter/Exit and the
-    OnCollision* variants keep their ``.Touched`` edge semantics (their origin
-    comments don't match)."""
+    Keyed on the ``-- OnTriggerStay`` origin comment immediately above the binding
+    (not ``s.name``); OnTriggerEnter/Exit and the OnCollision* variants keep their
+    ``.Touched`` edge semantics (their origin comments don't match)."""
     changed = 0
     for s in scripts:
         src = s.luau_source or ""

@@ -57,32 +57,42 @@ _RE_SERIALIZED_FIELD = re.compile(
     r"\[SerializeField\]\s*(?:private\s+)?(\w+)\s+(\w+)",
 )
 
+# C# ``static event`` declarations. A static event is a TYPE-level entity the
+# converter lowers to a module-table FIELD shared across every instance of the
+# class (the same cached require table). Each member name is exactly the Luau
+# field name the producer assigns and the consumer reads (``Player.AmmoUpdate``),
+# so this is the DETERMINISTIC upstream signal the channel-identity fix anchors
+# on. We match ``[modifiers] static event <HandlerType[generic/qualified]>
+# <declarator-list>`` where ``static`` and ``event`` co-occur (either order is
+# legal C#). A SINGLE declaration may bind MULTIPLE members:
+# ``public static event H Foo, Bar;`` declares both ``Foo`` AND ``Bar`` of type
+# ``H``. We therefore capture the handler type (group 1, the first type token —
+# generic/qualified allowed) and the WHOLE comma-separated declarator span up to
+# the terminator (group 2), and split the names in ``analyze_script``. NEVER parse
+# the emitted Luau.
+_RE_STATIC_EVENT = re.compile(
+    r"\bstatic\b"                  # the static modifier (anywhere in the modifier list)
+    r"(?:\s+(?:public|private|protected|internal|readonly|new|abstract))*"
+    r"\s+event\s+"                 # the event keyword
+    r"([\w<>\.\[\]]+(?:\s*<[^;{}]*>)?)"  # handler type (generic / qualified ok), group 1
+    r"\s+([\w\s,]+?)\s*"          # declarator list (one or more comma-separated names), group 2
+    r"(?:;|=|\{)",                 # declaration terminator
+)
+# Split a captured declarator span (``Foo, Bar`` / ``Foo``) into member names.
+_RE_DECLARATOR = re.compile(r"\b\w+\b")
+
 # GLOBAL scene-lookup generics whose type argument is NOT a dependency
-# edge at all: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING
-# instance of T somewhere in the scene. T's reachability/placement comes
-# from its own scene authoring or instantiation — NOT from the finder — so
-# the finder creates no structural relationship and no ``require()`` need.
-# Counting the type arg poisons ``dependency_map`` (e.g. ``Plane`` doing
-# ``FindObjectOfType<GameManager>()`` misroutes ``GameManager`` to
-# ServerStorage). If T is genuinely required it appears via a
-# field/``new``/param/base reference, captured by the other patterns.
-#
-# NOTE (Codex review, 2026-06-01): this set is deliberately LIMITED to
-# GLOBAL lookups. ``GetComponent<T>`` / ``AddComponent<T>`` /
-# ``TryGetComponent<T>`` / ``GetComponentInChildren<T>`` etc. are NOT here:
-# those reference a PEER component (or, for ``AddComponent``, create it),
-# which IS a real dependency edge that ``dependency_map`` feeds to
-# ``resolve_caller_graph`` / ``derive_reachability_requirements`` /
-# ``_compute_network_behaviour_reachable`` — none of which re-scan these
-# APIs. Dropping a component-lookup edge would ORPHAN a component that's
-# referenced only that way. (Whether such edges should also drive a
-# ``require()`` is a separate, pre-existing concern at the injection site,
-# out of scope here.)
+# edge: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING instance of
+# T, so the finder creates no structural relationship and no ``require()``
+# need; counting the type arg poisons ``dependency_map``. The set is
+# deliberately LIMITED to GLOBAL lookups — component lookups
+# (``GetComponent<T>`` / ``AddComponent<T>`` / …) reference a real peer
+# edge the reachability consumers need, so they are NOT excluded here.
 _GLOBAL_LOOKUP_GENERIC_METHODS = frozenset({
     # Legacy global finders.
     "FindObjectOfType", "FindObjectsOfType",
-    # ``Resources.FindObjectsOfTypeAll<T>()`` is PLURAL "Objects" (Codex
-    # review 2026-06-01 — the singular form does not exist as an API).
+    # ``Resources.FindObjectsOfTypeAll<T>()`` is PLURAL "Objects" (the
+    # singular form does not exist as an API).
     "FindObjectsOfTypeAll",
     # Unity 2023+ replacements for the deprecated finders above.
     "FindFirstObjectByType", "FindAnyObjectByType", "FindObjectsByType",
@@ -114,6 +124,11 @@ class ScriptInfo:
     is_test_script: bool = False
     suggested_type: str = "Script"  # Script, LocalScript, ModuleScript
     referenced_types: list[str] = field(default_factory=list)  # Project types used
+    # ``public static event`` member names. Each is a TYPE-level event the
+    # converter lowers to a shared module-table FIELD (``Player.AmmoUpdate``);
+    # the member name IS the Luau field name. Deterministic upstream signal for
+    # the static-event channel-identity fix — never derived from the AI output.
+    static_events: list[str] = field(default_factory=list)
 
 
 def analyze_script(script_path: str | Path) -> ScriptInfo:
@@ -160,6 +175,21 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
         (m.group(1), m.group(2)) for m in _RE_SERIALIZED_FIELD.finditer(decommented)
     ]
 
+    # Extract ``public static event`` member names (declaration order, deduped).
+    # These are the deterministic upstream signal for the static-event channel-
+    # identity fix: the member name is the Luau module-table field the converter
+    # lowers the event to.
+    _seen_events: set[str] = set()
+    for m in _RE_STATIC_EVENT.finditer(decommented):
+        # group(2) is the declarator list — one member (``Foo``) or a comma list
+        # (``Foo, Bar``). Split so EVERY member of a multi-declarator declaration
+        # reaches ``static_events`` (a single ``public static event H Foo, Bar;``
+        # declares both ``Foo`` and ``Bar``, not just the last).
+        for name in _RE_DECLARATOR.findall(m.group(2)):
+            if name and name not in _seen_events:
+                _seen_events.add(name)
+                info.static_events.append(name)
+
     # Extract type references (field types, method parameter types, etc.)
     # Matches PascalCase identifiers used as types in declarations
     _type_refs: set[str] = set()
@@ -175,17 +205,8 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
         _type_refs.add(m2.group(1))
     # Generic type args: List<TypeName>, Dictionary<K, TypeName>.
     # EXCLUDE the type arg of GLOBAL scene-lookup generics
-    # (``FindObjectOfType<T>`` etc.): those locate an already-existing T,
-    # creating no dependency edge and no ``require()`` need. Counting them
-    # poisons ``dependency_map`` (which feeds the legacy require-injector
-    # AND the topology caller_graph), e.g. ``Plane`` calling
-    # ``FindObjectOfType<GameManager>()`` misroutes ``GameManager`` to
-    # ServerStorage. Component-lookup generics (``GetComponent<T>`` /
-    # ``AddComponent<T>`` / …) are NOT excluded — they are real peer edges
-    # the reachability consumers need (see _GLOBAL_LOOKUP_GENERIC_METHODS).
-    # If T is genuinely require-worthy it's also captured by the
-    # new/field/param/base patterns. See TODO.md "Transpiler false-positive
-    # require() injection".
+    # (``FindObjectOfType<T>`` etc.) — see _GLOBAL_LOOKUP_GENERIC_METHODS
+    # for why; component-lookup generics are kept.
     # Capture the optional token immediately before ``<`` so we can tell a
     # global-lookup method (``FindObjectOfType<Foo>``) from a collection
     # type (``List<Foo>``) or a component lookup (``GetComponent<Foo>``).

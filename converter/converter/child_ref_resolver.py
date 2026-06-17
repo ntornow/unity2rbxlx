@@ -27,9 +27,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# Verified import paths — these match serialized_field_extractor.py exactly.
-# ``converter/`` is on sys.path, so the package prefix is ``core.``, and
-# GuidIndex / ParsedScene / PrefabLibrary all live in core.unity_types.
 from core.unity_types import (
     GuidIndex,
     ParsedScene,
@@ -67,22 +64,14 @@ class RigRootedRetargetFact:
     ``cam_receiver`` carries the EXACT camera receiver expression text the
     admission resolved (the C# group-2 receiver of ``<field> = <camrecv>.GetChild(n)``,
     e.g. ``cam`` for a seeded symbol or ``Camera.main.transform`` for the direct
-    form). Path A re-anchor: this is now an OPTIONAL Tier-2 refinement — the lowering
-    uses it ONLY to opportunistically pick the camera-child init-write to clean
-    (best-effort hygiene); it is NEVER required for the read-reroute discharge. Its
-    absence (the AI collapsed the RHS) is a SKIP, not a failure. Defaults to "".
-
-    REDESIGN r3 RE-PROMOTION: ``cam_receiver`` AND the new ``ordinal`` (the n in the
-    credited ``GetChild(n)``) are PROMOTED to LOAD-BEARING as the deterministic
-    upstream anchor for check D's dead-write exemption (stamped into the carrier as
-    ``cam_receiver``/``cam_ordinal`` — slice 1.2 consumes them). They remain NOT a
-    discharge condition. ``ordinal`` is in hand at every construction site
-    (``int(m.group(...))``); for an admitted fact ``cam_receiver`` is NEVER "".
+    form). It is the deterministic upstream anchor for check D's dead-write
+    exemption (stamped into the carrier as ``cam_receiver``/``cam_ordinal``), but is
+    NOT a discharge condition: for an admitted fact it is NEVER "".
     """
     field_name: str  # the assignment LHS field ("weaponSlot"), from `<field> = cam.GetChild(n)`
     child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded
     cam_receiver: str = ""  # the C# group-2 camera receiver text (the lowering's RECEIVER ANCHOR)
-    ordinal: int = 0  # REDESIGN r3: the n in the credited GetChild(n); -> carrier cam_ordinal
+    ordinal: int = 0  # the n in the credited GetChild(n); -> carrier cam_ordinal
 
 
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
@@ -552,7 +541,7 @@ def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
     """True iff the seed assignment starting at ``seed_start`` dominates the
     GetChild use at ``use_pos`` on the STRAIGHT-LINE path — i.e. the seed is in the
     same block or an unconditional enclosing scope, NOT buried in a
-    conditional/dead branch that closes before the use (codex round-3 BLOCKING).
+    conditional/dead branch that closes before the use.
 
     Conservative — ABSTAINS (returns False) whenever it cannot cheaply prove
     dominance, so a false-admitted fact is impossible (a missed fact is safe):
@@ -586,7 +575,7 @@ def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
     # statement is directly governed by a braceless conditional, it does not
     # dominate.
     #
-    # TRIVIA-ROBUST (codex harden BLOCKING): the back-walk MUST skip ``//``/``/* */``
+    # TRIVIA-ROBUST: the back-walk MUST skip ``//``/``/* */``
     # comments, not just whitespace. A comment between the governing header and the
     # seed (``if (c) /*x*/ cam = ...`` / ``if (c) // n\n cam = ...``) otherwise lands
     # ``prev`` on the comment delimiter, defeating the conditional detection and
@@ -697,12 +686,12 @@ def _seed_lhs_is_bare_or_this(source: str, sym_start: int) -> bool:
     FOREIGN member access (``other.cam = ...`` / ``a.b.cam = ...``).
 
     Mirrors the ``_lhs_is_bare_field`` "bare or ``this.`` only" discipline applied
-    to the GetChild LHS (round-1 BLOCKING #1): a seed assignment to a member field
-    of a foreign object is NOT a binding of the bare symbol used at the GetChild, so
-    it must not be admitted as a camera seed.
+    to the GetChild LHS: a seed assignment to a member field of a foreign object is
+    NOT a binding of the bare symbol used at the GetChild, so it must not be admitted
+    as a camera seed.
 
-    TRIVIA-ROBUST (phase-integration FINDING 1, UNSAFE direction): the "preceded by
-    ``.``" member-access check skips ALL C# trivia — spaces, tabs, NEWLINES, and
+    TRIVIA-ROBUST: the "preceded by ``.``" member-access check skips ALL C# trivia —
+    spaces, tabs, NEWLINES, and
     ``//``/``/* */`` comments — between the symbol and the preceding token, via
     ``_skip_ws_and_comments_back``. Without it a foreign member-LHS seed split by a
     comment or newline (``other.\ncam = ...`` / ``other./*c*/cam = ...``) false-admits
@@ -748,7 +737,7 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     Returns None for any foreign chain (``enemy.cam``, ``other.cam.transform``, a
     bare symbol with no such seed). EXACT match, NOT ``endswith``/substring.
 
-    Anchored to ``use_pos`` (codex BLOCKING): a later/unrelated
+    Anchored to ``use_pos``: a later/unrelated
     ``cam = Camera.main.transform`` after the GetChild does NOT admit when the
     binding live AT the GetChild is foreign (``cam = enemy.transform``). The seed
     is the LAST ``<sym> = <rhs>`` strictly before ``use_pos``; it admits iff that
@@ -763,7 +752,7 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     # ``<recv> = <rhs>`` (not ``==``) at a code position with start < use_pos.
     # Whichever is last wins (it is the binding live at the GetChild line).
     #
-    # SEED-LHS DISCIPLINE (round-1 BLOCKING #1 — mirror ``_lhs_is_bare_field``):
+    # SEED-LHS DISCIPLINE (mirror ``_lhs_is_bare_field``):
     # the binding's LHS symbol must be a BARE symbol or a ``this.<recv>`` write —
     # NOT a FOREIGN member access ``<other>.<recv>``. The ``\b`` after the ``.`` of
     # ``other.cam`` lets ``any_assign_re`` (``\bcam\s*=``) match the ``cam`` token
@@ -784,7 +773,7 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     if nearest_start == -1:
         return None  # no binding before the use site -> not seed-resolvable
     # Is that nearest preceding binding EXACTLY ``<recv> = Camera.main.transform``?
-    # TRIVIA-ROBUST (codex harden — mirror the LHS round-5 discipline): the seed's
+    # TRIVIA-ROBUST: the seed's
     # ``<recv>``, ``=``, and the ``Camera.main.transform`` literal may be separated by
     # ``//``/``/* */`` comments (``cam = /*c*/ Camera.main.transform``); skip trivia
     # forward between tokens so a comment-split LEGIT seed is not false-REJECTED (a
@@ -799,7 +788,7 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     tail = _skip_ws_and_comments_fwd(source, end)
     if tail < len(source) and source[tail] == ".":
         return None  # longer chain -> not the exact one-hop seed
-    # SCOPE-AWARE (codex round-3 BLOCKING): order-nearest is not enough — the seed
+    # SCOPE-AWARE: order-nearest is not enough — the seed
     # must DOMINATE the use site on the straight-line path. A seed buried in a
     # dead/conditional block (``if (false) { cam = Camera.main.transform; }``) does
     # NOT dominate ``weaponSlot = cam.GetChild(0)`` below it; abstain rather than
@@ -910,31 +899,17 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
     starting at ``field_start``, return the bare field name iff the LHS is a bare
     field WRITE or a ``this.``-qualified field write; else None.
 
-    REJECTED (abstain):
-      - a FOREIGN member-access LHS like ``x.weaponSlot`` (round-1 BLOCKING #2 /
-        edge 11) — a foreign ``.`` qualifier precedes the LHS; and
-      - a TYPED LOCAL DECLARATION like ``Transform weaponSlot = ...`` / ``var x = ...``
-        / a GENERIC ``List<Transform> weaponSlot = ...`` / an ARRAY ``Transform[]
-        weaponSlot = ...`` / a QUALIFIED-GENERIC
-        ``System.Collections.Generic.List<Transform> weaponSlot = ...`` (round-5
-        MAJOR) — a leading type TOKEN precedes the field. A local temp is NOT a rig
-        fact (the field never persists on the instance), so admitting it would flip
-        ``resolved_total`` and create a bogus fail-closed path for valid code.
-
     A bare field write (``weaponSlot = ...`` / ``this.weaponSlot = ...``) is the
-    ONLY admitted shape. ALLOW-LIST BY TERMINATOR: a bare field write's preceding
-    non-blank char in C# is always a STATEMENT TERMINATOR (``;``/``{``/``}``) or
-    start-of-file; ANY other preceding char means a leading token precedes the field.
-    This is the FAIL-CLOSED choice: it ABSTAINS on every typed-local form — simple
-    (``Transform``), generic (``List<T>``, prev ``>``), array (``T[]``, prev ``]``),
-    qualified (``A.B.T``, prev ``.``), nullable (``Transform?``, prev ``?``), tuple
-    (``(T, int)``, prev ``)``), comment-separated (``T /*c*/``, prev ``/``) — none of
-    which a single-char REJECT-list could enumerate (codex round-5: ``Transform?`` /
-    ``(T,int)`` escaped a reject-list, and ``)``/``:`` are AMBIGUOUS between a tuple
-    type and an ``if (ok) x``). Over-abstaining a rare conditional/labeled camera
-    write (``if (ok) weaponSlot = ...``) is fail-closed-safe; ADMITTING a typed local
-    (a bogus rig fact -> a false fail-close on valid code) is not. The corpus write
-    is a plain statement, so this admits the happy-path and never a typed local."""
+    ONLY admitted shape; a foreign member-access LHS (``x.weaponSlot``) or a typed
+    local declaration (``Transform weaponSlot = ...`` etc.) abstains.
+
+    ALLOW-LIST BY TERMINATOR: a bare field write's preceding non-blank char in C# is
+    always a STATEMENT TERMINATOR (``;``/``{``/``}``) or start-of-file; ANY other
+    preceding char means a leading token (a type, control-flow head) precedes the
+    field. This is the FAIL-CLOSED choice — admitting a typed local would flip
+    ``resolved_total`` and false-fail-close valid code, while over-abstaining a rare
+    conditional camera write is safe — and an allow-list avoids the unbounded
+    type-token reject-list (``Transform?``, ``(T,int)`` escape it)."""
     parts = full_lhs.split(".")
     if len(parts) == 1:
         field = parts[0]
@@ -992,7 +967,7 @@ def _resolve_rig_facts(
                 field_name=field,
                 child_name=name,
                 cam_receiver=m.group(2),
-                ordinal=ordinal,  # REDESIGN r3: credited GetChild(n) -> carrier cam_ordinal
+                ordinal=ordinal,  # credited GetChild(n) -> carrier cam_ordinal
             )
         )
     return rig_facts

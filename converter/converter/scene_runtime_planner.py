@@ -20,6 +20,8 @@ this module implements.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -355,10 +357,70 @@ class SceneRuntimeDisplacedInstance(TypedDict):
     inferred_domain: str
 
 
+class SceneRuntimeStaticChannel(TypedDict):
+    """One C#-derived ``static event`` lowered to a shared module-table field.
+
+    A C# ``public static event`` is a TYPE-level entity that must exist before
+    any instance ``Awake``. The converter lowers it to a BindableEvent stored on
+    the module table FIELD (``Player.AmmoUpdate``) that the producer fires and the
+    consumer reads. Because the producer's prefab-batch ``Awake`` can run AFTER a
+    consumer's scene-batch ``Awake``, the runtime pre-sets this field before any
+    ``Awake`` batch (``SceneRuntime:_ensureStaticEventChannels``) so the channel
+    instance is shared regardless of order. Every field here is derived from the
+    DETERMINISTIC C# ``static event`` declaration, never the AI-emitted Luau.
+
+    ``module_id``: the canonical script id (``.cs`` GUID or project-relative
+        source path) of the declaring class. UNIQUE per module (it is the
+        ``modules`` dict key), so it is the structured identity the channel
+        hierarchy keys on.
+    ``field_name``: the C# event member name = the Luau module-table field.
+    ``channel_name``: the BindableEvent INSTANCE name — the BARE ``field_name``.
+        The instance is made unique not by mangling this name but by parenting it
+        under a per-module ``Folder`` (``module_folder``), so two classes' same-
+        named static events get DISTINCT instances under DISTINCT folders (no
+        cross-class aliasing) AND no flat-concat keyspace collision (a flat
+        ``<stem>_<field>`` aliases ``stem="A_B",field="C"`` with
+        ``stem="A",field="B_C"``). The consumer reads the module FIELD
+        (``field_name``), never the BindableEvent name or its location, so the
+        structured location does not affect the rendezvous.
+    ``module_folder``: the OPAQUE, dot-free, collision-resistant token of a per-
+        module ``Folder`` created under ``parent_path``. Derived from the UNIQUE
+        ``module_id`` via a stable hash (NOT a lossy sanitization of the id, which
+        could re-collapse two distinct source-path ids — see
+        ``_module_channel_folder``). The runtime find-or-creates this one Folder
+        under the (strictly-resolved, must-already-exist) ``parent_path`` and
+        parents the BindableEvent under it.
+    ``parent_path``: dotted DataModel path of the (already-existing) container the
+        per-module Folder is created under (the declaring module's own container,
+        e.g. ``ReplicatedStorage`` for a client cross-script signal). The runtime
+        resolves this STRICTLY (fail-closed nil if any segment is missing) and only
+        creates the terminal ``module_folder`` Folder beneath it.
+    ``module_path``: dotted DataModel path the runtime ``require``s to reach the
+        module table whose field is set.
+    ``domain``: ``"client"`` | ``"server"`` — the channel is a same-domain
+        BindableEvent field on the shared VM; cross-domain signals route via
+        RemoteEvents and are NOT emitted here.
+    """
+
+    module_id: str
+    field_name: str
+    channel_name: str
+    module_folder: str
+    parent_path: str
+    module_path: str
+    domain: str
+
+
 class SceneRuntimeArtifact(TypedDict, total=False):
     modules: dict[str, SceneRuntimeModule]
     scenes: dict[str, SceneRuntimeScene]
     prefabs: dict[str, SceneRuntimePrefab]
+    # C#-static-event channels the runtime pre-sets before any Awake batch so the
+    # producer + consumer share the BindableEvent field regardless of scene-vs-
+    # prefab Awake order. Populated by ``_subphase_inject_scene_runtime`` (generic
+    # mode, write_output) — AFTER storage-classify has stamped each module's final
+    # ``domain`` / ``container`` / ``module_path``. Same-domain only.
+    static_channels: list["SceneRuntimeStaticChannel"]
     # Operator-set ``script_id → "client" | "server"`` overrides. Read by
     # PR3b's domain classifier; PR1 just preserves whatever's there.
     domain_overrides: dict[str, str]
@@ -1171,7 +1233,6 @@ def _build_modules_table(
 
 # ---------------------------------------------------------------------------
 # Class-name collision detection + script-by-class-name join
-# (Phase 2a slice 4 rounds 3-5).
 # ---------------------------------------------------------------------------
 
 def compute_class_name_collisions(
@@ -1180,21 +1241,13 @@ def compute_class_name_collisions(
     """Return the set of ``class_name`` values that appear on more
     than one ``SceneRuntimeModule`` row.
 
-    Phase 2a slice 4 round 5 review (Claude P1.1 + P1.2): the
-    class_name keyspace is degraded whenever two modules share a
+    The class_name keyspace is degraded whenever two modules share a
     class_name (e.g. two ``Utils.cs`` files declaring ``class Utils``
     in different folders). Multiple call sites — the topology's
     caller_graph collision detection, the planner's reachability
     rule, the script-by-class-name join — need to make consistent
     routing decisions for these classes. This helper is the SINGLE
     canonical source of truth so all sites read the same set.
-
-    Pre-round-5 each consumer had its own collision walk with
-    different policies (caller_graph: fail closed if dep_map
-    touched; scripts_by_class join: unconditional exclude; reach-
-    ability rule: silent first-write-wins). The asymmetry was a
-    drift surface; collapsing it to a single set keeps the
-    contract explicit + maintainable.
 
     The empty-class_name case is ignored (rows without a
     class_name have nothing to collide on).
@@ -1221,12 +1274,11 @@ def _compute_stem_collisions(
     """Return the set of ``stem`` values that appear on more than one
     ``SceneRuntimeModule`` row.
 
-    Phase 2a slice 5 round 3 (Codex P3): the stem keyspace was the
-    fallback join channel in ``build_script_id_by_name`` but had no
-    collision-exclusion gate — ``setdefault`` silently picked the
-    first writer when two modules shared a stem, violating the
-    docstring's degraded-service contract ("colliding class_names
-    exclude BOTH rows"). This helper mirrors
+    The stem keyspace is the fallback join channel in
+    ``build_script_id_by_name``; without a collision-exclusion gate a
+    ``setdefault`` would silently pick the first writer when two
+    modules share a stem, violating the degraded-service contract
+    ("colliding class_names exclude BOTH rows"). This helper mirrors
     ``compute_class_name_collisions`` for the stem keyspace so the
     contract is uniform across both join channels.
 
@@ -1252,16 +1304,12 @@ def _compute_stem_collisions(
     return frozenset(collisions)
 
 
-# Legacy heading retained — refactored in round 5 to consume the
-# unified collision helper above. See the helper's docstring for the
-# rationale.
-
 def build_scripts_by_class_name(
     scripts: list[RbxScript],
     modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
 ) -> dict[str, RbxScript]:
     """Build a class_name-keyed RbxScript index via primary-then-
-    fallback join. EXCLUDES colliding class_names per the slice-3
+    fallback join. EXCLUDES colliding class_names per the
     degraded-service contract.
 
     For each ``SceneRuntimeModule`` row's ``class_name``, find the
@@ -1276,40 +1324,36 @@ def build_scripts_by_class_name(
     Misses on BOTH joins mean we cannot link the script to the
     module — the entry is omitted.
 
-    **Collision exclusion** (Phase 2a slice 4 round 4 review,
-    Claude P1.1): when two ``SceneRuntimeModule`` rows share a
-    ``class_name``, the class_name-keyed join is fundamentally
-    ambiguous. Following the same degraded-service policy
-    ``_detect_caller_graph_collisions`` uses (slice 3 round 2):
-    exclude the colliding class_name from the index entirely.
-    Both module rows' downstream lookups will fall through to
-    safe defaults (``script_class="ModuleScript"`` in
-    ``_build_modules_block``; orphan-routing in the reachability
-    rule); the alternative (first-write-wins) would stamp the
-    WRONG script's metadata onto the second row.
+    **Collision exclusion**: when two ``SceneRuntimeModule`` rows
+    share a ``class_name``, the class_name-keyed join is
+    fundamentally ambiguous. Following the same degraded-service
+    policy ``_detect_caller_graph_collisions`` uses: exclude the
+    colliding class_name from the index entirely. Both module rows'
+    downstream lookups will fall through to safe defaults
+    (``script_class="ModuleScript"`` in ``_build_modules_block``;
+    orphan-routing in the reachability rule); the alternative
+    (first-write-wins) would stamp the WRONG script's metadata onto
+    the second row.
 
-    Phase 2a slice 4 round 2 + round 3 review (Claude P1.B):
-    single source of truth for the join used by both
+    This is the single source of truth for the join used by both
     ``module_domain.classify_scene_runtime_domains`` (the planner's
     reachability rule) and ``pipeline._build_and_apply_topology``
     (the topology orchestrator).
 
     Behavior note: scripts with empty ``name`` are skipped (they
     can't be addressed via the join). Scripts present in ``scripts``
-    but with no corresponding ``modules`` row are also omitted —
-    pre-slice-4 the planner's reachability rule would iterate them
-    but the closure check would filter them out anyway (orphan
-    scripts aren't in client_classes or server_classes), so this
-    is behavior-neutral for production.
+    but with no corresponding ``modules`` row are also omitted — the
+    reachability rule's closure check filters them out anyway (orphan
+    scripts aren't in client_classes or server_classes), so this is
+    behavior-neutral for production.
     """
     script_by_name: dict[str, RbxScript] = {}
     for s in scripts:
         if s.name:
             script_by_name.setdefault(s.name, s)
 
-    # Phase 2a slice 4 round 5 review (Claude P1.1): consume the
-    # unified class_name collision set so all class-name-keyed
-    # producers share ONE source of truth.
+    # Consume the unified class_name collision set so all
+    # class-name-keyed producers share ONE source of truth.
     colliding_class_names = compute_class_name_collisions(modules)
 
     out: dict[str, RbxScript] = {}
@@ -1338,24 +1382,17 @@ def build_scripts_by_class_name(
 
 
 # ---------------------------------------------------------------------------
-# Intrinsic script_class derivation (Phase 2a slice 5 round 2).
+# Intrinsic script_class derivation.
 #
-# The cycle this breaks: pre-slice-5, ``build_topology._build_modules_block``
-# read ``RbxScript.script_type`` AFTER ``storage_classifier.classify_storage``
-# had mutated it (the LocalScript-in-SSS coercion + StarterPlayerScripts /
-# StarterCharacterScripts post-pass at ``storage_classifier.py:185-194``).
-# That made topology a DOWNSTREAM consumer of storage routing — but the
-# design contract has topology AUTHORITY over storage.
-#
-# Round 1 tried to fix this by reordering the pipeline so build_topology
-# ran BEFORE classify_storage; review consensus rejected that approach
-# (see the revert commit message). Round 2 instead captures the
-# pre-classifier ``script_type`` in a NEW IMMUTABLE field
-# ``RbxScript.intrinsic_script_type`` stamped at construction time
-# (transpile / animation-gen / scriptable-object emit). This helper
-# reads through that field so the artifact's ``script_class`` reflects
-# the C# code-analysis decision regardless of the build_topology call
-# site's position in the pipeline.
+# Topology has AUTHORITY over storage, but ``build_topology._build_modules_block``
+# reads ``RbxScript.script_type`` which ``storage_classifier.classify_storage``
+# mutates (the LocalScript-in-SSS coercion). To keep topology from becoming a
+# DOWNSTREAM consumer of storage routing, the pre-classifier ``script_type`` is
+# captured in an IMMUTABLE field ``RbxScript.intrinsic_script_type`` stamped at
+# construction time (transpile / animation-gen / scriptable-object emit). This
+# helper reads through that field so the artifact's ``script_class`` reflects the
+# C# code-analysis decision regardless of the build_topology call site's position
+# in the pipeline.
 # ---------------------------------------------------------------------------
 
 def derive_intrinsic_script_class(script: RbxScript | None) -> str:
@@ -1375,23 +1412,12 @@ def derive_intrinsic_script_class(script: RbxScript | None) -> str:
     the mutable ``script_type``; neither touches
     ``intrinsic_script_type``.
 
-    Pre-classifier mutators robustness
-    -------------------------------------------------------------
-    The intrinsic value is specifically robust against the two
-    pre-classifier mutators that today are GATED OFF from the
-    topology consumer:
-
-      (a) ``classify_storage``'s ``Script→LocalScript`` routing
-          coercion (still gated by ``build_topology``'s consumer
-          design — topology reads intrinsic, not the mutable field).
-      (b) ``_subphase_cohere_scripts``'s
-          ``fix_require_classifications`` ``Script→ModuleScript``
-          rewrite, gated by generic-mode early-return (see
-          ``pipeline.py:2837-2843``); ``build_topology`` consumption
-          is itself gated to generic-mode (see
-          ``pipeline.py:4057-4058``).
-
-    If either gate is ever lifted, re-stamp
+    The intrinsic value is robust against the pre-classifier
+    mutators that are GATED OFF from the topology consumer —
+    ``classify_storage``'s ``Script→LocalScript`` coercion and
+    ``_subphase_cohere_scripts``'s ``Script→ModuleScript`` rewrite —
+    because topology reads ``intrinsic_script_type``, not the mutable
+    field. If either gate is ever lifted, re-stamp
     ``intrinsic_script_type`` after the relevant mutator runs so the
     immutable-field contract holds at the topology consumption site.
 
@@ -1407,18 +1433,12 @@ def derive_intrinsic_script_class(script: RbxScript | None) -> str:
 
       1. **Rehydration** (``_rehydrate_scripts_from_disk``): the
          stored ``script_type`` reflects the post-classifier value
-         from the prior conversion. A resumed conversion has no
-         fresher signal — preserving the post-classifier reading is
-         the only honest option. The persisted topology artifact's
-         ``script_class`` is preserved verbatim on resume, so this
-         fallback only affects the modest set of rebuilt rows.
+         from the prior conversion, and a resumed conversion has no
+         fresher signal.
       2. **Scaffolding / coherence-pack synthesized scripts** that
-         pre-date this field's introduction and have not been
-         migrated to stamp it. New construction paths SHOULD stamp
-         ``intrinsic_script_type`` so this fallback narrows over time.
-
-    The fallback is acknowledged-impure but bounded; the immutable-
-    field path is the canonical contract.
+         pre-date this field's introduction. New construction paths
+         SHOULD stamp ``intrinsic_script_type`` so this fallback
+         narrows over time.
     """
     if script is None:
         return "ModuleScript"
@@ -1434,14 +1454,14 @@ def derive_intrinsic_script_class(script: RbxScript | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Topology join helper: RbxScript → script_id (Phase 2a slice 5 step 3).
+# Topology join helper: RbxScript → script_id.
 #
-# Slice 6 will need to look up a ``TopologyModuleEntry`` from an
-# ``RbxScript`` (the storage-classifier decision tree iterates RbxScripts
-# but topology is keyed by script_id). The class_name keyspace is the
-# canonical join channel (same one ``build_scripts_by_class_name`` uses
-# in reverse). This helper builds the FORWARD index so slice 6 can do
-# ``script_id_by_name[s.name]`` → topology entry in one hop.
+# Looks up a ``TopologyModuleEntry`` from an ``RbxScript`` (the
+# storage-classifier decision tree iterates RbxScripts but topology is keyed by
+# script_id). The class_name keyspace is the canonical join channel (same one
+# ``build_scripts_by_class_name`` uses in reverse); this helper builds the
+# FORWARD index so a consumer can do ``script_id_by_name[s.name]`` → topology
+# entry in one hop.
 # ---------------------------------------------------------------------------
 
 def build_script_id_by_name(
@@ -1454,8 +1474,8 @@ def build_script_id_by_name(
     Mirrors ``build_scripts_by_class_name`` (which produces the reverse
     direction). Both consume ``compute_class_name_collisions`` so the
     degraded-service contract stays uniform: a class_name shared by
-    two modules excludes BOTH from the index. The consumer (slice 6's
-    ``_decide_script_container_from_topology``) falls through to its
+    two modules excludes BOTH from the index. The consumer
+    (``_decide_script_container_from_topology``) falls through to its
     orphan-routing branch when ``script_id_by_name.get(script.name)``
     returns ``None``.
 
@@ -1602,6 +1622,102 @@ def _resolves_to_component(
         seen.add(current)
         current = base_by_class.get(current, "")
     return False
+
+
+def _module_channel_folder(module_id: str, module_path: str) -> str:
+    """OPAQUE, dot-free, collision-resistant Folder name for a module's static-
+    event channels, keyed on the UNIQUE ``module_id``.
+
+    ``module_id`` is the canonical script id — a ``.cs`` GUID OR a project-relative
+    source path (per the scene-runtime contract), so it may contain ``/``, ``.``,
+    spaces. A LOSSY sanitization (replace each illegal char with ``_``) could
+    collapse two DISTINCT ids onto one Folder and re-introduce the cross-class
+    aliasing this folder structure exists to prevent. So the uniqueness is carried
+    by a full-id hash (never a sanitized prefix of the id); a readable stem prefix
+    is added purely for debuggability and does NOT carry identity.
+
+    The result contains no ``.`` (the runtime splits ``parent_path`` on ``.``) and
+    is a valid Roblox Instance ``Name``. Deterministic over ``module_id``.
+    """
+    digest = hashlib.sha1(module_id.encode("utf-8")).hexdigest()[:12]
+    stem = module_path.rsplit(".", 1)[-1]
+    # Readable, dot-free prefix (identity is the hash, so a collision here is
+    # harmless). Strip to alphanumerics/underscore; cap length.
+    safe_stem = re.sub(r"[^0-9A-Za-z_]", "", stem)[:32]
+    return f"sec_{safe_stem}_{digest}" if safe_stem else f"sec_{digest}"
+
+
+def build_static_event_channels(
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+    static_events_by_script_id: dict[str, list[str]],
+) -> list[SceneRuntimeStaticChannel]:
+    """Build the ``static_channels`` plan list from the deterministic C#
+    ``static event`` enumeration.
+
+    Pure function: for each script id that declares one or more C# static events
+    (``static_events_by_script_id``, surfaced by ``script_analyzer``), emit one
+    channel row per event member. Each channel pre-sets the module-table FIELD the
+    producer fires and the consumer reads, so the runtime can share the
+    BindableEvent instance before any ``Awake`` runs (regardless of scene-vs-
+    prefab order).
+
+    GATING (fail-closed, same-domain only):
+      * The module must be runtime-bearing and resolved to a concrete same-VM
+        domain (``client`` / ``server``) with a stamped ``module_path`` +
+        ``container``. A helper/excluded/unstamped module is SKIPPED — a static
+        field on an un-booted module has no consumer rendezvous here.
+      * ``parent_path`` = the module's own container (the BindableEvent lives
+        beside the module's ModuleScript). Cross-domain signals must route via
+        RemoteEvents (out of scope) — gating to a single resolved domain keeps the
+        pre-pass from masking a missing cross-domain bridge.
+
+    Deterministic over (modules, static_events_by_script_id): callable twice with
+    identical output (idempotent planning).
+    """
+    channels: list[SceneRuntimeStaticChannel] = []
+    for script_id in sorted(static_events_by_script_id):
+        events = static_events_by_script_id[script_id]
+        if not events:
+            continue
+        module = modules.get(script_id)
+        if not isinstance(module, dict):
+            continue
+        domain = module.get("domain")
+        if domain not in ("client", "server"):
+            continue
+        if not module.get("runtime_bearing"):
+            continue
+        module_path = module.get("module_path")
+        container = module.get("container")
+        if not isinstance(module_path, str) or not module_path:
+            continue
+        if not isinstance(container, str) or not container:
+            continue
+        # The BindableEvent INSTANCE identity must be unique PER MODULE, not per
+        # field name, OR two different classes' same-named static events alias onto
+        # one shared event (``Player.AmmoUpdate`` and ``Enemy.AmmoUpdate`` both in
+        # ReplicatedStorage → unrelated events silently cross-wired). A flat
+        # ``<stem>_<field>`` concat is NOT a safe keyspace: it collides for two
+        # modules with the same stem AND has delimiter ambiguity
+        # (``stem="A_B",field="C"`` vs ``stem="A",field="B_C"`` both →
+        # ``A_B_C``). Use a STRUCTURED identity instead: each module's channels
+        # live under a per-module ``Folder`` keyed on the UNIQUE ``module_id`` (the
+        # ``modules`` dict key), and the BindableEvent is named the BARE
+        # ``field_name``. Distinct folders ⇒ distinct instances, with no concat
+        # keyspace. The Luau module FIELD stays the C# member name (``field_name``);
+        # the consumer reads the field, never the BindableEvent name or location.
+        module_folder = _module_channel_folder(script_id, module_path)
+        for field_name in events:
+            channels.append({
+                "module_id": script_id,
+                "field_name": field_name,
+                "channel_name": field_name,
+                "module_folder": module_folder,
+                "parent_path": container,
+                "module_path": module_path,
+                "domain": domain,
+            })
+    return channels
 
 
 # ---------------------------------------------------------------------------

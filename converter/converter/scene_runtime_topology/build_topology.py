@@ -6,96 +6,53 @@ classifier output + animation emission output, and enforces emit-time
 invariants. Failure on any invariant ABORTS the build with the offending
 row + the violated invariant — the design doc's "fail closed" rule.
 
-This module is a pure assembler. The decision logic lives in:
-  - ``module_domain`` (relocated from scene_runtime_domain in a later
-    slice; for Phase 1 we still consume the legacy
-    ``classify_scene_runtime_domains`` entry point)
-  - ``cross_domain_edges.compute_cross_domain_edges``
-  - ``animation_routing.resolve_driver`` /
-    ``animation_routing.build_animation_driver_entry``
-  - ``lifecycle_roles.derive_module_lifecycle_role``
-
+This module is a pure assembler. The decision logic lives in
+``module_domain``, ``cross_domain_edges.compute_cross_domain_edges``,
+``animation_routing.*``, and ``lifecycle_roles.derive_module_lifecycle_role``.
 The coordinator is the SINGLE call site downstream consumers use; direct
-dict access to the artifact is discouraged (a future relocation to
-``topology_plan.json`` should be a one-file change).
+dict access to the artifact is discouraged.
 
-Phase 1 invariants (per design doc §"topology artifact" + the review's
-6th add) + Phase 2a slice 2's 7th invariant:
+Fail-closed emit-time invariants:
 
   1. Every ``animation_drivers[*].driver_module_guid`` resolves to a
      ``modules`` entry; the animation's ``domain`` matches the driver's.
   2. Every ``cross_domain_edges[*]`` has producer + consumer with
      defined runtime domains (``client``/``server``).
-  3. Every ``Anim_*`` script in the planned output corresponds to
-     exactly ONE ``animation_drivers`` entry (no duplicates; structural
-     via ``stable_id``).
-  4. Every ``lifecycle_role`` is in the closed enum (typed via the
-     Literal already; runtime check is belt-and-suspenders for
-     external-provenance data).
-  5. Every ``bridge_group_id`` in ``modules`` or ``animation_drivers``
+  3. Every ``Anim_*`` script maps to exactly ONE ``animation_drivers``
+     entry (no duplicates; structural via ``stable_id``).
+  4. Every ``lifecycle_role`` is in the closed enum.
+  5. Every ``bridge_group_id`` in ``modules`` / ``animation_drivers``
      refers to an existing ``cross_domain_edges[*].id``.
   6. Every ``animation_drivers[*].driver_module_guid``'s module domain
-     is in ``{"client", "server"}`` (helpers / excluded modules cannot
-     drive animations).
+     is in ``{"client", "server"}`` (helpers/excluded cannot drive).
   7. Every ``runtime_bearing`` planner row carries both
-     ``character_attached`` and ``is_loader`` booleans (Phase 2a slice
-     2). Catches external-provenance ``scene_runtime`` artifacts that
-     bypass the planner — without it, lifecycle_role derivation
-     silently defaults the missing inputs to False and the topology
-     row misrepresents the underlying script.
-  8. ``lifecycle_role`` is consistent with the gated inputs on every
-     ``modules`` entry (Phase 2a slice 2 round 3). One-way implications:
-       - ``lifecycle_role == "loader"`` ⇒ ``is_loader == True`` AND
+     ``character_attached`` and ``is_loader`` booleans. Catches
+     planner-bypassing artifacts whose missing inputs would silently
+     default to False.
+  8. ``lifecycle_role`` is consistent with the gated inputs (one-way):
+       - ``"loader"`` ⇒ ``is_loader`` AND
          ``script_class in {"Script", "LocalScript"}`` AND
-         ``domain == "client"`` (matches the gate inside
-         ``derive_module_lifecycle_role``).
-       - ``lifecycle_role == "character_attached"`` ⇒
-         ``character_attached == True`` AND ``domain == "client"``.
-     The opposite direction is NOT required: ``is_loader=True`` may
-     legitimately coexist with ``lifecycle_role != "loader"`` when one
-     of the gates fired (e.g. a server-domain loader-named script is
-     auto_run, not loader — the bool preserves the raw planner
-     observation while the role is the gated decision). Slice 2 round
-     3 added this invariant so a future change to
-     ``derive_module_lifecycle_role`` can't silently produce a
-     "loader" role on a server-domain module.
- 10. **Reachability ``module_path`` ↔ container coherence** (Phase
-     2a slice 4; narrowed by slice 9b which dropped the parallel
-     ``reachability_forced_container`` mirror) — for every
-     ``modules`` entry with non-empty
-     ``reachability_required_container``, ``module_path`` MUST either
-     equal that container (the bare top-level row) or start with that
-     container plus a dot (the strict child case — e.g.
-     ``"ReplicatedStorage.HudControl"``). ``module_path`` is the
-     dotted DataModel path the host runtime requires, so it has to
-     point at the actually-hoisted container; the pre-slice-4 codex
-     P1.1 fix at module_domain.py:1266-1278 codified this lockstep
-     between container + module_path. Catches both hand-edited
-     artifacts and any future refactor that splits the planner
-     triple-write without keeping ``container`` + ``module_path`` in
-     lockstep.
+         ``domain == "client"``.
+       - ``"character_attached"`` ⇒ ``character_attached`` AND
+         ``domain == "client"``.
+     The reverse is NOT required: ``is_loader=True`` may coexist with a
+     non-loader role when a gate fired (e.g. a server-domain
+     loader-named script is auto_run, not loader). The bool is the raw
+     planner observation; the role is the gated decision.
+ 10. **Reachability ``module_path`` ↔ container coherence** — for every
+     ``modules`` entry with non-empty ``reachability_required_container``,
+     ``module_path`` MUST equal that container or start with it plus a dot
+     (e.g. ``"ReplicatedStorage.HudControl"``). ``module_path`` is the
+     dotted DataModel path the host requires, so it must point at the
+     actually-hoisted container.
 
-Coherence policy (Phase 2a slice 3 rounds 2-3) — NOT a fail-closed
-invariant: when ``scene_runtime.modules`` contains a ``class_name``
-collision (two scripts sharing a class_name) AND that name is
-touched by ``dependency_map``, ``_detect_caller_graph_collisions``
-excludes it from ``caller_graph`` translation. The colliding scripts
-appear as orphan rows (no callers) in the curated view. An ERROR
-is logged per collision (slice 3 round 3 P1.3 — bumped from WARNING
-because the placement change is material and operators routinely
-filter WARNINGs out of batch logs).
-
-The "orphan → ReplicatedStorage" outcome is FORWARD-LOOKING (slice 3
-round 3 P1.1): slice 5's storage_classifier rewrite is the consumer
-that reads ``caller_graph`` + applies the orphan-fallback rule.
-Pre-slice-5 storage_classifier continues its own lossy class_name
-routing for the same scripts — slice 3 ships a topology that
-describes how slice 5 WILL route them, not how the current build
-routes them. The legacy pipeline silently mis-routed these projects
-pre-slice-3; this policy keeps them converting (no hard regression)
-while preventing slice 5 from receiving lossy edges. The deep fix
-(promote dependency_map's keyspace to script_id) lives in a future
-slice.
+Coherence policy (NOT fail-closed): on a ``class_name`` collision touched
+by ``dependency_map``, ``_detect_caller_graph_collisions`` excludes it
+from ``caller_graph`` translation; the colliding scripts appear as orphan
+rows. An ERROR is logged per collision (placement change is material;
+operators filter WARNINGs out of batch logs). The orphan →
+ReplicatedStorage fallback is applied downstream by the storage
+classifier reading ``caller_graph``.
 """
 
 from __future__ import annotations
@@ -138,12 +95,10 @@ from converter.scene_runtime_topology.lifecycle_roles import (
     LifecycleRole,
     derive_module_lifecycle_role,
 )
-# Phase 2a slice 10: import the predicate gate sibling
-# ``finalize_topology_containers`` uses to decide whether to fire the
-# late hoist. The topology read site reproduces the same gate so the
-# new ``reachability_required_container`` value matches the dropped
-# audit signal byte-for-byte in all four normalization cases (see
-# ``_normalize_reachability_requirement`` for the case enumeration).
+# The predicate gate ``finalize_topology_containers`` uses to decide
+# whether to fire the late hoist; the topology read site reproduces it so
+# ``reachability_required_container`` matches the gate (see
+# ``_normalize_reachability_requirement``).
 from converter.scene_runtime_topology.module_domain import (
     _SERVER_CONTAINERS_FOR_REACHABILITY,
 )
@@ -245,34 +200,21 @@ class TopologyModuleEntry(TypedDict, total=False):
 
     ``lifecycle_role`` is the **gated decision** the topology layer
     produces by feeding the bools + ``domain`` + ``script_class`` into
-    ``derive_module_lifecycle_role``. Three gates apply:
-      - ``character_attached`` honored only when ``domain == "client"``
-      - ``is_loader`` honored only when ``domain == "client"`` AND
-        ``script_class in {"Script", "LocalScript"}``
-      - Both fall through to the class-driven default when their gate
-        fires (``auto_run`` for Script/LocalScript, ``requireable`` for
-        ModuleScript)
+    ``derive_module_lifecycle_role``. Gates: ``character_attached`` honored
+    only when ``domain == "client"``; ``is_loader`` only when
+    ``domain == "client"`` AND ``script_class in {"Script", "LocalScript"}``;
+    both fall through to the class-driven default otherwise (``auto_run``
+    for Script/LocalScript, ``requireable`` for ModuleScript).
 
-    Consequence: a topology row CAN have ``is_loader=True`` but
-    ``lifecycle_role`` other than ``"loader"`` — e.g. a
-    server-domain ``BootstrapServer.cs`` will have
-    ``is_loader=True, lifecycle_role="auto_run"``. This is **deliberate
-    and documented**: the bool preserves the audit trail of what the
-    planner observed; lifecycle_role is what the runtime should do.
-    The divergence is a feature, not a bug — slice 5's storage_classifier
-    rewrite reads ``lifecycle_role`` for placement, NOT the raw bools.
+    Consequence: a row CAN have ``is_loader=True`` with
+    ``lifecycle_role != "loader"`` (e.g. server-domain
+    ``BootstrapServer.cs`` → ``is_loader=True, lifecycle_role="auto_run"``).
+    Deliberate: the bool is the raw planner observation; lifecycle_role is
+    the gated decision the storage classifier reads for placement.
+    Invariant 8 pins the one-way implication.
 
-    Invariant 8 (slice 2 round 3) pins the one-way implication so a
-    future derivation change can't silently break the relationship:
-    ``lifecycle_role == "loader"`` implies the gated bools were all
-    truthy at derivation time, and ditto for
-    ``lifecycle_role == "character_attached"``.
-
-    Phase 1 populates: ``stem``, ``domain``, ``script_class``,
-    ``lifecycle_role``, ``provenance``. Phase 2a slice 2 adds
-    ``character_attached`` + ``is_loader``. ``bridge_group_id`` is
-    populated when the module participates in a cross-domain edge;
-    otherwise ``None``.
+    ``bridge_group_id`` is populated when the module participates in a
+    cross-domain edge; otherwise ``None``.
     """
 
     stem: str
@@ -283,31 +225,12 @@ class TopologyModuleEntry(TypedDict, total=False):
     is_loader: bool
     bridge_group_id: str | None
     provenance: "TopologyProvenance"
-    # Phase 2a slice 4 — reachability pair. The planner's
-    # ``_apply_reachability_rule`` (module_domain.py:1202-1284) writes
-    # coordinated values atomically when a client-required helper gets
-    # hoisted out of a server container:
-    #   - ``script.parent_path`` on the RbxScript (the live container);
-    #   - ``module_row["container"]`` + ``module_row["module_path"]``
-    #     on the planner row (the canonical placement).
-    # Topology mirrors the planner-side two as fields here so slice
-    # 5's storage_classifier rewrite reads ONE canonical surface for
-    # the decision input (``reachability_required_container``).
-    # Invariant 10 enforces ``module_path`` ↔ container coherence.
-    #
-    # Slice 9b dropped a redundant ``reachability_forced_container``
-    # mirror that previously carried the audit-trail "rule fired"
-    # signal: no production code branched on it (only a tautological
-    # invariant-10 lockstep check and a trivial copy at this build
-    # site read it), and ``reachability_required_container`` already
-    # carries the full semantic ("this module needs to be in container
-    # X"). See revision-history entry 2026-05-30 and the
-    # scene-runtime-architecture-ir slice plan for the dual-audit
-    # rationale.
-    #
-    # When reachability did NOT fire for a module, both fields are
-    # empty strings. When it fired, both are present and
-    # ``module_path`` starts with the required container.
+    # Reachability pair. When a client-required helper is hoisted out of
+    # a server container, the canonical placement surface the storage
+    # classifier reads is ``reachability_required_container``; Invariant
+    # 10 enforces ``module_path`` ↔ container coherence. When reachability
+    # did NOT fire, both fields are empty strings; when it fired, both are
+    # present and ``module_path`` starts with the required container.
     reachability_required_container: str
     module_path: str
 
@@ -414,82 +337,48 @@ def build_topology(
     stays empty (Phase 1 invariant 3 still applies).
 
     ``dependency_map`` is the planner's class_name → required class_names
-    map (the same source ``classify_storage`` already uses). Phase 2a
-    slice 3 curates it into the ``caller_graph`` artifact field
-    (inverted + class_name → script_id translated) so slice 5's
-    ``script_storage`` rewrite reads a single canonical caller surface.
-    ``None`` (the default) emits an empty ``caller_graph`` — back-compat
-    for Phase 1 callers that pre-date slice 3 and for legacy-mode
-    invocations.
+    map (same source ``classify_storage`` uses), curated into the
+    ``caller_graph`` artifact field (inverted + class_name → script_id
+    translated). ``None`` (default) emits an empty ``caller_graph``
+    (legacy/back-compat).
 
-    ``preserved_animation_drivers`` (Phase 2a slice 3 round 4) supports
-    the resume path where ``convert_animations`` did NOT run this build
-    but a prior conversion's ``animation_drivers`` block lives on the
-    rehydrated ``scene_runtime.topology``. Pass the prior block via
-    this parameter and ``emitted_animations=[]``; build_topology
-    uses the preserved drivers verbatim instead of rebuilding from
-    (empty) emissions. Invariant 3 (emission ↔ driver 1:1) is SKIPPED
-    in this mode because we don't have the original emissions to
-    cross-check. Invariants 1 + 4 + 5 + 6 still run on the preserved
-    block; if the persisted artifact was valid when first written,
-    those still hold (or the build aborts with a clear message). The
-    canonical caller for this mode is
-    ``pipeline._build_and_apply_topology`` when
-    ``self.state.animation_result is None``.
+    ``preserved_animation_drivers`` supports the resume path where
+    ``convert_animations`` did NOT run but a prior conversion's
+    ``animation_drivers`` block lives on the rehydrated
+    ``scene_runtime.topology``. Pass it with ``emitted_animations=[]``;
+    the preserved drivers are used verbatim. Invariant 3 (emission ↔
+    driver 1:1) is SKIPPED (no emissions to cross-check); Invariants
+    1/4/5/6 still run on the preserved block.
 
-    ``preserved_caller_graph`` (Phase 2a slice 3 round 5) supports the
-    assemble-without-retranspile path where ``transpile_scripts`` did
-    NOT run this build (``--no-retranspile`` or cached-script
-    workflows). In that case ``state.dependency_map`` is empty (it's
-    rebuilt only inside ``transpile_scripts``), so re-deriving
-    caller_graph from it would silently emit ``{}`` and overwrite the
-    prior caller_graph that came from a real transpile run (codex
-    review slice 3 round 4 P2). Pass the prior block here and
-    ``dependency_map=None`` (or the empty dict); build_topology uses
-    the preserved graph verbatim. Invariant 9 is skipped (no
-    dependency_map to detect collisions on); the preserved graph's
-    correctness derives from when it was first computed.
+    ``preserved_caller_graph`` supports the assemble-without-retranspile
+    path where ``transpile_scripts`` did NOT run, so
+    ``state.dependency_map`` is empty; re-deriving caller_graph would
+    silently emit ``{}`` and overwrite the prior real graph. Pass the
+    prior block with ``dependency_map=None``; it is used verbatim.
+    Invariant 9 is skipped (no dependency_map to detect collisions on).
 
-    ``script_by_sid`` (Phase 2a slice 9a, followup task #10 fold-in):
-    optional ``script_id -> RbxScript`` map built from the canonical
-    ``build_script_id_by_name`` helper (inverted: ``s.name -> sid``
-    becomes ``sid -> s``). When provided, ``_build_modules_block``
-    joins on ``script_id`` directly instead of the class_name-only
-    ``scripts_by_class`` lookup at ``_build_modules_block:529``. This
-    closes the asymmetric-join hole slice 7 round 4 already fixed at
-    the prepass boundary: two modules whose ``class_name`` collides
-    but whose ``stem`` is distinct pass the prepass / classify_storage
-    join via the stem fallback, but were silently dropped to
-    ``script_class="ModuleScript"`` at this site because the class_name
-    keyspace excludes them. The slice-3 degraded-service contract on
-    BOTH keyspaces still holds — modules whose class_name + stem both
-    collide (or both miss) are absent from ``script_by_sid`` and fall
-    through to the same safe-default outcome as before.
-    ``None`` (the default) preserves the legacy class_name-only join,
-    keeping back-compat for callers that don't carry topology_inputs.
+    ``script_by_sid``: optional ``script_id -> RbxScript`` map. When
+    provided, ``_build_modules_block`` joins on ``script_id`` directly
+    instead of the class_name-only ``scripts_by_class`` lookup — closing
+    the asymmetric-join hole where two modules with a colliding
+    ``class_name`` but distinct ``stem`` were silently dropped to
+    ``script_class="ModuleScript"``. Modules whose class_name + stem both
+    collide are absent here and fall through to the same safe default.
+    ``None`` (default) preserves the legacy class_name-only join.
 
-    ``reachability_requirements`` (Phase 2a slice 10): the
+    ``reachability_requirements``: the
     ``{script_id: "ReplicatedStorage" | "__excluded__"}`` map
-    ``derive_reachability_requirements`` produced earlier in the prepass
-    (lives on ``TopologyInputs.reachability_requirements``). Slice 10
-    switched the topology entry's ``reachability_required_container``
-    source from the planner-row audit signal
-    (``domain_signals["reachability_forced_container"]``) to this raw
-    analysis fact, per slice 6's "save raw facts, recompute conclusions"
-    rule. Normalized through the same late-hoist predicate
+    ``derive_reachability_requirements`` produced in the prepass. The
+    source of the topology entry's ``reachability_required_container``,
+    normalized through the same late-hoist predicate
     ``finalize_topology_containers`` uses (``current_container in
-    _SERVER_CONTAINERS_FOR_REACHABILITY``) so the emitted value is still
-    exactly ``"ReplicatedStorage"`` (gate fired) or ``""`` (gate did
-    not fire / no requirement). ``None`` (the default) makes the read
-    fall back to the legacy audit-signal read site for back-compat with
-    callers that don't carry the prepass output.
+    _SERVER_CONTAINERS_FOR_REACHABILITY``) so the value is exactly
+    ``"ReplicatedStorage"`` (gate fired) or ``""``. ``None`` (default)
+    falls back to the legacy ``domain_signals`` audit-signal read site.
 
     Returns the artifact dict ready to merge into
-    ``scene_runtime["topology"]``.
-
-    Aborts (raises ``TopologyInvariantError``) on any invariant
-    violation. No warnings, no soft-fails — the design doc commits to
-    fail-closed on emit.
+    ``scene_runtime["topology"]``. Aborts (``TopologyInvariantError``) on
+    any invariant violation — fail-closed on emit, no soft-fails.
     """
     # caller_graph: build fresh from dependency_map, OR use the
     # preserved block on assemble-no-retranspile workflows where the
@@ -590,37 +479,26 @@ def build_topology(
 def _normalize_reachability_requirement(
     requirement: str | None, current_container: str,
 ) -> str:
-    """Phase 2a slice 10: project the raw analysis output
-    ``reachability_requirements[sid]`` onto the same surface the
-    dropped audit signal ``domain_signals["reachability_forced_container"]``
-    used to carry, so the topology entry's
-    ``reachability_required_container`` value is byte-equivalent to
-    today's read across all four cases:
+    """Project the raw ``reachability_requirements[sid]`` fact onto the
+    ``reachability_required_container`` surface, re-applying the late-hoist
+    gate. Four cases:
 
     1. ``requirement is None`` (missing / non-helper / unconstrained
-       helper) -> ``""`` -- the audit signal was never written.
+       helper) -> ``""``.
     2. ``requirement == "__excluded__"`` (helper reached by BOTH client
-       and server) -> ``""`` -- the conflict path in
-       ``finalize_topology_containers`` does NOT stamp
-       ``reachability_forced_container`` (only ``fail_closed_reason``).
+       and server) -> ``""`` -- the conflict path does not force a
+       container.
     3. ``requirement == "ReplicatedStorage"`` AND
        ``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``
-       (hoist gate fires) -> ``"ReplicatedStorage"`` -- mirrors the
-       late-hoist stamp at module_domain.py:947-955.
-    4. ``requirement == "ReplicatedStorage"`` AND helper is already
-       outside the gated containers (e.g. already in ReplicatedStorage
-       or Workspace) -> ``""`` -- the late hoist gate at
-       module_domain.py:939 short-circuits, so the audit signal stayed
-       unset. Today's read site sees ``""``; we preserve that here so
-       slice 10 is an internal-source swap, not a semantic change.
+       (hoist gate fires) -> ``"ReplicatedStorage"``.
+    4. ``requirement == "ReplicatedStorage"`` but the helper is already
+       outside the gated containers -> ``""`` (the late hoist gate
+       short-circuits).
 
-    The gate predicate is intentionally re-applied here rather than
-    encoded into the raw map: ``reachability_requirements`` is the
-    raw analysis fact (pure over ``domain_results`` +
-    ``dependency_map``); the audit signal is the legacy CONCLUSION
-    of "raw fact AND gate fired". Slice 6's persistence rule says
-    save raw facts and recompute conclusions, so the gate lives at
-    the read site that consumes the conclusion.
+    The gate predicate is re-applied here rather than baked into the raw
+    map: ``reachability_requirements`` is the raw analysis fact, and the
+    ``reachability_required_container`` value is the gate-applied
+    conclusion (save raw facts, recompute conclusions at the read site).
     """
     if requirement is None:
         return ""
@@ -745,103 +623,33 @@ def _build_modules_block(
                 if abs_path is not None:
                     provenance["source_path"] = abs_path.as_posix()
 
-        # Phase 2a slice 4 — read the reachability pair from the
-        # planner row's mutation-driven surface. ``module_path`` is
-        # the host-runtime require target stamped by
+        # ``module_path`` is the host-runtime require target stamped by
         # ``_stamp_container_and_path`` + the late hoist arm of
         # ``finalize_topology_containers``.
         module_path_obj = module.get("module_path", "")
         module_path = module_path_obj if isinstance(module_path_obj, str) else ""
 
-        # Phase 2a slice 10: ``reachability_required_container``
-        # SOURCE switched from the planner-row audit signal
-        # ``domain_signals["reachability_forced_container"]`` to the
-        # raw analysis fact ``reachability_requirements[sid]`` (lives
-        # on ``TopologyInputs.reachability_requirements``, produced by
-        # ``derive_reachability_requirements``). Normalized through
-        # ``_normalize_reachability_requirement`` so the emitted value
-        # is byte-equivalent to today's read across all four cases
-        # (None / "__excluded__" / RS-needs-hoist / RS-already-outside-
-        # gated-containers). Per slice 6's persistence rule we save
-        # raw facts and recompute conclusions at the consumer; the
-        # late-hoist predicate gate
-        # ``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``
-        # is the "recompute" step.
+        # ``reachability_required_container`` derives from the raw analysis
+        # fact ``reachability_requirements[sid]``, normalized through
+        # ``_normalize_reachability_requirement`` (re-applies the late-hoist
+        # gate ``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``).
+        # ``reachability_requirements is None`` is the back-compat fallback
+        # for callers that don't pass ``TopologyInputs`` through; the
+        # pipeline call site always passes the prepass output.
         #
-        # ``reachability_requirements is None`` is the back-compat
-        # fallback for callers that haven't migrated to pass
-        # ``TopologyInputs`` through (legacy test paths, future
-        # external embedders). In that case we read the legacy audit
-        # signal so build_topology still emits a coherent entry. The
-        # pipeline call site (``_build_and_apply_topology``) always
-        # passes the prepass output, so production runs go through the
-        # primary path.
-        #
-        # No-transpile resume semantics (slice 10 R2, Option Y --
-        # accept + document + test-pin):
-        #
-        # On a ``--phase=write_output`` resume the pipeline runs
-        # ``_maybe_run_topology_prepass`` (essential, see slice 6) but
-        # ``state.dependency_map`` is empty (it is populated only inside
-        # ``transpile_scripts``). ``derive_reachability_requirements``
-        # short-circuits ``if not dependency_map: return {}`` (its
-        # module_domain.py:782-783 contract), so the prepass hands us
-        # an EMPTY ``reachability_requirements`` dict (not ``None``).
-        # The primary branch below therefore takes the ``is not None``
-        # path with every ``.get(sid)`` returning ``None`` -- and the
-        # normalization helper collapses ``None`` to ``""``. As a
-        # result, on no-transpile resume, ``reachability_required_container``
-        # regenerates to ``""`` for ALL modules, REGARDLESS of whether
-        # the late-hoist rule would have fired during a fresh run.
-        # This is a documented, accepted regression vs the pre-slice-10
-        # audit signal (which the planner persisted across resumes via
-        # ``domain_signals``).
-        #
-        # Why it's accepted:
-        #   1. The storage classifier reads
-        #      ``topology_inputs["reachability_requirements"]`` DIRECTLY
-        #      (``storage_classifier.py:645``), not via the topology
-        #      entry's ``reachability_required_container``. Storage
-        #      routing decisions are therefore unaffected -- the
-        #      classifier sees the same empty dict on resume that the
-        #      pre-slice-10 classifier saw, and falls back to the
-        #      legacy "unconstrained helper" decision path codified
-        #      by slice 6's amendment (``storage_classifier.py:569-587``,
-        #      gated on ``not topology_inputs["transpile_ran"]``).
-        #   2. Invariant 10 (``build_topology.py:1474-1487``) short-
-        #      circuits on ``if required and ...`` so an empty
-        #      ``required`` value does NOT trip the module_path / required-
-        #      container coherence abort.
-        #   3. Slice 9b's dual independent audit (Claude Explore + Codex
-        #      exec) verified no production code consumes the artifact
-        #      field for behavior; the only previous reader was the
-        #      invariant-10 lockstep check, which slice 9b deleted.
-        #
-        # The trade is consistent with slice 6's "empty reqs on no-
-        # transpile resume is acceptable" precedent (same trade slice
-        # 3's preserved_caller_graph also accepts on the caller_graph
-        # side -- raw facts are saved, conclusions are recomputed where
-        # producible). If a future consumer needs the regenerated
-        # signal on resume, the lever is to revive the
-        # ``transpile_ran=False`` branch here and either (a) persist
-        # ``reachability_requirements`` as a raw fact (Option X) or
-        # (b) read the legacy ``domain_signals`` audit signal back
-        # (the previous design). ``TopologyInputs.transpile_ran`` is
-        # plumbed through (pipeline.py:4622) and unused by THIS read
-        # site by design -- kept for that potential future use. See
-        # ``slice-10-r1-decision.md`` for the synthesis.
+        # Accepted residual: on a no-transpile resume ``dependency_map`` is
+        # empty, so ``derive_reachability_requirements`` returns ``{}`` and
+        # this field regenerates to ``""`` for ALL modules regardless of
+        # whether the late-hoist rule would have fired fresh. Safe because
+        # (a) the storage classifier reads ``reachability_requirements``
+        # directly, not this field, and (b) Invariant 10 short-circuits on
+        # an empty ``required`` so coherence is never tripped.
         reachability_required: str
         if reachability_requirements is not None:
-            # Determine the helper's CURRENT container -- the script
-            # row's ``parent_path``, which ``classify_storage`` and
-            # the late hoist arm have already stamped at this point in
-            # the pipeline. Falls back to the module row's
-            # ``container`` when the script lookup miss (e.g. modules
-            # whose class_name + stem both collide / both miss are
-            # absent from ``script_by_sid`` AND ``scripts_by_class``).
-            # The fallback mirrors the legacy "the planner stamps
-            # ``container`` in lockstep with the audit signal"
-            # contract.
+            # Helper's CURRENT container = the script row's ``parent_path``
+            # (already stamped by ``classify_storage`` + the late hoist),
+            # falling back to the module row's ``container`` on a script
+            # lookup miss (class_name + stem both collide/miss).
             current_container = ""
             if script is not None:
                 pp = script.parent_path or ""
@@ -855,10 +663,8 @@ def _build_modules_block(
                 current_container,
             )
         else:
-            # Back-compat fallback: read the legacy audit signal. Used
-            # by legacy callers and a handful of unit-test paths that
-            # don't carry a TopologyInputs through. Retire when the
-            # last such caller migrates.
+            # Legacy fallback: read the ``domain_signals`` audit signal
+            # for callers that don't carry a TopologyInputs through.
             signals_obj = module.get("domain_signals", {})
             signals = signals_obj if isinstance(signals_obj, dict) else {}
             rfc_obj = signals.get("reachability_forced_container", "")
@@ -1549,14 +1355,11 @@ def _enforce_invariants(
                 row=entry,
             )
 
-    # Invariant 8 (Phase 2a slice 2 round 3): lifecycle_role
-    # consistent with gated inputs. One-way implication: if the role
-    # is "loader" or "character_attached", the inputs that produced it
-    # must satisfy the gates inside derive_module_lifecycle_role.
-    # The OPPOSITE direction is NOT enforced — `is_loader=True` may
-    # coexist with `lifecycle_role != "loader"` when a gate fired
-    # (this is the deliberate raw-hint-vs-gated-decision divergence
-    # documented on TopologyModuleEntry).
+    # Invariant 8: lifecycle_role consistent with gated inputs. One-way
+    # implication: a "loader" / "character_attached" role implies its
+    # gates fired. The OPPOSITE is NOT enforced — `is_loader=True` may
+    # coexist with `lifecycle_role != "loader"` (the deliberate
+    # raw-hint-vs-gated-decision divergence on TopologyModuleEntry).
     for guid, mod_entry in modules_block.items():
         role = mod_entry.get("lifecycle_role", "")
         if role == "loader":
@@ -1605,15 +1408,12 @@ def _enforce_invariants(
                     row=mod_entry,
                 )
 
-    # Invariant 7 (Phase 2a slice 2): every runtime-bearing planner row
-    # must carry both `character_attached` and `is_loader` booleans.
-    # Reads the PLANNER input (scene_runtime["modules"]) rather than the
-    # topology output because the goal is to catch a planner artifact
-    # that came in WITHOUT these fields — _build_modules_block defaults
-    # them to False on read, so a check against the output is
-    # tautological. The fail-closed case is an on-disk plan from a
-    # pre-slice-2 converter version, or a test fixture that hand-rolls
-    # `scene_runtime["modules"]` rows without going through the planner.
+    # Invariant 7: every runtime-bearing planner row must carry both
+    # `character_attached` and `is_loader` booleans. Reads the PLANNER
+    # input (scene_runtime["modules"]), not the topology output —
+    # _build_modules_block defaults them to False on read, so checking
+    # the output would be tautological. Catches a planner-bypassing
+    # artifact (old on-disk plan, or a hand-rolled test fixture).
     planner_modules = cast(
         dict[str, dict[str, object]], scene_runtime.get("modules", {}),
     )
@@ -1644,31 +1444,20 @@ def _enforce_invariants(
             )
 
     # Invariant 9 lives in `_detect_caller_graph_collisions` (called
-    # pre-derivation from `build_topology`). It's an INPUT validator,
-    # not an output one — keeping it here would let a future producer
-    # added between derivation and output validation leak the lossy
-    # data before invariant 9 fires (Claude review slice 3 round 2 P1).
+    # pre-derivation from `build_topology`). It's an INPUT validator —
+    # keeping it here would let a future producer between derivation and
+    # output validation leak the lossy data before it fires.
 
-    # Invariant 10 (Phase 2a slice 4; narrowed by slice 9b):
-    # reachability ``module_path`` ↔ container coherence. The
-    # planner's ``_apply_reachability_rule`` rewrites ``container`` +
-    # ``module_path`` together (codex P1.1 atomicity); this invariant
-    # enforces the mirrored coherence on the topology entry. Slice
-    # 9b dropped the prior ``reachability_forced_container`` lockstep
-    # arm — same-loop-sets-both-fields-from-same-source made it
-    # tautological and the field itself was removed (no production
-    # branch read it).
+    # Invariant 10: reachability ``module_path`` ↔ container coherence.
+    # The planner rewrites ``container`` + ``module_path`` together; this
+    # enforces the mirrored coherence on the topology entry.
     for guid, mod_entry in modules_block.items():
         required = mod_entry.get("reachability_required_container", "")
         module_path_v = mod_entry.get("module_path", "")
-        # Slice 4 round 1 review (Claude P1.2): accept BOTH
-        # ``module_path == required`` (the container itself, no
-        # module suffix — e.g. a top-level container row) AND
-        # ``module_path.startswith(f"{required}.")`` (the strict
-        # child case). The pre-fix `startswith(f"{required}.")`
-        # rejected the legitimate exact-match case AND a bare
-        # `startswith(required)` would false-positive on a
-        # sibling-container prefix like ``ReplicatedStorageOther.X``.
+        # Accept BOTH ``module_path == required`` (the bare container row)
+        # AND ``module_path.startswith(f"{required}.")`` (the strict child
+        # case). A bare ``startswith(required)`` would false-positive on a
+        # sibling prefix like ``ReplicatedStorageOther.X``.
         if required and module_path_v != required and not (
             module_path_v.startswith(f"{required}.")
         ):

@@ -127,18 +127,12 @@ def lower_rifle_rig_retarget(
         rig_facts = _rig_facts_for(script, child_ref_map)
         if not rig_facts:
             continue
-        # >1 rig fact on ONE script: the single-dict carrier (§1.5) can represent
-        # exactly one binding, and the design (§1.5, edge 9) frames multi-fact as a
-        # two-SCRIPTS case (the corpus is one-fact-per-script). Rather than silently
-        # keep only the LAST fact's carrier (dropping the earlier bindings'
-        # discharge from the verifier), FAIL CLOSED: stamp a FULL 5-key carrier
-        # (present=False, multi_fact=True) from the FIRST rig fact and ABSTAIN on all
-        # edits, so the verifier fail-closes LOUD instead of shipping an unverifiable
-        # binding. REDESIGN r3 (close the resume-path hole): the carrier MUST be the
-        # full 5-key shape — a 2-key carrier would be DROPPED to None by the 5-key
-        # rehydrate LOAD validator, so the verifier would ABSTAIN (not fire) on a
-        # preserve/resume assemble. Full-keyed -> round-trips the validator -> fires
-        # loud on the resume path exactly as on the fresh path.
+        # >1 rig fact on ONE script: the single-dict carrier holds exactly one
+        # binding. FAIL CLOSED — stamp a FULL 5-key carrier (present=False,
+        # multi_fact=True) from the FIRST fact and ABSTAIN on all edits, so the
+        # verifier fail-closes loud. The carrier MUST be the full 5-key shape: a
+        # 2-key carrier is dropped to None by the rehydrate LOAD validator, so the
+        # verifier would abstain (not fire) on a preserve/resume assemble.
         if len(rig_facts) > 1:
             first = rig_facts[0]
             script.rig_binding = {
@@ -297,15 +291,14 @@ def _return_is_inside_function_body(source: str, pos: int) -> bool:
     return is not at module scope. We track a dedicated function-nesting counter so
     a module-level ``do … end`` block (rare) does not misclassify.
 
-    ``elseif`` is the load-bearing edge (round-1 harden regress): an
-    ``if a then … elseif b then … end`` chain has MULTIPLE ``then`` openers but ONE
-    ``end``. Each ``elseif``'s own upcoming ``then`` over-counts ``block_depth``, so
-    ``elseif`` DECREMENTS to cancel it (net 0 for the whole chain) — the same grammar
-    ``_FALLBACK_BLOCK_CLOSERS`` uses. Without this, any method containing an
-    if/elseif chain leaves ``block_depth`` permanently open, so a genuine
-    module-trailing ``return <Class>`` after it is misclassified as function-local
-    and the resolver is never injected. ``elseif`` never closes a ``function`` body,
-    so it does not touch ``fn_depth``."""
+    ``elseif`` is the load-bearing edge: an ``if a then … elseif b then … end``
+    chain has MULTIPLE ``then`` openers but ONE ``end``. Each ``elseif``'s own
+    upcoming ``then`` over-counts ``block_depth``, so ``elseif`` DECREMENTS to cancel
+    it (net 0 for the whole chain) — the same grammar ``_FALLBACK_BLOCK_CLOSERS``
+    uses. Without this, any method containing an if/elseif chain leaves
+    ``block_depth`` permanently open, so a genuine module-trailing ``return <Class>``
+    after it is misclassified as function-local and the resolver is never injected.
+    ``elseif`` never closes a ``function`` body, so it does not touch ``fn_depth``."""
     fn_depth = 0  # count of open ``function`` bodies (the load-bearing nesting)
     block_depth = 0  # all block openers (function/do/then/repeat), to pair ``end``
     fn_open_at_block_depth: list[int] = []  # block_depth at each open ``function``
@@ -625,10 +618,10 @@ def _enclosing_method(source: str, pos: int) -> str | None:
 # end of value. Group 1 captures the whole guard prefix, group 2 the RECEIVER chain.
 # Anchored ``^...$`` against the STRIPPED RHS so the access must BE the value, not
 # merely appear inside a mixed expression — a trailing ``or <other>`` / any extra
-# operand fails to match (codex round-5 R2). The guard prefix is then required to be
-# ONLY the SAME camera receiver (codex round-5 R3): a foreign guard
-# ``self.defaultSlots and self.cam:GetChild(0)`` makes the value conditional on a
-# NON-camera (``nil`` when ``defaultSlots`` is falsy), so it must NOT be neutralized.
+# operand fails to match. The guard prefix is then required to be ONLY the SAME
+# camera receiver: a foreign guard ``self.defaultSlots and self.cam:GetChild(0)``
+# makes the value conditional on a NON-camera (``nil`` when ``defaultSlots`` is
+# falsy), so it must NOT be neutralized.
 _CAMERA_CHILD_VALUE_RE = re.compile(
     r"^((?:[A-Za-z_][\w.]*\s+and\s+)*)"
     r"([A-Za-z_][\w.]*)"
@@ -667,12 +660,11 @@ def _rhs_is_camera_child(
     (the corpus nil-guard shape), nothing else — whose ``<camrecv>`` is a canonical
     camera literal OR a recorded camera-symbol form (``self.cam``/``cam``).
 
-    PATH A: this is the Tier-2 best-effort neutralize's recognizer ONLY — it is NOT
-    a discharge gate. The whole-RHS / same-guard checks stay (they keep the neutralize
-    from clobbering an unrelated mixed expression), but the round-5 symbol-binding
-    DOMINANCE proof is dropped: a mis-neutralize no longer affects ``present`` (it is
+    This is the Tier-2 best-effort neutralize's recognizer ONLY — NOT a discharge
+    gate. The whole-RHS / same-guard checks keep the neutralize from clobbering an
+    unrelated mixed expression; a mis-neutralize does not affect ``present`` (it is
     caught by the final syntax gate if it corrupts the module, and is otherwise dead
-    data since no read survives), so the heavy proof is not load-bearing."""
+    data since no read survives)."""
     raw = source[rhs_abs_start:rhs_abs_end]
     m = _CAMERA_CHILD_VALUE_RE.match(raw.strip())
     if m is None:
@@ -826,17 +818,12 @@ def _binding_discharged(
     it never stamps ``present=True`` off a reverted edit).
 
     BEST-EFFORT HINT, NOT THE AUTHORITY: this predicate (and its
-    ``_has_unrewritable_boundary_read`` helper) is a best-effort discharge hint. The
+    ``_has_unrewritable_boundary_read`` helper) is a best-effort discharge hint; the
     verifier's ``_rig_binding_discharged`` — run on the FINAL output — is the SOLE
-    discharge authority. The two are independent text-scanners and can DESYNC on a few
-    boundary forms (``self[<int>]``, a shadowed-``self`` dot-read, a concatenated
-    bracket key ``self["weaponSlot".."" ]``) where this predicate is LENIENT (returns
-    discharged) but the verifier FIRES. That desync is FAIL-CLOSED-SAFE: the verifier
-    fires and the binding fails closed (never silent-wrong). The UNSAFE direction —
-    both discharged while a real read survives (mutual-mask) — does NOT occur: see
-    ``test_f2_no_mutual_mask_against_verifier_or_conservatism``. The residual desync
-    forms are all NON-REACHABLE from the deterministic dot-form transpiler, so per-form
-    parity between the two scanners is INTENTIONALLY NOT pursued.
+    discharge authority. Where the two independent scanners desync, this side is
+    LENIENT and the verifier FIRES, so the binding fails closed (never silent-wrong);
+    the unsafe both-discharged-while-a-read-survives direction does not occur
+    (``test_f2_no_mutual_mask_against_verifier_or_conservatism``).
 
     ``child`` is the REAL rig-child name (for reconstructing the canonical emit);
     ``suffix`` is the VALID-LUAU-IDENTIFIER method-name suffix (``_resolve<suffix>``).
@@ -982,12 +969,10 @@ def _has_surviving_field_read(source: str, field: str) -> bool:
 
 def _has_unrewritable_boundary_read(source: str, field: str) -> bool:
     """True iff a BOUNDARY-FORM read of ``field`` survives — a form the consumer-read
-    reroute CANNOT safely rewrite and which the slice-1.2 verifier's
-    ``_rig_binding_discharged`` FAILS CLOSED on. The lowering MUST mirror these so it
-    ABSTAINS (``present=False``, source unedited for the reroute) on exactly the
-    scripts the verifier will reject — never stamp ``present=True`` on a verifier-fire
-    case (the desync this guards, phase-integration MAJOR #2). The forms (design §1.6,
-    lines 403-412):
+    reroute CANNOT safely rewrite and which the verifier's ``_rig_binding_discharged``
+    FAILS CLOSED on. The lowering MUST mirror these so it ABSTAINS (``present=False``,
+    source unedited for the reroute) on exactly the scripts the verifier will reject —
+    never stamp ``present=True`` on a verifier-fire case. The forms:
       (a) a bracket-index read ``self["<field>"]`` (the string-key member access);
       (b) a DYNAMIC bracket read ``self[<expr>]`` (incl. a parenthesized ``self[(...)]``)
           whose key is not a pure integer array index — the key cannot be statically
@@ -996,19 +981,14 @@ def _has_unrewritable_boundary_read(source: str, field: str) -> bool:
           ``owner.<field>``, a receiver-alias ``local p = self; p.<field>`` — any
           ``<ident>.<field>`` whose receiver is not the bare ``self`` token;
       (d) a raw ``self.<field>`` dot-form read inside a NON-yielding lifecycle method
-          (``Awake``/``Start``) — a stale-derived-state hazard the verifier flags
-          (design §1.6, supersedes the old "Awake read sees a safe nil" premise).
+          (``Awake``/``Start``) — a stale-derived-state hazard the verifier flags.
 
     A SHADOWED-``self`` read (``function(self) ... self.<field>`` / ``local self = ...;
     self.<field>``) is NOT a boundary form: ``self`` there is a FOREIGN object, so the
-    read is not a read of THIS script's field — the verifier mirrors the lowering's
-    shadow guard and treats it as neutral (does not block discharge), matching
-    ``_has_surviving_field_read``. The bare ``self.<field>`` dot-form read in a
-    YIELD-SAFE method is likewise NOT a boundary form: the reroute rewrites it (and
-    ``_has_surviving_field_read`` already counts a leftover one). This detector covers
-    ONLY the forms the reroute leaves un-rewritten AND the verifier rejects, so the
-    two AGREE on discharge: a clean dot-form script discharges True on both; a
-    boundary-form script abstains False on both."""
+    read is neutral (matches ``_has_surviving_field_read``). The bare ``self.<field>``
+    dot-form read in a YIELD-SAFE method is likewise NOT a boundary form: the reroute
+    rewrites it. This detector covers ONLY the forms the reroute leaves un-rewritten
+    AND the verifier rejects, so the two AGREE on discharge."""
     # (a)/(b) bracket-index reads ``self[ ... ]`` (string key or dynamic expr).
     for m in re.finditer(r"self\s*\[", source):
         start = m.start()

@@ -1,82 +1,46 @@
 """module_domain — per-module execution-domain classification.
 
-Relocated in Phase 1 from ``converter/scene_runtime_domain.py``. The
-classifier guts are byte-identical with the pre-Phase-1 source; only
-the file's home + docstring + ``__all__`` shape changed.
-
-Phase 2a will refactor this module SLICE BY SLICE (storage mutations
-move out to ``script_storage``, signal tables consolidate, etc.). For
-Phase 1 the goal is structural: the topology package owns domain
-classification.
-
-Phase 2a slice 6 split the public entry point into three pure-ish
-functions that can run before ``classify_storage`` and a single late
-finalizer that runs after. The legacy entry point
-``classify_scene_runtime_domains`` is preserved as a thin orchestrator
-of those four pieces, byte-identical in behavior to the pre-split
-implementation:
-
-  - ``infer_module_domains`` (early, pure) -- per-module domain inference
-    via the 7-rule signal table. NO ``parent_path`` reads, NO mutation
-    of ``scene_runtime``.
-  - ``derive_reachability_requirements`` (early, pure) -- decides which
-    helper modules MUST land in ReplicatedStorage (client require-graph
-    reach) or excluded (both-sides conflict). NO ``parent_path`` reads,
-    NO mutation.
-  - ``finalize_topology_containers`` (late, mutating) -- stamps
-    ``domain`` / ``domain_signals`` / ``container`` / ``module_path`` /
-    ``reachability_forced_container`` onto every module row using the
-    early-derived domain map + reachability requirements + the now-
-    final ``parent_path`` from ``classify_storage``. This is the ONLY
-    place ``parent_path`` is read by the topology classifier today.
-  - ``classify_scene_runtime_domains`` -- coordinator. Calls the three
-    above in order and builds the ``DomainClassifierReport``.
-
-Slice-6 split rationale: ``_classify_module`` consumes only the C#
-source, post-transpile Luau, per-instance evidence, overrides, and
-networking-mode flags — it never reads ``parent_path``. By extracting
-that pure piece (``infer_module_domains``) we can run it BEFORE
-``classify_storage`` and feed the resulting domain map back into
-storage decision-making (slice 7 will rewrite ``_decide_script_container``
-on top of that channel). Slice 6 itself just plumbs the prepass; the
-storage decision tree is unchanged, gated on a kwarg fork in
-``classify_storage``.
-
 Public entry point: ``classify_scene_runtime_domains``. Runs after the
-storage classifier seeds ``scene_runtime.modules`` and after the
-planner has populated instance / reference rows. Assigns each
-runtime-bearing module one of:
+storage classifier seeds ``scene_runtime.modules`` and the planner has
+populated instance / reference rows. Assigns each runtime-bearing
+module one of:
 
-  - ``"client"``   -- per the design doc rule table.
-  - ``"server"``   -- per the rule table.
+  - ``"client"`` / ``"server"`` -- per the 7-rule design-doc table.
   - ``"helper"``   -- not runtime-bearing; pure utility module.
   - ``"excluded"`` -- runtime-bearing but unresolvable (Rule-1 / Rule-4
-                      / reachability conflict). Recorded in the report;
-                      the host runtime never instantiates it.
+    / reachability conflict). Recorded in the report; the host runtime
+    never instantiates it.
 
-The v2 classifier consumes **three signal channels**:
+Structure (each consumed by ``classify_scene_runtime_domains``):
 
-  1. **C# source** (the strongest channel): looked up per-module via the
-     ``guid_index`` mapping ``script_id -> asset_path``. The C# tables
-     fire on Unity-specific patterns (``using UnityEngine.UI``,
-     ``[SerializeField] Text``, ``Input.Get*``, ``[ServerRpc]``, ...).
+  - ``infer_module_domains`` (early, pure) -- per-module domain via the
+    rule table. NO ``parent_path`` reads, NO mutation.
+  - ``derive_reachability_requirements`` (early, pure) -- which helper
+    modules MUST land in ReplicatedStorage (client require-graph reach)
+    or be excluded (both-sides conflict). NO ``parent_path`` reads.
+  - ``finalize_topology_containers`` (late, mutating) -- stamps
+    ``domain`` / ``domain_signals`` / ``container`` / ``module_path`` /
+    ``reachability_forced_container`` onto every module row, using the
+    early domain map + reachability requirements + the final
+    ``parent_path``. The ONLY place the topology classifier reads
+    ``parent_path``.
 
-  2. **Post-transpile Luau** (legacy PR3b channel; kept). The classifier
-     still scans the post-transpile body for Roblox-flavoured signals
-     (``Players.LocalPlayer``, ``:FireServer(``, ``.OnServerEvent``, ...).
+Three signal channels:
 
-  3. **Per-instance evidence**: the planner stamps
-     ``instance_owner_is_ui`` per-instance when the host GameObject lives
-     in a Canvas subtree, and ``target_is_ui`` on UI-bearing refs. Both
-     contribute STRONG CLIENT signals (the design doc lists them on par
-     with ``[SerializeField] Text``).
+  1. **C# source** (strongest): per-module via ``guid_index``
+     (``script_id -> asset_path``). Fires on Unity patterns
+     (``using UnityEngine.UI``, ``[SerializeField] Text``,
+     ``Input.Get*``, ``[ServerRpc]``, ...).
+  2. **Post-transpile Luau**: Roblox-flavoured signals
+     (``Players.LocalPlayer``, ``:FireServer(``, ``.OnServerEvent``).
+  3. **Per-instance evidence**: planner-stamped ``instance_owner_is_ui``
+     / ``target_is_ui`` — both STRONG CLIENT signals.
 
-Signals are then bucketed into **strong** / **moderate** counts and
-resolved through the 7-rule table in the design doc. Operator overrides
-apply after the rule table with the rule-specific asymmetry from
-§"Operator override" (Rule-1 ``excluded`` accepts only ``"excluded"``;
+Signals bucket into **strong** / **moderate** counts and resolve through
+the 7-rule table. Operator overrides apply after the table with a
+rule-specific asymmetry: Rule-1 ``excluded`` accepts only ``"excluded"``;
 Rule-4 ``excluded`` and all other verdicts accept ``"client"`` /
-``"server"`` / ``"excluded"``).
+``"server"`` / ``"excluded"``.
 
 See ``converter/docs/design/scene-runtime-domain-signals.md`` for the
 full spec.
@@ -519,7 +483,8 @@ _CS_STRONG_SERVER: tuple[_CSharpPattern, ...] = (
 
 
 # Moderate server signals come in two flavours:
-#   1. Regex-tabled (none today; reserved for future expansion).
+#   1. Regex-tabled (none today; the empty table still compiles into
+#      ``_CS_MODERATE_SERVER_RX``, iterated at the moderate-server pass).
 #   2. Graph-derived: stamped via ``moderate_server_extra`` injected into
 #      ``_collect_signals``. The require-graph-reaches-NetworkBehaviour
 #      signal (``network_behaviour_reachable``) is graph-derived because
@@ -773,26 +738,17 @@ class DomainClassifierReport(TypedDict):
     strict_violations: list[str]
 
 
-# ---------------------------------------------------------------------------
-# Slice 6 early prepass: domain inference + reachability requirements.
-#
-# These two functions are PURE OVER THEIR INPUTS — no ``parent_path``
-# reads, no mutation of ``scene_runtime``. They can run BEFORE
-# ``classify_storage`` so storage decisions can consult their output.
-# The legacy entry point ``classify_scene_runtime_domains`` is rebuilt
-# on top of these (plus ``finalize_topology_containers``) and is
-# byte-identical in observable behavior.
-# ---------------------------------------------------------------------------
+# Early prepass: domain inference + reachability requirements.
+# Both functions are PURE OVER THEIR INPUTS — no ``parent_path`` reads,
+# no mutation of ``scene_runtime`` — so they can run BEFORE
+# ``classify_storage`` and feed storage decisions.
 
 
 class _DomainInferenceResult(TypedDict):
     """Per-module output of ``infer_module_domains``.
 
-    Carries everything the late finalizer needs to mirror onto the
-    module row — domain verdict, signals, and the displaced/excluded
-    bookkeeping the legacy pipeline accumulates. Defined as a TypedDict
-    rather than a tuple so the keys stay self-documenting where slice
-    7's storage decision tree will read them.
+    Carries everything the late finalizer mirrors onto the module row —
+    domain verdict, signals, and displaced/excluded bookkeeping.
     """
 
     domain: str
@@ -803,56 +759,31 @@ class _DomainInferenceResult(TypedDict):
 
 
 class TopologyInputs(TypedDict):
-    """Output of the slice-6 prepass; input to ``classify_storage``'s
-    topology-driven branch (slice 7).
+    """Output of the early prepass; input to ``classify_storage``'s
+    topology-driven branch.
 
     Composed by ``Pipeline._maybe_run_topology_prepass`` immediately
-    BEFORE ``classify_storage`` runs. Carries everything slice 7's
-    ``_decide_script_container_from_topology`` will read — per-module
-    domain verdict, reachability requirement, and the lookup indices
-    that map ``RbxScript.name`` ↔ ``script_id`` and ``script_id`` →
-    caller list. All entries are derived purely from
-    ``scene_runtime`` + the planner's ``dependency_map`` — NO
-    ``parent_path`` reads.
+    BEFORE ``classify_storage`` runs. Carries everything
+    ``_decide_script_container_from_topology`` reads — per-module domain
+    verdict, reachability requirement, and the lookup indices mapping
+    ``RbxScript.name`` ↔ ``script_id`` and ``script_id`` → caller list.
+    All entries derive purely from ``scene_runtime`` + the planner's
+    ``dependency_map`` — NO ``parent_path`` reads.
 
-    Phase 2b carries the cross-domain facts on this dict:
-    ``cross_domain_edges`` (Class 1, component-ref) +
-    ``shared_flag_channels`` (Class 2, dynamic shared-flag funnel). They
-    are produced in ``_maybe_run_topology_prepass`` so the post-transpile
-    reader scan / enrichment that backs them runs in the same scope as
-    the prepass (with ``state.transpilation_result``, ``domains``,
-    ``script_id_by_name`` all in hand). ``build_topology`` becomes
-    pure-assembly: it reads these fields off ``TopologyInputs`` and
-    writes them straight into the artifact dict; the producers are no
-    longer called from inside the assembler.
-
-    **Phase 2b reframe (2026-06-01).** The empirical whole-plan review
-    split cross-domain authority into two bridge classes. The slices-1-2
-    ``cross_domain_edge_candidates`` bucket (the
-    ``compute_shared_attribute_candidates`` fan-out) mis-modeled the
-    dynamic shared-flag class AS the static component-ref class and was
-    RETIRED. It is replaced by ``shared_flag_channels`` — the channel
-    fact (read-name set + reader domains + canonical store + present
-    gate). See ``shared_flag_channels.py``.
-
-    The fields hold:
+    Two cross-domain facts ride on this dict:
       - ``cross_domain_edges``: fully-resolved component-ref (Class 1)
         edges with ``from_*`` AND ``to_*`` populated.
         ``bridge_member_scripts`` carries caller / listener /
-        ``anim_listener`` rows (``edge_enrichment`` fills these).
-      - ``shared_flag_channels``: the ``PlayerSetSharedFlag`` channel
-        record (Class 2). Recomputed from the live reader scan every run.
+        ``anim_listener`` rows (filled by ``edge_enrichment``).
+      - ``shared_flag_channels``: the ``PlayerSetSharedFlag`` funnel
+        channel (Class 2) — read-name set + reader domains + canonical
+        store + present gate. See ``shared_flag_channels.py``.
 
     Threaded through ``classify_storage`` as a no-op-on-default kwarg;
-    NOT persisted (slice 6 rule: save raw facts, never persist derived
-    conclusions). Always recomputed from current operator inputs via
-    ``Pipeline._maybe_run_topology_prepass`` on every invocation,
-    including ``--phase=write_output`` resumes (the prepass is in
-    ``ESSENTIAL_PHASES``). The Phase 2b cross-domain fields are likewise
-    recomputed every run from ``scene_runtime`` + the producer functions
-    + the live ``transpilation_result``, per the slice-6 "save raw facts,
-    recompute conclusions" rule (the ``caller_graph``-style recompute
-    pattern; there is no preserve path for them).
+    NOT persisted. Always recomputed from current operator inputs on
+    every invocation (including ``--phase=write_output`` resumes; the
+    prepass is in ``ESSENTIAL_PHASES``) — save raw facts, never persist
+    derived conclusions.
     """
 
     # ``script_id`` -> domain verdict from ``infer_module_domains``.
@@ -868,47 +799,27 @@ class TopologyInputs(TypedDict):
     # degraded-service contract on colliding class_names + stems.
     script_id_by_name: dict[str, str]
     # ``script_id`` -> list of caller ``script_id``s. Built from the
-    # planner's ``dependency_map`` via the canonical
-    # ``_resolve_caller_graph`` helper in ``build_topology.py``.
+    # planner's ``dependency_map`` via ``_resolve_caller_graph`` in
+    # ``build_topology.py``.
     caller_graph: dict[str, list[str]]
-    # Phase 2a slice 7 -- raw fact: did the transpile phase run on this
-    # pipeline invocation? Sourced from
-    # ``state.transpilation_result is not None`` in
-    # ``Pipeline._maybe_run_topology_prepass``. NOT a derived
-    # conclusion; lets slice 7's ``_decide_script_container_from_topology``
-    # distinguish two structurally-identical "empty
-    # ``reachability_requirements``" cases:
-    #   * ``transpile_ran is False`` (assemble-no-retranspile resume):
-    #     empty is expected because ``dependency_map`` is empty, so
-    #     ``derive_reachability_requirements`` returns ``{}``. Per the
-    #     slice-6 "save raw facts, recompute conclusions" rule the
-    #     consumer falls back to the legacy six-rule path PER-SCRIPT
-    #     for modules not covered by topology (the unconstrained-helper
-    #     fallback). Byte-identical to slice-5 behavior on resume.
-    #   * ``transpile_ran is True``: empty
-    #     ``reachability_requirements[sid]`` means the analysis genuinely
-    #     produced no constraint -- the consumer proceeds through the
-    #     topology decision tree (helper is unconstrained, fall through
-    #     to ModuleScript caller-domain routing).
-    # See ``scene-runtime-architecture-ir.md`` §"TopologyInputs shape
-    # -- transpile_ran" and §"Unconstrained-helper fallback contract".
+    # Raw fact: did the transpile phase run this invocation? Disambiguates
+    # two structurally-identical empty-``reachability_requirements`` cases:
+    #   * ``False`` (assemble-no-retranspile resume): empty is expected
+    #     (``dependency_map`` empty); the consumer falls back to the
+    #     legacy six-rule per-script path (unconstrained-helper fallback).
+    #   * ``True``: empty means the analysis genuinely found no constraint;
+    #     the consumer proceeds through the topology decision tree.
     transpile_ran: bool
-    # Phase 2b (Class 1): produced + enriched by
-    # ``Pipeline._maybe_run_topology_prepass``. Fully-resolved
-    # component-ref cross-domain edges (one row per peer-MonoBehaviour
-    # serialized reference whose endpoints sit in different runtime
-    # domains). ``build_topology`` reads from here and writes straight
-    # into the artifact -- it no longer calls the producer itself.
-    # ``bridge_member_scripts`` populated by ``edge_enrichment``.
+    # Class 1: fully-resolved component-ref cross-domain edges (one row
+    # per peer-MonoBehaviour serialized reference whose endpoints sit in
+    # different runtime domains). ``build_topology`` reads these and
+    # writes them straight into the artifact (no producer call inside the
+    # assembler). ``bridge_member_scripts`` populated by ``edge_enrichment``.
     cross_domain_edges: list[CrossDomainEdge]
-    # Phase 2b (Class 2): the ``PlayerSetSharedFlag`` funnel channel
-    # fact, computed by ``compute_shared_flag_channels`` from the live
-    # reader scan. Records the literal flag names read cross-domain, the
-    # reader domains, the constant canonical store, and the ``present``
-    # gate. Recompute-only (``caller_graph``-style; no preserve path);
-    # fails open on a no-transpile resume (``present: True`` with empty
-    # ``read_names``). Replaces the retired
-    # ``cross_domain_edge_candidates`` bucket. See
+    # Class 2: the ``PlayerSetSharedFlag`` funnel channel — literal flag
+    # names read cross-domain, reader domains, canonical store, ``present``
+    # gate. Recompute-only; fails open on a no-transpile resume
+    # (``present: True`` with empty ``read_names``). See
     # ``shared_flag_channels.py``.
     shared_flag_channels: SharedFlagChannels
 
@@ -1193,11 +1104,7 @@ def finalize_topology_containers(
     ``domain_signals`` / ``container`` / ``module_path`` /
     ``reachability_forced_container``) AND, when a reachability
     requirement says to hoist, mutates ``RbxScript.parent_path`` to
-    match — this preserves the legacy ``_apply_reachability_rule``
-    behavior verbatim. Slice 7 will move the hoist into the early
-    storage decision tree so this late mutation becomes vestigial;
-    until then, byte-identical observable behavior REQUIRES the
-    finalizer mirror the legacy mutation.
+    match.
 
     Returns the FINAL list of excluded ``script_id``s (early-inferred
     excluded + reachability_conflict additions) so the caller can
@@ -1293,19 +1200,8 @@ def finalize_topology_containers(
         if current_container not in _SERVER_CONTAINERS_FOR_REACHABILITY:
             continue
         # Atomic triple-write: script.parent_path + module.container +
-        # module.module_path. Slice 4 round 2 codified this as
-        # invariant 10 — see the docstring on
-        # ``_apply_reachability_rule`` for the empty-name guard
-        # discussion.
-        #
-        # Phase 2a slice 10: the parallel
-        # ``signals["reachability_forced_container"] = REPLICATED_STORAGE``
-        # write was retired. ``build_topology._build_modules_block``
-        # now derives ``reachability_required_container`` from the
-        # raw ``reachability_requirements`` map normalized through the
-        # same gate above, so the planner-row audit signal had no
-        # remaining production consumer (only the three external
-        # tests migrated in slice 10 commit 3 still asserted it).
+        # module.module_path, kept in lockstep (enforced by invariant 10
+        # in build_topology).
         script.parent_path = REPLICATED_STORAGE
         module_row["container"] = REPLICATED_STORAGE
         module_row["module_path"] = (
@@ -2100,28 +1996,6 @@ def _stamp_container_and_path_from_script(
         module["container"] = container
     if script.name and container:
         module["module_path"] = f"{container}.{script.name}"
-
-
-# ---------------------------------------------------------------------------
-# Reachability rule (client require graph must not reach ServerStorage)
-#
-# Phase 2a slice 11: the legacy ``_apply_reachability_rule`` was deleted
-# here. It had no callers since slice 6 (its docstring promised slice 7
-# would delete it; the deletion was deferred for flag-day safety on a
-# function that turned out to have no out-of-tree callers either). Its
-# behavior was split into two pieces during slice 6:
-#
-#   - ``derive_reachability_requirements`` runs EARLY (before
-#     ``classify_storage``) and computes the
-#     ``{script_id: required_container}`` mapping. PURE: no
-#     ``parent_path`` reads, no mutation.
-#   - ``finalize_topology_containers`` runs LATE (after
-#     ``classify_storage``) and applies the requirements atomically
-#     onto module rows + ``RbxScript.parent_path``, preserving the
-#     legacy predicate gate
-#     (``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``)
-#     so the behavior delta is zero.
-# ---------------------------------------------------------------------------
 
 
 def _compute_network_behaviour_reachable(

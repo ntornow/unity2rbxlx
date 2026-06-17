@@ -145,7 +145,6 @@ class AnimCurve:
 
 
 @dataclass
-@dataclass
 class AnimEvent:
     """An event in a Unity AnimationClip."""
     time: float
@@ -1744,17 +1743,12 @@ def convert_animations(
             _prefab_id = f"{_guid}:{_rel}"
             # Name collisions across prefabs are an existing
             # animation_converter limitation: ``prefabs_per_controller``
-            # keys off ``prefab.name``, so when two distinct prefabs
-            # share a Unity-given name the upstream emission collapses
-            # them into one scope before reaching the topology lookup.
-            # Phase 1's lookup inherits this — first-wins on
-            # ``setdefault``. The codex review of slices 8/9/10 flagged
-            # this with empirical evidence (SimpleFPS has 23 "Standard",
-            # 9 "Pickable", 5 "tile" duplicate-named prefabs). The real
-            # fix lives in ``prefabs_per_controller``'s keying (Phase 2
-            # or a follow-up cleanup). Until then, RECORD collisions so
-            # they surface in the log + are debuggable, instead of
-            # vanishing silently.
+            # keys off ``prefab.name``, so two distinct prefabs sharing a
+            # Unity-given name collapse into one scope before the topology
+            # lookup. This lookup inherits that — first-wins on the existing
+            # entry. The real fix lives in ``prefabs_per_controller``'s
+            # keying; until then, RECORD collisions so they surface in the
+            # log instead of vanishing silently.
             _existing = _topology_prefab_id_by_template_name.get(_template.name)
             if _existing is None:
                 _topology_prefab_id_by_template_name[_template.name] = _prefab_id

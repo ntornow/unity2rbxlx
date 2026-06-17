@@ -203,9 +203,7 @@ def ordered_child_go_fids(
     Transform. The parser otherwise visits nodes in YAML-document order,
     which doesn't match the prefab's authored order — so scripts that
     read ``transform.GetChild(i)`` translate to a Roblox ``GetChildren()[i]``
-    that returns the wrong sibling. (SimpleFPS Turret had Collider listed
-    in the YAML before Base; ``getTBase = getChildIndex(model, 1)`` then
-    returned the trigger Part instead of the rotating MeshPart.)
+    that returns the wrong sibling.
 
     Returns child GameObject fileIDs in m_Children order, dropping any
     references that don't resolve to a known GameObject. The caller is
@@ -283,15 +281,12 @@ def parse_documents(
         docs.append(parsed)
 
     # Step 4: pair documents with headers, skip stripped docs.
-    #
-    # Pairing is POSITION-STABLE: ``docs`` is in the same order as ``chunks``,
-    # and ``_split_yaml_documents`` emits one leading pre-separator chunk (no
-    # header) followed by one chunk per ``---`` separator. So document slot
-    # ``i`` (for ``i >= 1``) pairs with ``doc_headers[i - 1]`` — the
-    # ``0 <= header_idx < len(doc_headers)`` guard below covers the
+    # Pairing is position-stable: ``docs`` shares order with the chunks, and a
+    # leading pre-separator chunk has no header, so document slot ``i`` (for
+    # ``i >= 1``) pairs with ``header_idx = i - 1``. The guard below covers the
     # bare-trailing-separator edge where that index runs past the headers. Each
-    # document slot consumes its own header slot regardless of whether it parsed
-    # to a dict, so an interior malformed/non-dict doc burns ITS OWN header and
+    # document slot consumes its OWN header slot regardless of whether it parsed
+    # to a dict, so an interior malformed/non-dict doc burns its own header and
     # every later doc (including stripped ones) keeps the correct (cid, fid).
     result: list[tuple[int, str, dict]] = []
     for i, doc in enumerate(docs):

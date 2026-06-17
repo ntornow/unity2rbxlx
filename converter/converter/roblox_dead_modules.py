@@ -562,31 +562,20 @@ def csharp_source_has_gameplay_effect(csharp_source: str) -> bool:
 # ---------------------------------------------------------------------------
 # Positive rendering / visual-effect API signal (input-side gate).
 #
-# The transpile-time stub gate is DESTRUCTIVE (it replaces a script's body with
-# an inert stub BEFORE the AI ever sees it). Generic "low mapping coverage" is
-# NOT a safe trigger on its own: a portable menu / save / scene controller
-# (``PlayerPrefs`` + ``Application.Quit`` + ``SceneManager.LoadScene`` +
-# ``Cursor.lockState``) also has low coverage yet carries real, transpilable
-# behavior. So the gate additionally requires a POSITIVE rendering-API signal.
+# The transpile-time stub gate is DESTRUCTIVE (it stubs the body BEFORE the AI
+# sees it), and low mapping coverage alone is unsafe (a portable menu / save /
+# scene controller has low coverage but real behavior), so the gate also
+# requires a POSITIVE rendering-API signal.
 #
-# CRITICAL SAFETY PROPERTY: the signal must require ACTUAL RENDERING-API USAGE
-# -- a member access (``Type.member``), a method call, a render-target
-# constructor, or a render lifecycle hook -- NEVER a bare type token that can
-# appear in an ``using``/``namespace`` directive or a serialized FIELD
-# DECLARATION. A ``MenuController`` that merely does
-# ``using UnityEngine.Rendering.PostProcessing;`` or a gameplay script with only
-# a serialized ``public Projector projector;`` field makes NO rendering call and
-# is NOT provably dead at transpile time -- stubbing it would silently drop live
-# code. Such modules, if truly inert, are caught downstream by the
-# output-confirmed ``classify_module_dead``. Two layers enforce this:
-#   1. ``using ...;`` / ``namespace ...`` lines are stripped before matching.
-#   2. Every signal is a member-access / call / constructor / lifecycle form
-#      (it includes a ``.`` member, a ``(`` call, or a hook method name) -- so a
-#      bare ``Projector proj;`` declaration never matches.
-#
-# These are behavioral API surfaces, NOT class names, so a renamed rendering
-# helper (``OceanShimmer``) is still caught by its rendering CALLS while a menu
-# controller or a declaration-only field is left untouched.
+# SAFETY PROPERTY: the signal must require ACTUAL RENDERING-API USAGE -- a
+# member access, method call, render-target constructor, or render lifecycle
+# hook -- NEVER a bare type token in a ``using``/``namespace`` directive or a
+# serialized field declaration (which makes no rendering call and is not
+# provably dead). Two layers enforce this: (1) ``using``/``namespace`` lines
+# are stripped before matching; (2) every signal is a member-access / call /
+# constructor / lifecycle form, so a bare ``Projector proj;`` never matches.
+# These are behavioral surfaces, not class names, so a renamed helper
+# (``OceanShimmer``) is still caught by its rendering CALLS.
 # ---------------------------------------------------------------------------
 
 # Lines whose only role is importing / namespacing a type. A bare rendering type
@@ -638,13 +627,9 @@ def csharp_source_has_rendering_api(csharp_source: str) -> bool:
     render-target API that has no Roblox equivalent (input-side POSITIVE
     rendering signal).
 
-    Requires real USAGE -- a member access, a method call, a render-target
-    constructor, or a render lifecycle hook -- NEVER a bare type token in an
-    ``using``/``namespace`` import or a serialized field DECLARATION. Comments
-    and import/namespace lines are stripped first, and every signal is a
-    member-access / call / lifecycle form, so a declaration-only field
-    (``public Projector projector;``) does not trip the gate. This is the
-    decisive safety property of the destructive transpile-time stub gate.
+    Requires real USAGE, never a bare type token in an import or field
+    declaration (see the SAFETY PROPERTY note above ``_RENDERING_API_SIGNALS``).
+    Comments and import/namespace lines are stripped first.
     """
     src = _USING_OR_NAMESPACE_LINE.sub("", _strip_csharp_comments(csharp_source))
     return any(p.search(src) for p in _RENDERING_API_SIGNALS)
@@ -657,28 +642,15 @@ def is_input_side_dead(csharp_source: str) -> bool:
     -effect API signal (a GPU/shader/camera-effect/render-target API with no
     Roblox equivalent) AND no gameplay veto AND mapping coverage is dead-leaning.
 
-    The positive rendering signal is decisive for SAFETY: this gate is
-    destructive (it stubs the body before AI transpilation), so generic low
-    coverage alone is NOT enough -- a portable menu / save / scene controller
-    (``PlayerPrefs`` / ``SceneManager.LoadScene`` / ``Application.Quit`` /
-    ``Cursor.lockState``) also has low coverage but must NOT be stubbed. The
-    rendering signal isolates true rendering helpers. This REPLACES the old
-    hardcoded class-name list with a generic behavioral test; the decisive
-    output-side confirmation runs later in ``classify_module_dead``
-    (post-coherence). A renamed rendering helper (``OceanShimmer``) with the
-    same body shape is caught here by behavior, not name.
-
     BEST-EFFORT GATE (NOT the decisive authority). This input-only test is a
-    transpile-time OPTIMIZATION: it lets the converter stub an obviously-dead
-    rendering helper before spending an AI transpile on it, and -- decisively --
-    it keeps the generic ``rule_based`` -> ``strategy="stub"`` fallback from
-    mislabeling a real visual helper as a non-visual stub when AI is unavailable
-    (the only edge this allowlist actually guards). The ``_RENDERING_API_SIGNALS``
-    allowlist is therefore broad-but-finite and WILL miss some rendering APIs.
-    That is acceptable: a rendering helper that slips this gate is still caught by
-    the post-coherence, output-confirmed ``classify_module_dead`` for routing /
-    prune. The decisive authority is ALWAYS the output-side D3 verdict, never this
-    input-only allowlist.
+    transpile-time OPTIMIZATION: it stubs an obviously-dead rendering helper
+    before spending an AI transpile, and keeps the ``rule_based`` ->
+    ``strategy="stub"`` fallback from mislabeling a real visual helper when AI
+    is unavailable. The ``_RENDERING_API_SIGNALS`` allowlist is broad-but-finite
+    and WILL miss some rendering APIs -- acceptable, because a helper that slips
+    this gate is still caught by the post-coherence, output-confirmed
+    ``classify_module_dead``. The decisive authority is ALWAYS the output-side
+    D3 verdict, never this input-only allowlist.
     """
     if csharp_source_has_gameplay_effect(csharp_source):
         return False

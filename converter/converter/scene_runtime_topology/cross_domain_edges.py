@@ -1,45 +1,28 @@
 """cross_domain_edges — enumerate every static component-ref cross-domain
 edge (Class 1) in the plan.
 
-Relocated in Phase 1 from ``scene_runtime_domain.compute_cross_domain_edges``.
-Schema extended with the design doc's ``id`` field (the
-``deterministic_edge_id`` used as ``bridge_group_id`` by Phase 2b
-consumers). The id is populated deterministically in Phase 1 so Phase 2b
-can read it without a schema migration.
+A Class-1 edge is a serialized peer-MonoBehaviour reference in scene data
+(Door → Animator's ``open`` field). The bridge is per-edge, derivable,
+owned + recorded by topology. ``compute_cross_domain_edges`` enumerates
+these; the ``CrossDomainEdge`` schema below carries them. The dynamic
+shared-flag (Class 2) channel is recorded separately in
+``shared_flag_channels.py``.
 
-**Phase 2b reframe (2026-06-01).** The empirical whole-plan review split
-cross-domain authority into TWO bridge classes (design doc §"Phase 2b —
-cross-domain authority (two bridge classes)"):
-
-  - **Class 1 — static component-ref** (THIS module). A serialized
-    peer-MonoBehaviour reference in scene data (Door → Animator's
-    ``open`` field). The bridge is per-edge, derivable, owned + recorded
-    by topology. ``compute_cross_domain_edges`` enumerates these; the
-    ``CrossDomainEdge`` schema below carries them. UNCHANGED by the
-    reframe.
-  - **Class 2 — dynamic shared-flag** (NOT this module any more). An
-    attribute name computed at runtime (``"has" .. itemName``) routed
-    through ONE funnel RemoteEvent (``PlayerSetSharedFlag``). The
-    slices-1-2 seed (``SHARED_ATTRIBUTE_SEEDS`` /
-    ``compute_shared_attribute_candidates`` / ``producer_domain``)
-    mis-modeled this dynamic class AS the static class and was RETIRED in
-    the reframe. The channel is now recorded as a distinct
-    ``shared_flag_channels`` fact (``shared_flag_channels.py``) and gated
-    in step 2 / slice 3; the funnel itself stays.
+The ``id`` field (``deterministic_edge_id``) is used as
+``bridge_group_id`` by the bridge consumers.
 
 This module carries the Class-1 schema + producer only:
   - ``kind: "attribute_write"`` (closed-enum discriminator).
-  - ``resolution`` (strategy + event_name): the resolution metadata Phase
-    2b consumes. ``resolution.strategy`` is ``"remote_event_bridge"``
+  - ``resolution`` (strategy + event_name): the resolution metadata the
+    bridge consumes. ``resolution.strategy`` is ``"remote_event_bridge"``
     and ``resolution.event_name`` is derived from ``<owner>_Set<Field>``.
   - ``bridge_member_scripts``: the bridge unit (caller, listener, anim
     listener) populated by ``edge_enrichment.enrich_cross_domain_edges``.
   - ``payload`` (attribute_name + schema): the field name + its schema.
 
 The CrossDomainEdge schema is intentionally KEPT FLAT (no nested
-``producer{}/consumer{}`` sub-objects). The design doc's example
-(L228-251) shows a nested shape; that restructure is deferred
-indefinitely — every consumer reads ``from_*`` / ``to_*`` today.
+``producer{}/consumer{}`` sub-objects) — every consumer reads
+``from_*`` / ``to_*`` today.
 """
 
 from __future__ import annotations
@@ -133,15 +116,12 @@ class CrossDomainEdge(TypedDict):
     """One cross-domain attribute-write edge identified at conversion
     time.
 
-    ``id`` is added in Phase 1 (see module docstring). The original 10
-    flat fields (``from_*``, ``to_*``, ``field``, ``owner_*``) are
-    byte-stable with the pre-Phase-1 CrossDomainEdge so on-disk plans +
-    the cross-domain report writer keep working.
-
-    Phase 2b adds ``kind`` / ``resolution`` / ``bridge_member_scripts``
-    / ``payload`` per the design doc Path C architecture. The
-    producer/consumer restructure (nested objects per design doc
-    L232-235) is intentionally NOT done.
+    The 10 flat fields (``from_*``, ``to_*``, ``field``, ``owner_*``) are
+    byte-stable with the original CrossDomainEdge so on-disk plans + the
+    cross-domain report writer keep working. The bridge fields
+    (``kind`` / ``resolution`` / ``bridge_member_scripts`` / ``payload``)
+    are kept flat — the nested producer/consumer restructure is
+    intentionally NOT done.
     """
 
     id: str
@@ -177,9 +157,9 @@ def deterministic_edge_id(
     """Stable, debuggable edge id built from the 3 fields that already
     uniquely identify the edge (from_instance + field + to_instance).
 
-    Phase 2b consumes this as ``bridge_group_id``. The format is
-    intentionally human-readable — debugging a misrouted bridge means
-    eyeballing edge ids in dumps, not decoding a SHA prefix.
+    Consumed as ``bridge_group_id``. The format is intentionally
+    human-readable — debugging a misrouted bridge means eyeballing edge
+    ids in dumps, not decoding a SHA prefix.
 
     Two distinct edges sharing all three fields ARE the same edge by
     definition (one MonoBehaviour's one serialized field pointing at
@@ -198,9 +178,9 @@ def _derive_event_name_from_owner_field(
     camelCase fields (``isOpen`` → ``IsOpen``) keep internal casing so
     the name is human-recognizable.
 
-    Phase 2b slice 2 (P3 carry-forward from slice 1): returns ``None``
-    when ``field`` is empty. An empty-field component-ref edge has no
-    semantic content (the producer has no field to write) -- emitting
+    Returns ``None`` when ``field`` is empty. An empty-field
+    component-ref edge has no semantic content (the producer has no field
+    to write) -- emitting
     ``<owner>_Set`` would create a fragile event name + collide with
     every other empty-field edge from the same owner class. The
     structural-producer ``compute_cross_domain_edges`` skips edges
@@ -226,15 +206,14 @@ def compute_cross_domain_edges(
         execution domains in ``{"client", "server"}``
       - The two domains differ
 
-    Slice 1 stamps the new ``kind`` / ``resolution`` /
-    ``bridge_member_scripts`` / ``payload`` fields on every emitted
-    edge. The ``resolution.strategy`` is ``"remote_event_bridge"``
-    unconditionally — slice 2's enrichment may downgrade to
-    ``"same_domain_no_bridge"`` once it cross-checks finalized domains
-    against the live module table. ``bridge_member_scripts`` stays
-    empty until slice 2 fills it.
+    Stamps the ``kind`` / ``resolution`` / ``bridge_member_scripts`` /
+    ``payload`` fields on every emitted edge. The ``resolution.strategy``
+    is ``"remote_event_bridge"`` unconditionally — the enrichment pass may
+    downgrade to ``"same_domain_no_bridge"`` once it cross-checks finalized
+    domains against the live module table. ``bridge_member_scripts`` stays
+    empty until enrichment fills it.
 
-    Phase 2b:
+    Behavior:
       - Iterates ``scenes`` and ``prefabs`` in SORTED key order so the
         output is stable across runs even when the upstream planner
         reorders its dict insertions.
@@ -243,8 +222,8 @@ def compute_cross_domain_edges(
         returns ``None`` on that input and the row is dropped here
         rather than emitting a fragile ``<owner>_Set`` event name).
 
-    ``domains_override`` (Phase 2b slice 2 R1 P1-A fix): when supplied,
-    consulted FIRST for each script_id's domain. Falls back to
+    ``domains_override``: when supplied, consulted FIRST for each
+    script_id's domain. Falls back to
     ``scene_runtime["modules"][sid]["domain"]`` only when
     ``domains_override.get(sid)`` is missing or empty. Required by the
     prepass call site (``pipeline.py`` ``_maybe_run_topology_prepass``)
@@ -280,7 +259,7 @@ def compute_cross_domain_edges(
         return stem if isinstance(stem, str) else ""
 
     def _resolve_domain(script_id: str) -> str:
-        # P1-A fix: consult ``domains_override`` first (the prepass's
+        # Consult ``domains_override`` first (the prepass's
         # already-inferred-but-not-yet-stamped domains), then fall
         # back to the on-row stamped value (direct callers / resume).
         if domains_override is not None:
@@ -318,9 +297,9 @@ def compute_cross_domain_edges(
                 owner_class, field,
             )
             if event_name is None:
-                # Slice 2 P3 carry-forward: skip empty-field rows
-                # rather than emit a fragile ``<owner>_Set`` event
-                # name. The producer has no attribute to write here.
+                # Skip empty-field rows rather than emit a fragile
+                # ``<owner>_Set`` event name. The producer has no
+                # attribute to write here.
                 continue
             out.append(CrossDomainEdge(
                 id=deterministic_edge_id(src_inst, field, tgt_inst),

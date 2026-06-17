@@ -179,7 +179,7 @@ def decimate_mesh(
             final_faces,
             final_faces / original_faces * 100,
         )
-    except (AttributeError, Exception) as exc:
+    except Exception as exc:
         log.warning(
             "Quadric decimation unavailable for %s (%s); "
             "exporting original mesh",

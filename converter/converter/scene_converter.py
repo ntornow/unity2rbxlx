@@ -150,21 +150,11 @@ _LOD_TYPES = {"LODGroup"}
 # Scene conversion context
 # ---------------------------------------------------------------------------
 #
-# Single mutable container for state previously held in 9 module-level
-# globals (mesh sizes, material mappings, water-region collector, etc.).
-# convert_scene() instantiates one at entry and clears it on exit so:
-#
-#   - Multi-scene runs (`u2r.py convert --scene all`) cannot bleed state
-#     across scenes.
-#   - Helpers that read context fail loud (RuntimeError) if invoked
-#     outside an active conversion, instead of silently reading stale
-#     module-level data.
-#
-# Helpers access the active context via `_ctx()`. The frozen-input vs
-# accumulated-output split locked in the eng-review plan is deferred: this
-# PR keeps a single mutable dataclass to minimize diff against the existing
-# call sites; the input/output split lands when individual helper
-# signatures are refactored to accept ctx explicitly.
+# Single mutable container for per-conversion state. convert_scene()
+# instantiates one at entry and clears it on exit so multi-scene runs cannot
+# bleed state across scenes, and helpers reading context outside an active
+# conversion fail loud (RuntimeError) rather than reading stale state.
+# Helpers access the active context via `_ctx()`.
 
 @dataclass
 class SceneConversionContext:
@@ -214,9 +204,7 @@ _current_ctx: SceneConversionContext | None = None
 def _ctx() -> SceneConversionContext:
     """Return the active SceneConversionContext.
 
-    Raises ``RuntimeError`` when no conversion is in progress — helpers
-    invoked outside ``convert_scene()`` would previously read stale
-    module-level globals.
+    Raises ``RuntimeError`` when no conversion is in progress.
     """
     if _current_ctx is None:
         raise RuntimeError(
@@ -227,22 +215,19 @@ def _ctx() -> SceneConversionContext:
 
 
 # ---------------------------------------------------------------------------
-# Scene-runtime ID stamping (Piece 3 of scene-runtime-contract.md)
+# Scene-runtime ID stamping
 # ---------------------------------------------------------------------------
 #
-# The host runtime (PR4) binds plan entries to Roblox instances by reading a
+# The host runtime binds plan entries to Roblox instances by reading a
 # ``_SceneRuntimeId`` attribute of the form ``<scene>:<gameobject_fileID>``.
-# PR2 stamps the attribute on the logical GameObject host (the outer
+# The attribute is stamped on the logical GameObject host (the outer
 # RbxPart/Model returned for each SceneNode); the wrapped-geometry inner
 # ``*_Mesh`` child is intentionally NOT stamped — stamping both would make
-# lookup ambiguous. The legacy ``unity_file_id`` constraint-referent path
-# is untouched; ``_SceneRuntimeId`` is purely additive.
-#
-# Scene namespace format matches PR1's ``scene_runtime_planner._scene_namespace``
-# exactly so that ``_SceneRuntimeId`` collides with the plan's
-# ``game_object_id`` (``f"{namespace}:{node.file_id}"``). Mirrored rather than
-# imported because PR2 is independently landable off ``origin/main`` — the
-# two helpers consolidate when both PRs are in.
+# lookup ambiguous. ``_SceneRuntimeId`` is purely additive (the legacy
+# ``unity_file_id`` constraint-referent path is untouched). The scene
+# namespace format matches ``scene_runtime_planner._scene_namespace`` so the
+# id collides with the plan's ``game_object_id``
+# (``f"{namespace}:{node.file_id}"``).
 
 def _scene_namespace(
     scene_path: Path | None, unity_project_root: Path | None,
@@ -593,19 +578,6 @@ def _get_fbx_unit_ratio(
 # Mesh sizing — one input shape, one unit system, one formula
 # ---------------------------------------------------------------------------
 #
-# Before this refactor, sizing had three branches (per-sub-mesh resolved,
-# overall FBX bbox, embedded AABB) each applying its own scale-factor chain
-# to ``size`` values whose units were not commented. Two of the branches
-# treated ``size`` as "FBX vertex units interpreted as studs by Roblox" and
-# multiplied by ``import_scale × unit_ratio × STUDS_PER_METER``; the third
-# treated ``size`` as Unity metres and multiplied by ``STUDS_PER_METER``
-# only. PR #121 shifted embedded meshes from the third branch into the
-# first without changing the data shape, and ``_get_fbx_import_scale``
-# returned its default ``0.01`` for ``.prefab`` paths — Sizes dropped 100×
-# to ~0.029 studs and the writer's 0.05 floor absorbed the underflow.
-# Codex's read: "sizing was dispatched by lookup success, not by geometry
-# provenance".
-#
 # This adapter normalises every source to ``native_meters`` (the mesh's
 # actual real-world extent in metres) before any consumer sees it. Each
 # source kind owns its own conversion math; consumers apply exactly one
@@ -613,9 +585,11 @@ def _get_fbx_unit_ratio(
 #
 #     Size = unity_scale × native_meters × STUDS_PER_METER
 #
-# Adding a new source kind in the future just means writing another
-# adapter branch that fills ``native_meters`` — there is no path for a
-# downstream caller to pick the wrong scale chain by mistake.
+# Adding a new source kind just means writing another adapter branch that
+# fills ``native_meters`` — no downstream caller can pick the wrong scale chain.
+#
+# Invariant: each source converts to native_meters exactly once — never re-introduce
+# per-branch scale chains (they previously underflowed embedded-prefab AABBs ~100x).
 
 @dataclass(frozen=True)
 class _ResolvedMeshGeometry:
@@ -879,39 +853,6 @@ def _read_embedded_mesh_aabb(
     return None
 
 
-def _compute_mesh_size_from_embedded_aabb(
-    unity_scale: tuple[float, float, float],
-    mesh_guid: str,
-    guid_index: GuidIndex,
-    mesh_file_id: str | None = None,
-) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """Estimate Roblox Size/InitialSize for a mesh embedded in a Unity asset.
-
-    Used when ``mesh_guid`` resolves to a ``.prefab``/``.asset`` that embeds
-    its Mesh geometry (see :func:`_read_embedded_mesh_aabb`). Such meshes are
-    never uploaded, so neither ``mesh_native_sizes`` nor ``fbx_bounding_boxes``
-    has an entry for them.
-
-    The embedded ``m_LocalAABB`` is already in Unity metres -- no FBX import
-    scale applies -- so ``Size = aabb × unity_scale × STUDS_PER_METER``.
-
-    Returns ``(size, initial_size)`` or ``None`` when no embedded mesh AABB
-    is available.
-    """
-    asset_path = guid_index.resolve(mesh_guid)
-    if not asset_path:
-        return None
-    native = _read_embedded_mesh_aabb(asset_path, mesh_file_id)
-    if not native:
-        return None
-    size = (
-        abs(unity_scale[0]) * native[0] * config.STUDS_PER_METER,
-        abs(unity_scale[1]) * native[1] * config.STUDS_PER_METER,
-        abs(unity_scale[2]) * native[2] * config.STUDS_PER_METER,
-    )
-    return size, native
-
-
 # Unity built-in mesh shapes.
 # Format: fileID -> (roblox_shape_enum, flatten, base_size_meters)
 # base_size_meters is the mesh's size at Unity scale (1,1,1).
@@ -1137,18 +1078,12 @@ def _collect_ui_child_suppression_ids(
                 continue
             if not module_row.get("runtime_bearing"):
                 continue
-            # Codex P1: when the domain classifier has already run
-            # (`module_row["domain"]` is populated), exclude fail-closed
-            # modules. The classifier may force a module to
-            # ``domain="excluded"`` (both-side API, intra-class
-            # conflict, reachability conflict, moderate-only ambiguity);
-            # the host runtime never wires those modules, so the static
-            # UI subtree must persist. At ``convert_scene`` time the
-            # classifier hasn't run yet (subphase order: ``convert_scene``
-            # → ``_classify_storage``), so the field is typically absent —
-            # in that case we fall back to ``runtime_bearing``.
-            # (``"legacy"`` is the pre-classifier-v2 spelling; kept here
-            # for on-disk artifacts that haven't been migrated yet.)
+            # When the domain classifier has already run, exclude
+            # fail-closed modules: the host runtime never wires a module
+            # forced to ``domain="excluded"``, so the static UI subtree must
+            # persist. At ``convert_scene`` time the classifier usually
+            # hasn't run yet (order: ``convert_scene`` → ``_classify_storage``)
+            # so the field is absent and we fall back to ``runtime_bearing``.
             if module_row.get("domain") in ("excluded", "legacy"):
                 continue
             suppressed.add(game_object_id)
@@ -1180,7 +1115,7 @@ def _emit_dormant_holder(
     node: SceneNode, scene_nodes: dict[str, SceneNode],
 ) -> RbxPart:
     """Build the dormant Roblox Model for an inactive-but-referenced
-    GameObject under generic mode (PR3c carve-out).
+    GameObject under generic mode.
 
     The host runtime resolves the holder by ``_SceneRuntimeId`` and calls
     ``host.setActive(true)`` to bring it online; until then it sits inert
@@ -1192,13 +1127,10 @@ def _emit_dormant_holder(
     sees the GameObject in its authored location.
     """
     # World position + rotation composition mirrors the active branch in
-    # ``_convert_node`` — walk the parent chain, accumulating each
-    # ancestor's local position rotated into the running world frame and
-    # multiplying the running world rotation. A rotated authoring of an
-    # inactive GO must reactivate at the right ORIENTATION as well as the
-    # right position; emitting identity rotation lost the authored quat
-    # (codex P2). Kept local instead of factored to avoid perturbing the
-    # hot path for active conversion.
+    # ``_convert_node`` — walk the parent chain, accumulating each ancestor's
+    # local position rotated into the running world frame and multiplying the
+    # running world rotation, so an inactive GO reactivates at the right
+    # orientation as well as position.
     _chain: list[SceneNode] = []
     _pf = node.parent_file_id
     while _pf and _pf in scene_nodes:
@@ -2862,7 +2794,7 @@ def _embedded_key_candidates(relative: str, file_id: str) -> list[str]:
     ``conversion_context.json`` cached on Windows would otherwise miss
     every lookup on macOS/Linux when reused -- the ordinary FBX/OBJ
     lookup below this branch already builds both slash directions, so
-    do the same for synthetic keys. Codex review [P3].
+    do the same for synthetic keys.
     """
     keys = []
     seen: set[str] = set()
@@ -2904,7 +2836,7 @@ def _resolve_sub_mesh(
     #
     # Normalise slash directions: a Windows-keyed context (``Assets\
     # Foo.prefab#123``) reused on macOS/Linux would otherwise miss the
-    # uploaded entry. Codex review [P3].
+    # uploaded entry.
     if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
             and relative is not None):
         for embedded_key in _embedded_key_candidates(str(relative), str(mesh_file_id)):
@@ -2981,7 +2913,7 @@ def _resolve_mesh_id(
     # that first so the regular path-string lookup never falls back to a
     # cube-decal render when the synthesised OBJ has been uploaded.
     # Normalised slash variants so a context cached on Windows still
-    # matches when loaded on macOS/Linux. Codex review [P3].
+    # matches when loaded on macOS/Linux.
     if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
             and relative is not None):
         for embedded_key in _embedded_key_candidates(str(relative), str(mesh_file_id)):
@@ -4762,10 +4694,9 @@ def _convert_prefab_instance(
             )
         # NOTE: the prefab-root ``_SceneRuntimeId`` stamp lives at the
         # convergence point below (after the has_children/else branches
-        # rejoin). Without that lift, the ``else`` branch -- which
-        # handles single-node prefab instances -- emitted root parts
-        # with no stamp at all, so PR4 couldn't bind plan rows for the
-        # most common prefab shape (codex P1 review).
+        # rejoin) so the single-node ``else`` branch also gets stamped;
+        # without the lift those root parts emitted with no stamp and the
+        # host runtime couldn't bind their plan rows.
         for child in root.children:
             # Convert child prefab nodes with parent world transform
             # so positions are in world space (Roblox Models don't
@@ -4911,14 +4842,11 @@ def _convert_prefab_instance(
         if hasattr(root, 'components') and root.components:
             _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
 
-    # Stamp the prefab root with its ``<prefab_id>:<file_id>`` — PR4
-    # binds prefab subplan entries to converter-instantiated prefab
-    # roots via this attribute. Descendant nodes get the same stamp
-    # inside ``_convert_prefab_node``; this site catches BOTH the
-    # has-children branch (multi-node prefabs) AND the else branch
-    # (single-node prefabs) — see codex P1: the previous, in-branch
-    # placement silently skipped single-node prefab roots, leaving
-    # PR4 with no way to bind their plan entries.
+    # Stamp the prefab root with its ``<prefab_id>:<file_id>`` — the host
+    # runtime binds prefab subplan entries to converter-instantiated prefab
+    # roots via this attribute. Descendant nodes get the same stamp inside
+    # ``_convert_prefab_node``; this site catches BOTH the has-children
+    # branch (multi-node prefabs) AND the else branch (single-node prefabs).
     _stamp_scene_runtime_id(
         part, getattr(root, "file_id", ""), prefab_namespace,
     )

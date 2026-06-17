@@ -26,10 +26,6 @@ receiver group ``[A-Za-z_][A-Za-z0-9_.]*`` cannot match a receiver containing
 ``a:GetChildren()[1]:GetChildren()[1]`` rewrites only the inner site to
 ``__unityChild(a, 1):GetChildren()[1]`` -- no corruption. ``_luau_pos_is_code``
 skips matches inside single/double-quoted strings and ``--`` comments.
-
-Generic-only wiring -> legacy output stays byte-identical (this same logic is
-the legacy pack's logic; the generic path simply reuses it on a different
-source field).
 """
 
 from __future__ import annotations
@@ -173,11 +169,9 @@ def rewrite_child_index_source(source: str) -> tuple[str, int]:
     new_source = _GETCHILDREN_INDEX_RE.sub(_repl, source)
     if count == 0:
         return source, 0
-    # Code-aware presence check: a ``local function __unityChild(`` occurrence
-    # inside a comment/string (or a stray non-code position) does NOT count as
-    # the helper being defined -- otherwise we'd suppress injection while the
-    # call sites are rewritten to ``__unityChild(...)`` -> undefined helper at
-    # runtime. Only a definition at a real code position counts.
+    # Inject the helper unless it is already defined at a real code position
+    # (a definition buried in a comment/string would leave ``__unityChild(...)``
+    # call sites undefined at runtime).
     if not _has_helper_definition_at_code(new_source):
         new_source = _UNITY_CHILD_HELPER + "\n" + new_source
     return new_source, count
@@ -199,11 +193,8 @@ def lower_child_index(scripts: list[_HasLuauSource]) -> int:
     (``<recv>:GetChildren()[N]``) on each script's ``luau_source`` to the shared
     ``__unityChild`` resolver. Returns the number of scripts modified.
 
-    GENERAL rule (acceptance 2): keyed on the ``:GetChildren()[<literal>]``
-    STRUCTURE, never on ``s.name`` -- it applies to any GetChild site, not just
-    the turret. A variable index (``[i]``) is left untouched (genuine dynamic
-    lookup). This is the SAME logic the legacy pack runs, so generic and legacy
-    stay byte-identical for the same input."""
+    Keyed on the ``:GetChildren()[<literal>]`` STRUCTURE (not ``s.name``); a
+    variable index (``[i]``) is left untouched (genuine dynamic lookup)."""
     changed = 0
     for s in scripts:
         src = s.luau_source or ""

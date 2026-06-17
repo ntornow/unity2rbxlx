@@ -142,7 +142,7 @@ def _screen_filename(name: str, kind: str) -> ModerationFinding | None:
                 kind=kind,
                 classification="VIOLATION",
                 standards=["Civility"],
-                evidence=f"Filename contains slur/hate speech pattern",
+                evidence="Filename contains slur/hate speech pattern",
                 source_document="#1",
             )
 
@@ -176,7 +176,7 @@ def _screen_script(path: Path, relative_path: str) -> list[ModerationFinding]:
                 kind="script",
                 classification="VIOLATION",
                 standards=["Civility"],
-                evidence=f"Script contains slur/hate speech",
+                evidence="Script contains slur/hate speech",
                 source_document="#1",
             ))
             break
@@ -215,11 +215,10 @@ def _screen_audio_filename(name: str, relative_path: str) -> ModerationFinding |
         artist = match.group("artist").strip()
         title = match.group("title").strip()
         # Only flag if both parts look like real words (not asset pack names)
-        # AND at least one half contains a space (single-word artist+title
-        # like ``foo_bar`` is usually an asset-pack filename, not a song).
-        # ``and`` binds tighter than ``or``, so the parens are load-bearing:
-        # without them the title-only space check fires on its own and the
-        # length gate is bypassed.
+        # AND at least one half contains a space — a single-word artist+title
+        # like ``foo_bar`` is usually an asset-pack filename, not a song.
+        # Parens are load-bearing: ``and`` binds tighter than ``or``, so without
+        # them the title-only space check would bypass the length gate.
         if (
             len(artist) > 2
             and len(title) > 2

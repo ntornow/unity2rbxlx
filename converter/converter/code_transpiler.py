@@ -82,6 +82,16 @@ class TranspiledScript:
     # zero rig facts; a rig-fact-bearing script is NEVER ``None`` (default
     # ``present=False``, flipped ``True`` only on confirmed discharge).
     rig_binding: dict[str, object] | None = None
+    # Per-script roster-consumer binding carrier from the generic-mode
+    # post-transpile ``roster_consumer_lowering``: a JSON-native dict
+    # ``{"label": str, "receiver": str, "lowered": True}`` or ``None``. Stamped
+    # ONLY on a module re-lowered to read Phase 1's by_label tagged surface.
+    # Copied onto the produced ``RbxScript.roster_binding`` so the dead-module
+    # analysis can EXEMPT the (deterministically-inert) canonical body from the
+    # Roblox-dead set — it was re-lowered to read a live roster surface, so it is
+    # live by construction (NEW-FINDING-B). ``None`` for every non-re-lowered
+    # script.
+    roster_binding: dict[str, object] | None = None
 
 
 @dataclass
@@ -552,13 +562,9 @@ def transpile_scripts(
         if pattern_warnings:
             warnings = pattern_warnings + warnings
 
-        # Fall back to stub if AI didn't run or failed. The stub comments
-        # out the original C# as reference and generates a minimal module
-        # skeleton. This is intentionally minimal — AI transpilation is the
-        # primary path and the stub is only a safety net for offline/no-key
-        # scenarios. The old regex-based transpiler was removed because AI
-        # produces superior output and the regex patterns were a maintenance
-        # burden (catastrophic backtracking, 500+ lines of fragile patterns).
+        # Fall back to stub if AI didn't run or failed. The stub comments out
+        # the original C# and generates a minimal module skeleton — a safety
+        # net for offline/no-key scenarios; AI transpilation is the primary path.
         if not luau or confidence < 0.1:
             from converter.stub_generator import generate_stub
             luau = generate_stub(csharp_source, info)

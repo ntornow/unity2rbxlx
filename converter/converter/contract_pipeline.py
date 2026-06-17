@@ -45,6 +45,10 @@ from converter.code_transpiler import (
     _is_visual_only_script,
     transpile_scripts,
 )
+from converter.roster_consumer_lowering import (
+    RosterConsumerFact,
+    csharp_label_loader_paths,
+)
 from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.script_analyzer import ScriptInfo
 
@@ -72,6 +76,14 @@ class _SceneRuntimeModule(TypedDict, total=False):
     module_path: str  # PR3b -- present iff the storage classifier has run
 
 
+class _Addressables(TypedDict, total=False):
+    """The ``addressables`` block the planner stamps (Unit-4 surface). Phase 2
+    reads ``by_label`` (label -> [prefab_id]) to identify the roster consumer."""
+
+    by_label: dict[str, list[str]]
+    by_address: dict[str, str]
+
+
 class _SceneRuntimeArtifact(TypedDict, total=False):
     """Top-level ``scene_runtime`` shape PR3a reads."""
 
@@ -82,6 +94,9 @@ class _SceneRuntimeArtifact(TypedDict, total=False):
     scenes: dict[str, object]
     prefabs: dict[str, object]
     domain_overrides: dict[str, str]
+    # Unit-4 roster: the addressables label/address block the planner stamps.
+    # ``find_roster_consumers`` keys the roster re-lowering on ``by_label``.
+    addressables: _Addressables
 
 log = logging.getLogger(__name__)
 
@@ -471,20 +486,19 @@ def transpile_with_contract(
     # carries forward.
     _apply_require_resolutions(transpilation.scripts, require_resolutions)
 
-    # Camera-facet lowering (allowlisted deterministic lowering pass, PR5):
-    # route a flattened first-person DRONE/TURRET controller's look math onto
-    # the SceneCameraInput runtime service so generic-mode FPS games yaw, not
-    # just pitch. Structure-gated, never per-game; see camera_facet_lowering.py
-    # and docs/design/camera-input-fidelity-plan.md. The PLAYER is owned by
-    # paradigm C (the deterministic host authority in scene_runtime.luau, keyed
-    # on the upstream ``has_character_controller`` signal), so the player script
-    # is EXCLUDED from this pass (§3) -- it is never the camera/move writer here.
-    # Player identity comes from the DETERMINISTIC UPSTREAM Unity signal (the
-    # planner's per-module ``has_character_controller``), NOT a fingerprint of
-    # the transpiled output -- the latter abstained silently on AI shape
-    # variance, decoupling camera/movement/character (the systemic bug this
-    # closes). ``_player_controller_paths`` fail-closes (``∅``) on 0 or >1
-    # distinct CC-scripts.
+    # Camera-facet lowering (allowlisted deterministic lowering pass): route a
+    # flattened first-person DRONE/TURRET controller's look math onto the
+    # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
+    # pitch. Structure-gated, never per-game; see camera_facet_lowering.py. The
+    # PLAYER is owned by paradigm C (the deterministic host authority in
+    # scene_runtime.luau, keyed on the upstream ``has_character_controller``
+    # signal), so the player script is EXCLUDED from this pass (§3) -- it is never
+    # the camera/move writer here. Player identity comes from the DETERMINISTIC
+    # UPSTREAM Unity signal (the planner's per-module ``has_character_controller``),
+    # NOT a fingerprint of the transpiled output -- the latter abstained silently
+    # on AI shape variance, decoupling camera/movement/character.
+    # ``_player_controller_paths`` fail-closes (``∅``) on 0 or >1 distinct
+    # CC-scripts.
     # Surface upstream player identity that did NOT cleanly bind, rather than
     # abstaining silently. ``cc_module_count`` is the number of distinct
     # CC-bearing scripts the planner saw on placed GameObjects.
@@ -500,9 +514,8 @@ def transpile_with_contract(
     # the operator re-plans instead of shipping an unbound player.
     dict_mods = [m for m in modules.values() if isinstance(m, dict)]
     signal_present = any("has_character_controller" in m for m in dict_mods)
-    # Gate on runtime_bearing too (present since PR1) so an artifact old enough
-    # to also predate ``is_component_class`` still trips the guard (codex
-    # re-review false-negative).
+    # Gate on runtime_bearing too so an artifact old enough to also predate
+    # ``is_component_class`` still trips the guard.
     has_runnable = any(
         m.get("is_component_class") or m.get("runtime_bearing")
         for m in dict_mods
@@ -572,22 +585,21 @@ def transpile_with_contract(
         log.info("[contract] camera-facet lowering routed %d controller(s) "
                  "to SceneCameraInput", lowered)
 
-    # NOTE: paradigm C (the deterministic host authority in scene_runtime.luau,
-    # keyed on the upstream ``has_character_controller`` signal) owns the
-    # player's look + move; paradigm A is deleted, so there is no A-locator
-    # abstention concept any more. The signal-based fail-closeds
-    # (player_signal_absent / player_ambiguous / player_unresolved) key on C's
-    # own identity and remain above.
+    # Paradigm C (the deterministic host authority in scene_runtime.luau, keyed
+    # on the upstream ``has_character_controller`` signal) owns the player's
+    # look + move. The signal-based fail-closeds (player_signal_absent /
+    # player_ambiguous / player_unresolved) key on C's own identity and remain
+    # above.
 
-    # Child-index handling is now done by the pre-transpile child-ref resolver
+    # Child-index handling is done by the pre-transpile child-ref resolver
     # (``child_ref_resolver.build_child_ref_map`` + ``prerewrite_child_index``,
     # threaded into ``transpile_scripts`` above): transform-rooted
     # ``transform.GetChild(n)`` sites are resolved to named ``Find("<name>")``
     # lookups in the C# BEFORE the AI sees them, so no positional ordinal reaches
-    # the output. The post-transpile ``lower_child_index`` pass is retired here;
-    # the contract verifier's child-ordinal backstop fail-closes on any survivor
-    # for a fully-resolved script. (``child_index_lowering.py`` stays — the
-    # legacy packs still use it, and the backstop reuses ``source_has_child_index``.)
+    # the output. The contract verifier's child-ordinal backstop fail-closes on
+    # any survivor for a fully-resolved script. (``child_index_lowering.py`` stays
+    # — the legacy packs still use it, and the backstop reuses
+    # ``source_has_child_index``.)
 
     # OnTriggerStay lowering (allowlisted deterministic lowering pass): the
     # transpiler collapses Unity OnTriggerStay onto the same ``.Touched`` EDGE
@@ -641,16 +653,68 @@ def transpile_with_contract(
         log.info("[contract] rifle rig-retarget lowering rebound %d script(s) "
                  "to the _MainCameraRig slot", lowered_retarget)
 
+    # Roster-consumer re-lowering (allowlisted deterministic lowering pass,
+    # Unit 4 Phase 2): rewrite each Addressables-label-roster consumer's
+    # LoadDatabase/GetCharacter/dictionary/loaded to return the component object
+    # graph read from the by_label tagged surface (Phase 1's emitted roster).
+    # Keyed on the DETERMINISTIC upstream by_label fact (the module whose C# calls
+    # Addressables.LoadAssetsAsync<T>("<L>", ...) for L in by_label), NEVER on an
+    # AI-output fingerprint or a per-game string (D-P2-1/D-P2-2). Abstains on
+    # empty by_label / no literal label; fail-closes on ambiguity / stale artifact.
+    # COMPUTED here (the facts are local) but the rows are aggregated into
+    # ``fail_closed`` only AFTER its definition below (it does not exist yet).
+    from converter.roster_consumer_lowering import (
+        RosterUnresolved,
+        find_roster_consumers,
+        lower_roster_consumers,
+    )
+    addressables = scene_runtime.get("addressables") or {}
+    by_label_raw = addressables.get("by_label") or {}
+    by_label: dict[str, list[str]] = {
+        k: v for k, v in by_label_raw.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+    csharp_by_path = {s.source_path: s.csharp_source for s in transpilation.scripts}
+    roster_facts = find_roster_consumers(csharp_by_path, by_label)
+    roster_fail_closed = _roster_fail_closed(
+        roster_facts, by_label, csharp_by_path,
+    )
+    if not roster_fail_closed:
+        try:
+            lowered_roster = lower_roster_consumers(
+                transpilation.scripts, roster_facts,
+            )
+        except RosterUnresolved as exc:
+            # A located fact whose LoadDatabase/GetCharacter anchors could not be
+            # located -> fail closed (roster_unresolved), rather than shipping an
+            # empty-loadout DB (E-P2-2). Drained through the same path as the
+            # other roster rows at Site B below.
+            roster_fail_closed.append(FailClosed(
+                kind="roster_unresolved",
+                detail=str(exc),
+            ))
+        else:
+            if lowered_roster:
+                log.info(
+                    "[contract] roster re-lowering normalized %d label-roster "
+                    "consumer(s) to the by_label tagged surface", lowered_roster,
+                )
+
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
     # Player-binding rows (computed during the facet section above) lead so an
     # un-bound player is the first thing the operator sees.
     fail_closed: list[FailClosed] = list(player_fail_closed)
+    # Roster-consumer rows (computed at Site A above, where the facts are local):
+    # a roster ambiguity / stale-artifact / unresolved row REJECTS the conversion
+    # rather than shipping a silently-unlowered (empty-loadout) place -- symmetric
+    # with the player-binding fail-closeds (D-P2-7).
+    fail_closed.extend(roster_fail_closed)
     # Surface stem collisions FIRST -- a colliding stem was never added to
     # the path sets, so the per-script verifier loop below can't flag it.
-    # Without this surface the module silently disappears (codex P1 finding
-    # on PR3a). Component-class collisions subsume runtime-bearing ones
+    # Without this surface the module silently disappears. Component-class
+    # collisions subsume runtime-bearing ones
     # (every placed MonoBehaviour is a component class), so iterate the
     # superset and dedupe by stem.
     seen_collision_stems: set[str] = set()
@@ -675,22 +739,19 @@ def transpile_with_contract(
         # surviving violation) would still throw when first instantiated.
         if Path(script.source_path) not in component_class_paths:
             continue
-        # PR3b: stub_strategy fail-closed (carry-over from PR3a P2 #1).
-        # When the AI transpiler is unavailable / disabled / errored,
-        # ``code_transpiler.transpile`` falls through to the stub
-        # generator (``strategy="stub"``) which emits a placeholder
-        # ``print(...)`` body. A component module can't host the
-        # contract on stub output; ``auto`` mode must treat this as a
-        # fail-closed signal to fall back to legacy.
+        # stub_strategy fail-closed: when the AI transpiler is unavailable /
+        # disabled / errored, ``code_transpiler.transpile`` falls through to the
+        # stub generator (``strategy="stub"``) which emits a placeholder
+        # ``print(...)`` body. A component module can't host the contract on stub
+        # output; ``auto`` mode must treat this as a fail-closed signal to fall
+        # back to legacy.
         #
         # EXCEPTION: an INTENTIONALLY inert-stubbed component (a visual-only
         # water-shader / particle helper, OR an empty subclass of a dead base)
         # is a contract-valid inert ModuleScript (see ``_inert_component_stub``),
-        # so it is a legitimate terminal state, not an AI failure. The
-        # transpiler stamps ``intentional_inert_stub`` for those -- trust the
-        # stamp (the empty-subclass verdict needs project context this site
-        # lacks; recomputing ``_is_visual_only_script`` here would miss it and
-        # turn a clean stub into a spurious stub_strategy fail-close). The
+        # a legitimate terminal state, not an AI failure. The transpiler stamps
+        # ``intentional_inert_stub`` for those -- trust the stamp (the
+        # empty-subclass verdict needs project context this site lacks). The
         # ``_is_visual_only_script`` recompute is retained as a backstop for any
         # stub path that predates the stamp. Only genuine fallthrough fails
         # closed.
@@ -748,6 +809,71 @@ def transpile_with_contract(
         fail_closed=fail_closed,
         runtime_bearing_paths=runtime_bearing_paths,
     )
+
+
+def _roster_fail_closed(
+    roster_facts: dict[str, RosterConsumerFact],
+    by_label: dict[str, list[str]],
+    csharp_by_path: dict[str, str],
+) -> list[FailClosed]:
+    """Roster-consumer fail-closed rows (pure). Mirrors the player-binding
+    guards: surface ambiguity / a stale artifact rather than silently skipping
+    the re-lowering and shipping an empty-loadout DB.
+
+    ``roster_facts`` is already abstaining (empty when ``by_label`` is empty or
+    labels are non-literal); this adds the PROJECT-level guards
+    ``find_roster_consumers`` cannot see from a single module (D-P2-7).
+
+    The stale-artifact (``roster_signal_absent``) guard sources its "a roster was
+    expected" signal from the DETERMINISTIC C# fact (``csharp_label_loader_paths``
+    reusing the same LoadAssetsAsync regex as ``find_roster_consumers``), NOT from
+    ``by_label`` -- because in the stale case the ``addressables`` block is
+    missing, so ``by_label`` is empty and ``roster_facts`` is ``{}``; only the
+    C# fact can still see that a roster loader exists."""
+    rows: list[FailClosed] = []
+
+    # roster_ambiguous: >1 distinct module is the unique consumer of the SAME
+    # label (never first-match-wins). Group the located facts by label.
+    consumers_by_label: dict[str, list[str]] = {}
+    for src, fact in roster_facts.items():
+        consumers_by_label.setdefault(fact.label, []).append(src)
+    for label, srcs in sorted(consumers_by_label.items()):
+        if len(srcs) > 1:
+            rows.append(FailClosed(
+                kind="roster_ambiguous",
+                detail=(
+                    f"{len(srcs)} distinct modules load the same Addressables "
+                    f"label {label!r} ({', '.join(sorted(srcs))}); the roster "
+                    f"consumer is ambiguous and none was re-lowered. "
+                    f"Disambiguate the loaders or the by_label mapping."
+                ),
+            ))
+
+    # roster_signal_absent (STALE-ARTIFACT guard, analogous to
+    # player_signal_absent): some module's ORIGINAL C# calls
+    # ``Addressables.LoadAssetsAsync<T>("<L>", ...)`` (a roster IS expected,
+    # deterministic upstream) but the artifact carries NO ``by_label`` surface --
+    # the planner predates the Unit-4 addressables block. ``by_label`` is then
+    # empty so ``find_roster_consumers`` silently returns {} and the re-lowering
+    # is skipped with no signal; we surface it instead of shipping an empty-
+    # loadout DB. The signal is the C# fact, NOT ``by_label`` (which is exactly
+    # what is missing in the stale case). We cannot recompute the surface here
+    # (no scene access), so fail closed loudly. ``by_label`` truthy + the C# fact
+    # present is the NORMAL, healthy path -- ``find_roster_consumers`` handles it,
+    # so the guard requires the surface to be MISSING.
+    loader_paths = csharp_label_loader_paths(csharp_by_path)
+    if loader_paths and not by_label:
+        rows.append(FailClosed(
+            kind="roster_signal_absent",
+            detail=(
+                f"{len(loader_paths)} module(s) load an Addressables prefab "
+                f"roster ({', '.join(loader_paths)}) but scene_runtime carries "
+                f"no by_label addressables surface (artifact predates the Unit-4 "
+                f"addressables block); the roster consumer cannot be re-lowered. "
+                f"Re-run plan_scene_runtime (re-convert) so the block is stamped."
+            ),
+        ))
+    return rows
 
 
 # ---------------------------------------------------------------------------

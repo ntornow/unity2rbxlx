@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Tuple, Union
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -100,13 +100,11 @@ def invert_image(image_path: str | Path, output_path: str | Path) -> Path:
     if has_alpha:
         img = img.convert("RGBA")
         r, g, b, a = img.split()
-        from PIL import ImageOps
         rgb = Image.merge("RGB", (r, g, b))
         rgb_inv = ImageOps.invert(rgb)
         ri, gi, bi = rgb_inv.split()
         result = Image.merge("RGBA", (ri, gi, bi, a))
     else:
-        from PIL import ImageOps
         img = img.convert("RGB")
         result = ImageOps.invert(img)
 
@@ -261,11 +259,6 @@ def generate_uniform_texture(
 
     logger.info("Generated %s %s texture -> %s", size, color, output_path)
     return output_path
-
-
-# ---------------------------------------------------------------------------
-# Phase 4.2 additions
-# ---------------------------------------------------------------------------
 
 
 def bake_ao(

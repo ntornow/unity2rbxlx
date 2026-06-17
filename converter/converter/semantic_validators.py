@@ -82,12 +82,10 @@ _FPS_MARKERS = (
 def _is_fps_script(source: str, stripped: str | None = None) -> bool:
     """Detect FPS LocalScripts via Mouse-lock markers.
 
-    The check ignores comments AND string literals (quoted strings
-    AND long-bracket ``[[...]]`` strings) — a harmless ``local hint =
-    "Enum.MouseBehavior.LockCenter"`` or
-    ``-- Enum.MouseBehavior.LockCenter`` must not classify a script as
-    FPS. ``_strip_comments`` preserves string content (so other rules
-    can read it), so we additionally blank both string shapes here.
+    Ignores comments AND string literals (quoted and long-bracket) so a
+    marker inside a string/comment does not classify a script as FPS.
+    ``_strip_comments`` preserves string content for other rules, so both
+    string shapes are blanked here.
     """
     base = stripped if stripped is not None else _strip_comments(source)
     # Long-bracket strings ``[[ ... ]]`` / ``[=[ ... ]=]``.
@@ -362,8 +360,7 @@ def _rule_anchored_false_no_weld(
     issues: list[SemanticIssue] = []
     for m in _ANCHORED_FALSE_RE.finditer(code_only):
         if has_weld:
-            # Still warn if the assignment is structurally distant from
-            # the weld — but as low-confidence. For now skip: avoids
+            # A weld anywhere in the script suppresses the warning — avoids
             # the most common false positive.
             continue
         line_no = _line_of(source, m.start())

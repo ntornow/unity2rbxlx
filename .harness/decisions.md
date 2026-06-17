@@ -2493,6 +2493,66 @@ the only EMITTED gravity delta is the script + the `_Rigidbody2D` stamp + the pl
   around fall-rate ≈35.03, UseGravity=false float, server-force replication, ≥2000-body perf budget with
   bounce-to-Phase-1).
 
+# === Run hud-values-generic-20260616T161253 (2026-06-16) ===
+
+## [2026-06-16T08:19:46Z] Plan-stage review right-sized to dual-voice design review (not full autoplan gauntlet)
+**Decision:** Run the load-bearing dual-voice design review (Claude reviewer + codex exec on design.md)
+as the plan convergence gate; SKIP the full autoplan CEO→Design→DX product lenses.
+**Classification:** Mechanical (proportionality).
+**Rationale:** This is an internal converter bug-fix design (generic-mode HUD lifecycle + UI-control
+lowering). The CEO (strategy/market), Design (product UX), and DX (developer onboarding) lenses have
+near-zero signal for a pipeline fix; the Eng/soundness lens is what matters and is fully covered by the
+dual-voice design review. Right-size-at-design: review rigor matched to stakes.
+
+## [2026-06-16] Phase-1 detailed design — root-cause localization decisions
+- **D1 — Reframe (d) from "duplicate BindableEvent instances" to "Awake ORDERING race over a shared field."**
+  Both Player + HudControl are client-domain on one VM sharing the cached `Player` table (instances ARE shared);
+  the bug is HudControl:Awake (scene batch, scene_runtime.luau:3079) running BEFORE Player:Awake (prefab batch,
+  :3209) → reads nil `Player.*Update` → connects skipped. Kills Cur/Health/item updates. Root-cause correction.
+- **D2 — Build the (d) channel-identity fix UNCONDITIONALLY; gate the construction/host fix on runtime
+  instrumentation.** (d) decisive in code. Lead blank-`Total` (a static module, no event) is NOT static-decisive
+  — 3 surviving sub-mechanisms (Awake-never-runs / clone-descendants-absent-at-Awake / second-clone-visible);
+  one instrumented playtest (design-phase1.md §5) discriminates before writing host-resolution code.
+- **D3 — Default ONE slice** (shared boot-order contract, small, no fan-out). 2nd slice opens only if §5 shows
+  a respawn re-clone rebind (scene_runtime.luau:2861-2863, already a documented followup).
+- **D4 — Prefer runtime pre-pass (`event_channels` + `_ensureSharedEventChannels`) over transpile-time hoist**
+  unless implement step-0 finds the consumer reads the module FIELD (not an RS child), forcing producer-field
+  pre-set or a module-scope channel hoist. Deterministic lever over the byte-frozen AI prompt.
+- **Mechanism verdicts:** (b) clone-never-lands REFUTED (no warn); (a) module-never-constructs REFUTED static
+  (Player in RS → require resolves); (c) Awake-on-template REFUTED static (PlayerGui present → workspaceFind
+  never scans StarterGui); (d) ordering race CONFIRMED decisive.
+
+## [2026-06-16T09:04:08Z] Phase-1 fix mechanism (post dual-voice r1)
+- Reject runtime RS-child pre-pass (consumer reads module FIELD, not RS child — dead-end) AND naive module-scope hoist (generic contract forbids top-level side effects: code_transpiler.py:1325, runtime_contract.py).
+- Adopt: lower C# static events into a generated static `__ensureStaticChannels()` via a DETERMINISTIC contract_pipeline.py span-move; runtime invokes it before the Awake batches (contract-legal — runtime holds game). Planner flags modules with static channels (new schema).
+- Split Phase 1 into 2 slices: 1.1 channel-identity (offline-buildable now), 1.2 host-resolution/Total (gated on §5 Studio probe).
+
+## [2026-06-16] Slice 1.1 implementation decisions
+- **D1.1-a — C# static-event enumeration site:** `script_analyzer.analyze_script` (new `ScriptInfo.static_events: list[str]`), regex `_RE_STATIC_EVENT` over the decommented source. Member name = the last identifier in `public static event <HandlerType> <Member>;`. SimpleFPS Player.cs surfaces 4: HealthUpdate/AmmoUpdate/ItemUpdate/PauseEvent. Deterministic C# parse — never the AI Luau.
+- **D1.1-b — `static_channels` computed in `_subphase_inject_scene_runtime` (write_output, generic-only), NOT in `plan_scene_runtime`.** `field_name`/`channel_name` come from the C# member; `module_path`/`domain`/`container`(→parent_path) are only FINAL after storage-classify, which the planner phase predates. Mirrors `_build_scriptable_object_module_map`. Gated to same-domain (the channel is a same-VM BindableEvent field; cross-domain routes via RemoteEvents, out of scope). parent_path = the module's own container (RS for client cross-script) so the BindableEvent lives beside the module.
+- **D1.1-c — runtime find-or-create via a new `findOrCreateChannel(channelName, parentPath)` service** (autogen client+server tables), not direct `game` access in the runtime (the runtime is service-abstracted + harness-testable). `_ensureStaticEventChannels()` called from `start()` after Phase-0 module collection, before the scene loop. Sets `mod[field] = findOrCreateChannel(...)`; the AI's untouched `Player.X = Player.X or (...)` short-circuits. Idempotent: find-by-name returns the existing instance.
+- **D1.1-d — fail-closed rendezvous verifier = a new check in `contract_verifier.verify_contract` (3rd param `static_events_by_script`), keyed on the C# static-event list, NOT the AI Luau.** Fed by `pipeline._static_events_by_emitted_name`, which applies the SAME same-domain/runtime-bearing/stamped-module_path gate as the channel builder (so it never demands a rendezvous for a channel the runtime won't pre-set).
+- **D1.1-e — the verifier blesses ONLY the lazy-init GUARD shape `<Module>.<Field> = <Module>.<Field> or (...)` [post dual-voice r-impl].** EMPIRICAL (real LLM cache): the producer emission varies — `X = X or (IIFE)`, `X = X or ensureEvent("X")`, `X = ensureEvent("X")` (no `or`), `self:_playerEvent("X")` (local helper, no field assignment). The runtime field-pre-set is load-bearing ONLY when the producer's `or` SHORT-CIRCUITS onto the pre-set instance. An UNCONDITIONAL reassignment (`X = ensureEvent(...)` / `X = Instance.new(...)`) can OVERWRITE the pre-set instance with a fresh one and disconnect already-bound consumers (codex finding; `ensureEvent` happens to re-find under RS for SimpleFPS, but the verifier can't prove the create-expr re-finds the SAME name+parent generically) → fail-closed. The local-helper shape never assigns → fail-closed. The verifier ALSO strips string literals (not just comments) so a rendezvous inside `"..."` can't bypass (codex adversarial finding). Known lenient gaps (fail-OPEN noise, documented in followups, not fixed in 1.1): (1) an aliased read `local ev = X; ev:Connect(...)` warns spuriously; (2) a multi-declarator `static event H A, B;` surfaces only the last name.
+
+## [2026-06-16T11:22:14Z] Slice 1.1 converged (3 review rounds); codex r3 P1 overruled at integration
+Both round-2 P1s fixed (structured per-module channel identity + module-id-keyed verifier feed). codex r3
+raised a new P1 (consumer RS-name-lookup breaks folderization) — REFUTED against the real rbxlx (consumer
+reads the module field, not an RS lookup); overruled with evidence, residual logged to followups. Claude r3
+CONVERGED. Classification: refute-adversarial-finding-at-integration.
+
+## [2026-06-16T14:17:10Z] LIVE-PROBE root-cause refinement + scope decision (B)
+- Instrumented Studio probe (SimpleFPS-HUDPROBE.rbxlx) showed: HudControl:Awake RUNS on the live PlayerGui
+  clone; Module/Ammo/Total resolve; maxAmmo=250; Player.AmmoUpdate already set. User confirms **max ammo (Total)
+  renders DETERMINISTICALLY** → the designed "blank-Total / host-resolution" bug (Slice 1.2) is REFUTED. **Slice
+  1.2 DROPPED.** (Per OPERATING: reproduce the actual symptom live before building; found a real race but not
+  THE Total symptom.)
+- Confirmed-real remaining HUD bugs: (1) current-ammo (Cur) update path rides the scene-vs-prefab Awake
+  ORDERING RACE (nondeterministic — probe won it this run; design proved it loses on others) → **Slice 1.1**
+  (channel identity, CONVERGED) makes it deterministic. KEEP. (2) item-pickup **checkmarks never show**:
+  UpdatePlayerItems sets SetAttribute("isOn") with no reader driving Checkmark visibility = Unity Toggle→no
+  visual binding → **Phase 2**.
+- **Scope = (B):** Phase 1 (Slice 1.1, current-ammo determinism) + Phase 2 (generic Toggle isOn→Checkmark
+  visual binding). Health-fill (Slider→fill, same lowering class) DEFERRED to followups.
 ## Run turret-bullet-damage-20260616T101918 (2026-06-16T08:27:13Z) — turret bullets: damage instead of push
 
 - **Reported bug:** turret/plane bullets hit the player but deal no damage and shove them.
@@ -2878,3 +2938,417 @@ principles. Design: `design.md` (re-anchored against worktree `1acd1bb`).
 - **D-12 — e2e MUST use /convert-unity (or /e2e-test), NEVER u2r** (recorded as a durable lesson): u2r mandates
   `--skip-architecture-step` (no client/server split) → can't faithfully run the client-only binding. u2r is OK only
   for deterministic converter-unit checks (A6 plan emission).
+
+## ── /drive run addressables-unit3-themes-20260617T080323 — Addressables Unit 3 (Themes) — 2026-06-17T04:00:11Z ──
+
+# Decisions — Addressables Unit 3 (Themes)
+
+## D1 — Fix dead theme registration via data-seeding through a converter-owned contract
+Classification: Taste / Mechanical
+Populate the theme registry with a deterministic build-time seed (off the `scriptable_objects` guid→path
+map + addressables labels), NOT by re-lowering the AI's non-deterministic `LoadDatabase`/`Register`
+emission. The seed must register through a contract the converter owns, not the AI's incidental
+`Register`/`_pendingThemeData` shape (fingerprinting AI output is the anti-pattern this fix removes).
+
+## D2 — Resolve AssetReference via the existing primitive + `_value_to_lua` seam
+Classification: Mechanical
+Extend `scriptable_object_converter._value_to_lua` object-ref recognition to match the AssetReference
+`{m_AssetGUID, m_CachedAsset:{guid,fileID,type}}` shape and resolve via the Unit-2
+`prefab_id_for_ref`/`prefab_id_for_guid` primitive. No new resolver, no duplication; the consumer
+`host.instantiatePrefab(zone.prefabList[i])` is already wired to expect a prefab-id string.
+
+## D3 — Two phases on the foundation→consumer staged-risk seam
+Classification: Taste
+Phase 1 (AssetReference resolution) is an independently-verifiable foundation; Phase 2 (theme
+registration) end-to-end depends on Phase 1 being correct (a registered theme with unresolved prefabList
+spawns nothing — failure would scatter, hiding the broken layer). Split rather than one linear phase.
+
+## D4 — No game-specific hardcodes in the seed
+Classification: Mechanical
+Derive the owning label + key field from the consuming load method (not literal `themeData`/`themeName`);
+dedupe by guid; abstain (don't crash) on SOs lacking the identifying field (best-effort fallback). Never
+hardcode `themeData` or `themeName`. (Superseded the earlier "iterate ALL SO labels" framing — see D6.)
+
+## D5 — Strike option (b) coherence-pack; committed converter-owned write-time surface
+Classification: Mechanical
+Round-1 review (P1-A) verified: coherence packs are SKIPPED in generic scene-runtime mode — the generic
+`write_output` branch returns BEFORE `run_packs` (`converter/converter/pipeline.py:3139-3147`). The whole
+feature is generic, so a "coherence-pack structural guarantee" can never fire — option (b) is STRUCK.
+Also corrected: a PUBLIC `ThemeDatabase.Register(themeData)` DOES exist in captured output
+(`ThemeDatabase.luau:52-59`); the honest reason not to call it is that its name/shape is a
+non-deterministic AI emission (D1), NOT that "no write path exists." Committed direction: a
+converter-owned, generic-mode-safe deterministic registration surface emitted at write-time alongside the
+`scriptable_objects` map build (`pipeline.py:~6877-6925`), NOT fingerprinting the AI `Register`. The
+remaining open item is the precise write mechanism, to be SPIKED at Phase 2 detailed design against the
+real ThemeDatabase/PlayerData/TrackManager modules; if it forces a consumer registry-READ-site rewrite,
+that is absorbed in Phase 2 scope/SLOC and the "zero consumer change" claim is qualified to Phase 1 only.
+
+## D6 — Scope Unit 3 to the theme DB with a DERIVED ownership/routing model
+Classification: Taste / User-Challenge
+Round-1 review (P1-B): "retain all SO labels + key by identifying field" explains discovery but not which
+consumer DB owns a label nor the correct key function. Blindly iterating ALL SO-addressable labels +
+dedup-by-guid cross-registers unrelated SOs, and the guid/stem fallback creates entries the consumer never
+retrieves (registry looks populated but is behaviorally dead). Decision: route each label to the database
+whose converted load method requests it, keyed by the field that database indexes by — DERIVED from the
+source (`ThemeDatabase.LoadDatabase` issues `LoadAssetsAsync<…>("themeData")`, indexed by `op.themeName`),
+never hardcoded. Scope Unit 3 to the theme database only; a fully-general "every SO-addressable consumer"
+ownership model (CharacterDatabase, future SO-loaded DBs) is deferred.
+
+## D7 — Reframe Phase 2 acceptance to a directly-invoked criterion; name the Unit-1 dependency
+Classification: Taste
+Round-1 review (P1-C): "segments spawn" is gated on Unit 1 (character boot / client spawn-domain, "Error
+2"), not Phase 1/2 alone — so it is not honestly isolatable. Reframed Phase 2's isolatable acceptance to:
+`currentTheme` non-nil AND `host.instantiatePrefab(prefabList[i])` returns a real instance WHEN INVOKED
+DIRECTLY (probe-driven, decoupled from live gameplay). The Unit-1 character/spawn-domain dependency is
+named as an out-of-band precondition for the visible end-to-end (added to Out of scope / dependencies).
+
+## D8 — AssetReference matcher: require m_CachedAsset present + subset-bound the rest (Phase 1 detailed design)
+Classification: Mechanical
+`_value_to_lua` matches a Unity AssetReference iff `{m_AssetGUID, m_CachedAsset} <= set(d.keys()) <=
+{m_AssetGUID, m_CachedAsset, m_SubObjectName}` (pinned against `trash-dash/.../themeData.asset:22-31`;
+verified 152/152 real occurrences are exactly `{m_AssetGUID, m_CachedAsset}`). REQUIRE both `m_AssetGUID`
+AND `m_CachedAsset` (the real serialization always pairs them) and subset-bound the rest (only
+`m_SubObjectName` optional). Anti-swallow tightening: requiring `m_CachedAsset` stops a bare `{m_AssetGUID}`
+/ `{m_AssetGUID, m_SubObjectName}` one-field struct from being wrongly collapsed to a prefab-id string or
+nil — it falls through to the generic-dict branch UNRESOLVED with its data intact (fail-soft, no
+regression). Disjoint from the existing `set(keys) <= {fileID,guid,type}` object-ref arm.
+
+## D9 — Resolve via existing primitives; zero edits to prefab_ref.py (Phase 1 detailed design)
+Classification: Mechanical
+Resolve precedence: `m_AssetGUID` (bare guid -> `prefab_id_for_guid`) first, `m_CachedAsset`
+(`{fileID,guid,type}` -> `prefab_id_for_ref`) as fallback; both through the UNCHANGED shared `.prefab`
+filter (`prefab_ref.py:54`). No new resolver, NO edit to `prefab_ref.py` — the REAL primitives already
+suffice. [DIVERGENCE] design.md:159 allowed a "0-1" prefab_ref.py touch; the real code needs 0. Phase 1
+lives entirely in `_value_to_lua` (+ a one-line import of `prefab_id_for_guid`).
+
+## D10 — Unresolved AssetReference collapses to nil, not the old unresolved table (Phase 1)
+Classification: Taste
+A non-prefab/empty/dangling AssetReference emits `nil --[[(Unity AssetReference)]]`, NOT the prior
+unresolved `{AssetGUID=…, CachedAsset=…}` table. The consumer indexes `prefabList[i]` as a STRING for
+`host.instantiatePrefab`; a table there was already non-functional, so a uniform `nil` fail-soft is the
+honest, consumer-guardable contract and matches the object-ref arm's `nil`. No data loss vs a usable
+prior emit.
+
+## D11 — Write mechanism: converter-owned boot shim feeds deterministic consumer-called LoadDatabase (Phase 2 detailed design / spike)
+Classification: Mechanical / User-Challenge
+SPIKED against real modules + dual-voice review. The shim (a new converter-owned module, NOT a coherence-pack
+edit on AI output) seeds owned SO instances onto the DB's appendable write surface at boot; the deterministic,
+consumer-called `LoadDatabase` (`ThemeDatabase.luau:30`, C#-derived name) does the dict-fill AND sets
+`loaded()=true` — so the `LoadoutState.luau:184` `loaded()` UI gate works for free. STRUCK option (b) "rewrite
+the C#-derived read bodies" (GetThemeData/dictionnary/loaded): body-rewrites on transpiled output are
+coherence-pack-shaped and packs are SKIPPED in generic mode (the SAME constraint that killed the pack option in
+D5) — codex overruled the design subagent's (b) recommendation at integration. STRUCK "converter fully emits
+the DB module" (can't generically pick which AI module is the theme DB without fingerprinting D1/D6 forbid).
+The AI-name dependency is confined to ONE structurally-detected appender ingress (prefer a public list-appender
+fn, else a `*pending*` list field) with fail-soft no-op+warn. Consumer registry-READ-site rewrite is NOT
+required — "zero consumer change" extends to Phase 2 (design.md:128 caveat does NOT trigger).
+
+## D12 — Bootstrap order: entrypoint slot between SceneRuntime.new and engine:start (Phase 2)
+Classification: Mechanical
+The shim runs in `SceneRuntimeClient`/`Server` between `SceneRuntime.new(services, Plan)` and
+`engine:start(domain)` (`autogen.py:960-961`/`:1115-1116`). Verified: every `PlayerData.Create()` call (which
+fires `LoadDatabase` via `StartStaticCoroutine`, `PlayerData.luau:233-238`) is inside a lifecycle method
+(GameManager:OnEnable, MusicPlayer/LicenceDisplayer/ShopUI:Start) that runs in `engine:start()`'s
+`_runAwakeEnableStart` — strictly AFTER the shim slot. The `themeDataList == nil` guard
+(`ThemeDatabase.luau:32`) makes a too-late seed permanently invisible (spike 2 "Order BAD"), so the slot is
+load-bearing. The shim seeds the PENDING list (not the private store), so `LoadDatabase`'s `themeDataList={}`
+reset is re-filled in the same call — no clobber.
+
+## D13 — Ownership/routing derived generically; seed supplies instances, LoadDatabase owns the key (Phase 2)
+Classification: Mechanical
+Owned label derived from the C# `Addressables.LoadAssetsAsync<T>(LABEL, …)` call in the DB's load method
+(`ThemeDatabase.cs:35` → "themeData"); key field from the callback's `dict.Add(op.FIELD, op)`
+(`ThemeDatabase.cs:36-37` → `themeName`); owning DB = the module issuing the load; owned SO guids =
+`addressables.by_label[label]` ∩ emitted SO guids (the two `m_Address: themeData` entries,
+`Themes.asset:20-29`). NEVER hardcode `themeData`/`themeName`. The seed supplies SO INSTANCES only; the key
+field is used SOLELY to abstain on a key-less SO, never to write the registry key (that stays `LoadDatabase`'s
+job) — keeping AC-1 self-satisfaction-proof. Unit 3 scoped to the theme DB; CharacterDatabase/future deferred.
+
+## D14 — Parallel SO-addressables surface gated on positive evidence; shared .prefab filter untouched (Phase 2)
+Classification: Mechanical
+New `ScriptableObjectAddressables` + `resolve_scriptable_object_addressables` in `addressables_resolver.py`,
+PARALLEL to `resolve_prefab_addressables`. Retains label/address → SO guids gated on `so_guids` (an emitted SO
+module EXISTS — positive evidence), NOT on the absence of a `.prefab` (which would also catch sprites/audio).
+The shared `.prefab` filter (`prefab_ref.py:54`) and the existing prefab resolver are UNCHANGED (P2 hard
+constraint upheld; AC-8 pins byte-identical prefab maps).
+
+## D15 — Acceptance reads via the consumer's lookup path, not the seed's key (Phase 2; followups P2)
+Classification: Taste
+AC-1 reads `ThemeDatabase.GetThemeData(PlayerData.instance.themes[PlayerData.instance.usedTheme + 1])`
+(verbatim `TrackManager.luau:228`), indexing by `PlayerData.themes[1] == "Day"` (`PlayerData.luau:271`), NOT
+the seed's derived key. Self-satisfaction-proof because the seed never writes the registry key — `LoadDatabase`
+extracts it from `op.themeName` and the probe looks it up via `PlayerData.themes`, two independent paths that
+meet only if the registry is genuinely keyed right. Discharges followups P2.
+
+## D16 — Write-surface detection BOUND to the LoadDatabase drain list + FAIL-LOUD on a miss (Phase 2; review P1)
+Classification: Mechanical
+The write-surface detector must prove the surface it seeds is the SAME list the converted `LoadDatabase`
+drains into the private store — not merely that *some* appender to *some* list exists (a mismatched/false
+detection silently leaves `GetThemeData`/`currentTheme` nil, the D1 fingerprint-fragility this approach exists
+to avoid, with no consumer read-rewrite to compensate). Key the mechanism off the deterministic C#-derived
+`LoadDatabase` (name from C# `ThemeDatabase.LoadDatabase`, stable across re-transpiles): derive `DRAIN_FIELD` =
+the field its body iterates (`ipairs(<MODULE>.<DRAIN_FIELD>)` → `_pendingThemeData` on real output), accept a
+public appender ONLY if its `table.insert` `TARGET_FIELD == DRAIN_FIELD` (else seed `DRAIN_FIELD` directly).
+What is compared: appender-target-field == LoadDatabase-drained-field == the field the store is built from —
+all derived from that one converted module, never a name match (no `Register`/`_pendingThemeData`/`themeData`
+hardcode). If the linkage can't be proven (no recognizable drain, OR no surface binds), the seed records NO
+entry for that DB, emits a converter WARNING, and ABSTAINS — loud abstain > silent dead registry. Verified on
+the real `ThemeDatabase.luau` via `/tmp/drain_link_probe.py` (Register binds: `_pendingThemeData ==
+_pendingThemeData`). (design-phase2 §1.4; AC-7/AC-9; edges 7/8.)
+
+## D17 — Seed plan RECOMPUTED at emit time (not round-tripped through conversion_plan.json) so a no-retranspile resume keeps it (Phase 2; review P2)
+Classification: Mechanical
+`addressable_db_seeds` is **RECOMPUTED in `write_output` on every run** and set on the in-memory `scene_runtime`
+dict in the window after `_build_scriptable_object_module_map` (`pipeline.py:6819`) and BEFORE
+`generate_scene_runtime_plan_module` (`:6822`) — NOT persisted through `conversion_plan.json`. It does NOT rely
+on the conversion_plan round-trip: `_classify_storage` writes conversion_plan.json during
+`materialize_and_classify` (`:5056`/`:2798`) BEFORE this derivation point, and `_merge_scene_runtime` (`:5885`)
+preserves only keys already on disk while `plan_scene_runtime` resets `ctx.scene_runtime` (`:1159`) — so a
+late-added seed would NOT round-trip; recomputing each emit sidesteps the on-disk-only preservation entirely.
+Every input is recomputed by an ESSENTIAL phase on resume, so it is NOT gated on a fresh transpile: the
+`addressables` block via ESSENTIAL `plan_scene_runtime` → `_build_addressables_block`
+(`pipeline.py:691`,`:1041-1124`); the transpiled DB module body (drain/appender bind) via ESSENTIAL
+`materialize_and_classify` → `_rehydrate_scripts_from_disk` re-reading `<output>/scripts/*.luau` into
+`rbx_place.scripts[*].source` (`pipeline.py:696`,`:3034`,`:3162`); the DB C# (label + key field) re-read from
+`self.unity_project_path` by path. It does NOT read transient `transpilation_result` (`None` on a no-retranspile
+resume, `pipeline.py:175`/`:2212`) — unlike the dead-modules pass that sources C# from
+`transpilation_result.scripts` and abstains on resume. So a no-retranspile `--phase=write_output`/`assemble`
+resume re-emits the `seedAddressableDatabases` call AND a non-empty seed list **into the emitted
+`SceneRuntimePlan`**; the seed is NOT transpile-gated. (design-phase2 §2.2, §2.5; AC-10.)
+
+## D18 — Allowlist the seed key in `_PLAN_KEYS_FOR_HOST` so it reaches the runtime-required plan; re-point AC at the emitted plan (Phase 2; review P1, both reviewers)
+Classification: Mechanical
+The embedded `SceneRuntimePlan` ModuleScript the runtime actually `require`s is built by
+`generate_scene_runtime_plan_module` (`autogen.py:654`), which filters `scene_runtime` through the
+`_PLAN_KEYS_FOR_HOST` allowlist (`:643-651`; real current contents: `modules, scenes, prefabs,
+domain_overrides, scriptable_objects, scene_prefab_placements, addressables, gravityDesiredBaseStuds`). The
+subset is `{k: scene_runtime.get(k) for k in _PLAN_KEYS_FOR_HOST if k in scene_runtime}` (`:662-666`) — a key
+NOT in the allowlist is ELIDED from the emitted plan even when present on `scene_runtime`. So the D17-recomputed
+seed (written to `scene_runtime`/`conversion_plan.json`) would be dropped from the plan the runtime requires →
+`Plan.addressable_db_seeds == nil` → `seedAddressableDatabases` always sees `{}` → silent dead registry on a
+FRESH convert (not just resume) — the exact failure the phase exists to prevent. FIX: add
+`"addressable_db_seeds"` to `_PLAN_KEYS_FOR_HOST` (the SAME mechanism that carries
+`addressables`/`gravityDesiredBaseStuds`; confirmed the correct lever — the filter is the single gate the
+runtime-required plan passes through). Named as a fifth production TOUCH-POINT in the Interfaces + the slice
+`owns` (one-line, small but LOAD-BEARING; cannot be split off — a slice that built the seed without it ships a
+silently dead registry). AC-10 is RE-POINTED to assert the key is present in the EMITTED `SceneRuntimePlan`
+ModuleScript (the filtered artifact the runtime requires), NOT only `conversion_plan.json`, so the AC actually
+guards this seam; edge 9 covers "key on `scene_runtime` but absent from the emitted plan" (a test that drops the
+allowlist key must turn AC-10 RED). (design-phase2 §2.2a, §4 touch-point #5, AC-10(P1), edge 9.)
+## Run addressables-unit4-20260616T084409 (Addressables Unit 4 — roster) — 2026-06-17
+
+# Decisions — Addressables Unit 4 (roster)
+
+## D1 — Anchor roster on `addressables.by_label`, not the AI-emitted `CharacterDatabase` access string
+Classification: Taste (architecture)
+The transpiled consumer has drifted across 3 shapes (WaitForChild folder, FindFirstChild folder, CollectionService:GetTagged). Key the re-lowering on the deterministic upstream label block (canonical-contract rule). Output-fingerprinting reserved for the best-effort consumer-side rule only.
+
+## D2 — Emit roster as CollectionService-tagged + attributed instances AND a named Folder
+Classification: Taste (architecture)
+Covers all three observed consumer shapes; a folder alone silently abstains on the current `GetTagged` shape. The tag is the canonical agreed key.
+
+## D3 — Roster instances clone/reference the existing `ReplicatedStorage.Templates.<unique-key>` prefabs (Unit 1's emit)
+Classification: Mechanical
+Unit 1 already emits the roster prefabs as uniquely-keyed templates via `addressable_prefab_ids`; reuse avoids a second prefab→template conversion and keeps identity collision-free.
+
+## D4 — Redirect the dead `scriptable_objects/<Name>.luau` ModuleScript for roster-shaped `.asset`s; trigger structurally (a `by_label` set of prefab refs), never on the name
+Classification: User-Challenge
+Touches the generic SO-emit path and the "stay general-purpose, no hardcoded game values" constraint. Review explicitly that roster-detection is structural and game-agnostic.
+
+## D5 — One phase (emit + consume are one contract)
+Classification: Mechanical
+Default one phase; no fan-out and no staged-risk foundation present (Unit 1's identity foundation already landed/verified). Emit-without-consumer or consumer-without-surface each prove nothing; only the assembled boot proves the fix.
+
+## Scope correction (recorded)
+Design-doc "Unit 4" = consumables + roster. This task is the ROSTER HALF only (the boot-gating dep). Consumables deferred to followups.
+
+---
+## Revision after dual-voice design review (review-design-1.md) — 2026-06-16
+
+D1–D5 below REVISE the originals above; D6–D9 are NEW. (See design.md for full wording.)
+
+## D1 (revised) — Anchor BOTH halves on `addressables.by_label`, not the AI access string
+Classification: Taste (architecture)
+Consumer drifted across 3 access shapes; both producer and the consumer re-lowering key on the upstream label block.
+
+## D2 (revised) — Tag-as-primary contract (CollectionService tag + attributes); named Folder OPTIONAL
+Classification: Taste (architecture)
+Tag is the canonical key and needs no folder name (also resolves the D6 collision). Folder added only if the spike shows a consumer shape that requires it; default tag-only.
+
+## D3 (revised) — Roster→template lookup keys on prefab_id, not characterName/address
+Classification: Mechanical
+Templates child name is the prefab file-stem (guid-disambiguated). Keying on name/address mis-resolves. Reuse Unit-1 uniquely-keyed templates.
+
+## D4 (revised, was the mis-tiered Open Question) — Deliverable is BOTH the roster surface AND the consumer resolved to the `Character` object graph
+Classification: User-Challenge
+LoadDatabase returns a raw tagged Instance; LoadoutState/Character dereference a rich Character OOP table (`c.gameObject:Clone()`, `c.accessories`, `c.characterName`, `getComponent(...,"Character")`). A tagged surface alone does NOT unblock the boot. Consumer lever is greenfield (no roster re-lowering scaffold in contract_pipeline.py). Exact shape settled by the SPIKE-FIRST directive.
+
+## D5 (revised, was "characterName from address") — characterName from the Character component's serialized field; fall back to address/prefab-name only if absent
+Classification: Mechanical
+Consumer keys on `op:GetAttribute("characterName")` — a serialized component field, not the addressable address (`address ≠ characterName`).
+
+## D6 (new) — Resolve the dead AssetGroup SO name-collision now (tag-primary and/or suppress the dead module), don't defer
+Classification: User-Challenge
+`scriptable_objects/<Group>.luau` is the parsed AssetGroup definition (dead — LoadDatabase never reads it); writer reserves RS names (~1685-1692). Tag-primary avoids the folder name; suppressing the dead module removes the collision. Trigger is structural (a by_label set of prefab refs), never the name.
+
+## D7 (new) — Explicit roster-tag emit path; don't overload the single-tag m_TagString writer path
+Classification: Mechanical
+rbxlx_writer.py:942-948 emits one tag from m_TagString. Roster needs its own tag-emit path (writer + place builder) or a generalized null-delimited Tags list.
+
+## D8 (new) — New/extended RbxPlace data-model channel for the roster, consumed identically by BOTH emit paths
+Classification: Mechanical
+RbxPlace has no generic RS tree, only `replicated_templates`. Both rbxlx_writer AND luau_place_builder must emit the roster, or publish-built places stay broken.
+
+## D9 (new, supersedes the prior "one phase" D5) — Two-phase staged-risk split (producer foundation → greenfield consumer); spike at the front of detailed design
+Classification: Taste (architecture)
+Producer surface is an independently-verifiable foundation (parsed-rbxlx + headless place) the greenfield consumer lever depends on → foundation-before-dependents condition justifies the split. May re-merge to one phase post-spike if Phase 2 is thin; then carry heightened-review.
+
+## Framing correction (recorded)
+The fix is ADDITIVE (emit a new roster surface), NOT a "redirect" of the dead SO ModuleScript. The SO module matters only for the D6 name-collision. The prior doc's "redirect"/"dead ModuleScript" framing throughout was corrected.
+
+---
+## Phase-1 detailed-design decisions (post-spike) — 2026-06-16
+Spike (spike-phase1.md) verdict: `c.accessories` + `c.gameObject:Clone()` ARE on the boot path → two-phase split (D9) STANDS. The following are Phase-1 (producer) decisions.
+
+## P1-D1 — Roster channel is a typed `list[RbxRoster]` on RbxPlace, NOT a generic RS-children tree
+Classification: Taste (architecture)
+Right-sized to one feature; a generic RS-children tree is a followup if themes/consumables/other label rosters accrue. Self-describing for both emit paths (D8). New types RbxRoster{label, members} / RbxRosterMember{template_name, tag, attributes:dict[str,RbxAttrValue]} in core/roblox_types.py.
+
+## P1-D2 — Roster members are deep-copied clones of the emitted Templates.<template_name> tree at the canonical RS surface; lookup keys on prefab_id→template_name (D3)
+Classification: Mechanical
+Reuses Unit-1 templates (no second conversion). prefab_id→template_name comes from scene_runtime.prefabs[pid]["template_name"] (already resolved at pipeline.py:6087-6091). Keying on prefab_id (not name/address) avoids D3 mis-resolution.
+
+## P1-D3 — Tag-primary, NO folder by default (D2/D6); any container uses a fixed reserved non-colliding name added to _reserved_rs_names
+Classification: User-Challenge
+Avoids the dead-AssetGroup-SO name collision by construction (scriptable_objects/<Group>.luau ModuleScript name already reserved at rbxlx_writer.py:1689-1691). Trigger is structural (by_label set of prefab refs), never the name. Flag for game-agnostic review.
+
+## P1-D4 — Dedicated roster-tag emit on BOTH writers; rbxlx emits correct base64 NUL-delimited Tags, headless emits CollectionService:AddTag (D7/D8)
+Classification: Mechanical
+Does NOT overload the existing single-tag path (rbxlx_writer.py:944, reads attributes.get("Tag"), writes plain text — a doc divergence: it is NOT m_TagString). Spike finding: luau_place_builder emits ZERO CollectionService tags today, so the roster-tag path is new on BOTH writers. Existing single-tag plain-text format left as-is; flagged as a VERIFY-stage (Studio boot) risk.
+
+## P1-D5 — characterName from the prefab's Character-component serialized field (scene_runtime.prefabs[pid].instances[*].config), fallback address→stem, omit if absent (D5)
+Classification: Mechanical
+Matches consumer contract op:GetAttribute("characterName"). serialized_field_extractor strips the m_ prefix (serialized_field_extractor.py:73-74). address ≠ characterName.
+
+## P1-D6 — Phase 1 is ONE slice (shared co-authored RbxPlace.rosters contract)
+Classification: Taste (architecture)
+The new channel is co-authored by the assembly producer + both emit consumers; the shared-contract rule forces one slice. No fan-out, no staged-risk seam inside Phase 1 (the staged-risk boundary is Phase 1→2). XML-only roster leaves headless places broken (D8), so the writers are not independently verifiable. NOTE: the merged-tag-encoder test (P1-D8 below) and cross-emitter parity test (P1-D2-rev) are FIRST-CLASS slice acceptance, not deferred to VERIFY.
+
+---
+## Phase-1 detailed-design REVISION after dual-voice review (review-phasedesign1-1.md) — 2026-06-16
+P1-D2/P1-D4/P1-D5 below REVISE the originals above (verified against real worktree code this session). P1-D7/P1-D8 are NEW. (Full wording in design-phase1.md §5.)
+
+## P1-D2 (revised) — Each emitter MATERIALIZES a SECOND instance; the canonical Templates child is NEVER tagged/mutated (P4)
+Classification: Mechanical
+rbxlx deep-copies the template RbxPart and re-emits under ReplicatedStorage (sibling of Templates); luau builds a second copy into an RS var via the same part-emit, then AddTag+SetAttribute on THAT var. Tagging the canonical child in place would make GetTagged()[i].Parent differ across emitters and corrupt the template. Parity AC asserts equal {parent-context, tag-set, attributes}. Inertness verified: RS scripts don't auto-run AND the generic runtime host scans `workspace`, not RS (converter/runtime/scene_runtime.luau binds via workspaceFind / workspace:GetPartsInPart / GetDescendants on workspace objects only).
+
+## P1-D4 (revised) — ONE canonical Tags codec per writer; FOLD the existing single-Tag path in (P2)
+Classification: Mechanical
+rbxlx_writer.py:942-948 ALREADY writes <BinaryString name="Tags"> as plain text from attributes["Tag"]. A second base64/NUL-delimited Tags element = two incompatible encodings + two <Tags> elements on a member carrying both. Fix: `_emit_collection_tags(props, tags)` is the SOLE writer of name="Tags" — collect {attributes["Tag"]} ∪ {roster label tag}, dedup, emit ONE element. MANDATORY merge (no "leave untouched/optional" hedge). Wire encoding (plain vs base64 NUL-delimited) is a VERIFY-stage risk; single-codec/single-element is a Phase-1 requirement. Mirror the same single-AddTag-site invariant on the luau side.
+
+## P1-D5 (revised) — characterName selected by FIELD-PRESENCE (config contains key `characterName`), tiebreak via modules[script_id].class_name (P1)
+Classification: Mechanical
+The planner's instances[*] rows (scene_runtime_planner.py:969-977) carry only script_id + opaque config — NO component-type tag — and the Cat prefab has 5 MonoBehaviour instances, so a class-based selector is not implementable. Select the instance whose config CONTAINS the key `characterName` (the consumer's GetAttribute contract key, NOT a "Character" class literal); tiebreak ONLY via scene_runtime["modules"][script_id]["class_name"]; on remaining ties pick first-in-lifecycle + warn. Fallback address→stem; omit if absent. CORRECTION: the round-1 "serialized_field_extractor strips m_ at :73-74" rationale is FALSE (verified — that extractor avoids a blanket m_ filter and only handles object refs; the planner does not strip m_ either). characterName is un-prefixed because Character.cs declares it `public string`.
+
+## P1-D7 (new) — assemble_rosters dedups on (label, prefab_id); pipeline keeps `place.rosters.extend(...)` (P3)
+Classification: Mechanical
+by_label is built via setdefault().append() (addressables_resolver.py:128-129) with NO dedup → a prefab under two AddressableEntry rows duplicates the prefab_id → GetTagged returns the member twice. Dedup at assembly is the load-bearing guard. `extend` is SAFE (mirrors replicated_templates.extend; self.state.rbx_place is rebuilt fresh from convert_scene each conversion at pipeline.py:2601) — no set/replace hedge. Twice-call idempotency test kept as hygiene, re-anchored on the dedup.
+
+## P1-D8 (new) — Explicit str-narrowing at EVERY scene_runtime/config read; non-str → skip-with-warning, fail-closed (P5)
+Classification: Mechanical
+config is dict[str, object]; template_name/by_label arrive untyped from persisted JSON; RbxAttrValue admits only scalars. Narrow with isinstance(v, str) (and the scalar set for attributes) before use; else skip-with-warning — never coerce (str(v)), never Any. A malformed member (non-str characterName) is still tagged + clonable; only the bad attribute is omitted. AC for this case.
+
+---
+## Phase-1 detailed-design REVISION 2 after dual-voice round 2 (review-phasedesign1-2.md) — 2026-06-16
+P1-D2/P1-D3 below REVISE the round-1 revisions above. P1-D9/P1-D10 are NEW (the 2 round-2 BLOCKING findings). Verified against real worktree code this session. (Full wording in design-phase1.md §1.4/§1.4a/§1.5/§5.)
+
+## P1-D2 (revision 2) — Deep-copy must RE-KEY referents/unity_file_ids fresh; members live under a dedicated container (P4, NEW-BLOCKING-a)
+Classification: Mechanical
+A naive copy.deepcopy of a template RbxPart retains its unity_file_id, and rbxlx_writer mints a part's referent FROM unity_file_id (pre-pass _pre_register at rbxlx_writer.py:1420-1429; _make_part at :854-857) → the copy and template get the SAME referent (duplicate referent IDs), and a constraint Part1 (resolved from connected_body_file_id via the global fid→referent map at :392-398) cross-links the copy to the TEMPLATE part. Fix: per-copy old_fid→new_fid remap assigning fresh-unique fids to every copied part, rewrite each constraint's intra-subtree connected_body_file_id through the remap (drop Part1 for external bodies), and extend the pre-pass to walk place.rosters copies so fresh fids get referents. luau path needs NO re-key (verified: it keys nothing on a global id — Instance.new per part; Motor6D Part0/Part1 by name via FindFirstChild(name,true) at :941-954; _emit_constraint at :858-872 sets no Part0/Part1). AC12 asserts every referent in the file is unique + intra-member Part1 resolves within the copy.
+
+## P1-D3 (revision 2 — SUPERSEDES round-1 "tag-primary, NO folder") — Members live under ONE dedicated collision-checked container Folder (NEW-BLOCKING-b)
+Classification: User-Challenge
+Bare RS-root siblings named from template_name reintroduce the WaitForChild/auto-RemoteEvent shadowing both writers reserve against (rbxlx_writer.py:1683-1697 / :1685-1701; luau_place_builder.py:617-629). Fix: parent all roster members (across labels) under ONE Folder under ReplicatedStorage whose name passes the SAME reserved-RS-name dedup both writers build — default base RosterMembers, suffix-disambiguate on collision (Templates / a ModuleScript / a template / scriptable_objects/<Group>.luau), and add the chosen name to _reserved_rs_names on BOTH writers so no auto-created RemoteEvent shadows it. CollectionService tag (GetTagged) is the discovery key, so the container name is free to be disambiguated — it need NOT be "Characters" or the label. This ALSO resolves the round-1 dead-AssetGroup-SO module collision (no RS-root sibling named like the module) and keeps members clear of the host's RS:FindFirstChild("Templates")/Templates:FindFirstChild lookups (autogen.py:844-846). AC13 asserts container + member names pass the reserved-RS-name check on BOTH emitters.
+
+## P1-D9 (new) — Roster label tag applied to the member ROOT only, carried via a dedicated marker attribute (_RosterTag) unioned by _emit_collection_tags / the AddTag site
+Classification: Mechanical
+The deep-copy/rebuild produces a whole subtree, but GetTagged(<label>) must return exactly the member ROOTS, not their descendants. Carry the label on the copy ROOT via attributes["_RosterTag"] (set when materializing the member, root only, never propagated to descendants); _emit_collection_tags (rbxlx) and the single AddTag site (luau) union {attributes["Tag"]} ∪ {attributes["_RosterTag"]} for that part and STRIP _RosterTag from the emitted AttributesSerialize / SetAttribute (it is a marker, not a real attribute). Descendants carry no label.
+
+## P1-D10 (new) — Inertness rationale (P4) reworded: host NEVER enumerates RS, only NAMED lookups
+Classification: Mechanical
+Round-1 wording "nothing iterates RS" was imprecise. Verified: the host DOES named RS lookups (RS:FindFirstChild("Templates") at autogen.py:844-846; bootstrap WaitForChild) but NEVER enumerates RS children (no RS:GetChildren/GetDescendants); all component-binding scans run on workspace clones (scene_runtime.luau binds via workspaceFind / workspace:GetPartsInPart / clone:GetDescendants on workspace objects). So members under a dedicated container are invisible to host binding AND clear of the named Templates lookups.
+
+---
+## Phase-1 detailed-design REVISION 3 after dual-voice round 3 (review-phasedesign1-3.md) — 2026-06-16
+Round 3 confirmed rounds 1-2 BLOCKERS fixed; both voices converged on ONE remaining coupled BLOCKING: the rbxlx Tags emission does not provably produce a working CollectionService:GetTagged. P1-D4 below is REVISED (supersedes "wire encoding deferred to VERIFY"). Verified against real worktree code this session: rbxlx_writer.py:942-948 is the SOLE name="Tags" producer in the whole codebase and sits INSIDE the `if part_class != "Model":` branch (859-995); AttributesSerialize at :1059-1063 is OUTSIDE that branch; `import base64` present at :10; scene_converter._wrap_geometry_with_children_into_model sets class_name="Model" at :2185 for any prefab node with geometry+child transforms (multi-part character prefabs ⇒ Model-rooted); no existing test asserts on the Tags element (grep tests/ for name="Tags"/GetTagged/CollectionService = none). (Full wording in design-phase1.md §1.5/E12/AC4/AC7/AC11/AC12/P1-D4.)
+
+## P1-D4 (REVISION 3 — SUPERSEDES "wire encoding deferred to VERIFY") — Tags codec SPECIFIED + LIFTED in Phase 1 (round-3 Tags-contract BLOCKING)
+Classification: Mechanical
+The Tags emission is fixed in three coupled parts, all Phase-1 (offline), with ONLY the live GetTagged boot left to VERIFY:
+1. LIFT — `_emit_collection_tags(props, tags)` is called in the COMMON tail next to AttributesSerialize (rbxlx_writer.py:1059-1063, verified OUTSIDE the `part_class != "Model"` branch that closes at :995), NOT inside the non-Model branch where the current emit sits. So every roster member root — Part- or Model-rooted — emits its Tags element; previously Model roots (the common multi-part character case, e.g. the Cat prefab) emitted none → GetTagged empty, and a single-Part fixture passed falsely.
+2. CODEC — `_emit_collection_tags` emits exactly ONE `<BinaryString name="Tags">` whose content is the tag list joined by NUL (\0) as UTF-8, base64-encoded (the canonical Roblox CollectionService encoding). The existing plain-text emit (tags_elem.text = unity_tag, :948) is FOLDED IN, which also corrects that pre-existing wrong (raw-text) encoding. ONE codec for both the Unity-Tag path and the roster-label path.
+3. ACs — AC4 decodes the BinaryString (base64 → split on \0) and asserts the label present, run on a MODEL-ROOTED multi-part fixture (the AC12 fixture, made the SHARED fixture so the Model-root path is actually exercised). AC11 asserts exactly one Tags element with the decoded union {Unity tag} ∪ {label}. AC7 cross-emitter parity PARSES the actual rbxlx (decode) vs the luau AddTag strings — never luau-vs-intended. Live GetTagged boot stays AC6/VERIFY.
+luau path is encoding-INDEPENDENT (CollectionService:AddTag(var, tag) takes the plain string; the engine owns the in-memory store) — ONLY the rbxlx XML path needs the wire-codec fix.
+
+## P1-D4 regression risk (folding the single-Tag plain-text path into the canonical codec) — ASSESSED: NONE on covered behavior
+Classification: Mechanical
+rbxlx_writer.py:947 is the ONLY name="Tags" producer in the codebase and NO existing test/output asserts on its content/encoding (grep of tests/ and roblox/ = no Tags assertion). So folding the untested plain-text emit into base64 regresses no covered behavior; it replaces an untested, likely-non-loading plain-text form with the proven Roblox codec. The design also UNIONS (not replaces) the Unity m_TagString tag with the roster label and dedups, so a part carrying a Unity tag keeps it (now correctly encoded) — and a Model carrying a non-Untagged m_TagString, which the old branch-scoped emit silently DROPPED, now emits its tag too (a pre-existing gap also closed by the lift). VERIFY confirms pre-existing single-Tag parts still emit correctly under the merged codec.
+
+## Re-observation (live, on PR-#24 base) — 2026-06-16
+
+- **Unit 4 CONFIRMED still needed.** Fresh generic conversion on the #24 base (af4a1c2 = Units 1+2 old + #24 require-closure fix), headless smoke: scriptErrorCount=0, boot_health_ok, wasd_works. BUT no roster surface exists — the only `Characters` in the rbxlx is the dead AssetGroup ModuleScript (line 17864), not a Folder of character instances. CharacterDatabase.LoadDatabase finds container=nil → m_CharactersDict={} → empty roster (no crash, but non-functional loadout). #24 shifted the symptom from boot-crash to silent-empty; the roster still needs populating. Classification: premise-confirmation.
+- **NEW-FINDING-A (consumer drift shape):** this conversion's transpiled CharacterDatabase reads the FOLDER shape (ReplicatedStorage:FindFirstChild("Characters") + GetChildren + op:GetAttribute("characterName")), NOT GetTagged (unit2-proper). Confirms AI drift across the 3 shapes → validates anchoring on by_label and REQUIRES Phase 2's consumer re-lowering (the producer surface alone won't satisfy every shape). The current folder-shape consumer needs `ReplicatedStorage.Characters` to be a FOLDER of instances OR the re-lowering to normalize it to the tagged surface.
+- **NEW-FINDING-B (dead-module interaction):** CharacterDatabase is flagged Roblox-dead ("inert output + dead-leaning input prior") — chicken-and-egg: inert because the roster is empty. Phase 2 must ensure the re-lowered, roster-backed CharacterDatabase is NOT dead-stubbed (or the dead-module classifier must see it as live once it has real data). Fold into Phase 2 detailed design.
+- **BASE dependency:** this run is based on upstream/main (ntornow#196), which LACKS #24. A boot on this base would hit the #24 require cascade (masking). #24 is merged on the jiazou fork (into the superseded old Unit-2 branch) but NOT upstream. Unit 4 needs #24 in its base to verify/ship end-to-end.
+
+---
+## Phase-2 detailed-design decisions (consumer re-lowering) — 2026-06-16
+Dual-voice design review (codex + Claude design subagent) both converged. Verified against real worktree code + the real transpiled output (unit1 == reobs24 FOLDER shape) + the C# source (CharacterDatabase.cs:33 LoadAssetsAsync<GameObject>("characters",...)) + an EMPIRICAL classify_module_dead run. Full wording in design-phase2.md §5.
+
+## D-P2-1 — Identify the roster consumer by a DETERMINISTIC upstream fact, NOT a transpiled-body fingerprint
+Classification: Taste (architecture)
+The consumer module is the one whose ORIGINAL C# calls Addressables.LoadAssetsAsync<...>(L) for an L present in scene_runtime["addressables"]["by_label"] (keys on by_label per D1). New module roster_consumer_lowering.py + typed RosterConsumerFact{source_path,label,component_type,index_key}. Abstains on empty by_label / non-literal label arg; fail-closes (roster_ambiguous) on >1 consumer of one label and (roster_signal_absent) on a stale artifact — symmetric with the player-binding facts. Body-fingerprinting was REJECTED by both reviewers: it misfires across the 3 AI drift shapes (WaitForChild folder / FindFirstChild folder / GetTagged) and on other label loaders.
+
+## D-P2-2 — Re-lowering WHOLE-REGION-REPLACES the four public methods + state decls with a GAME-AGNOSTIC canonical object-graph body; never patches the AI drift string
+Classification: Taste (architecture)
+REVISED (review-phasedesign2-1 P1): the canonical body contains NO per-game literal. The receiver-table name <N> is READ from the located `function <N>.LoadDatabase`/`function <N>.GetCharacter` anchor (the C# class/file stem; verified per-game — unit1 + unit2-proper both name the table after the stem) and substituted at render time, and the body OWNS its own <DICT>/<LOADED> module-locals + rewrites the dictionary()/loaded() accessors to read them, instead of assuming the AI's m_CharactersDict/m_Loaded upvalues survive. The body is built from <N> + the fact + Phase-1 contract constants (label, GetTagged surface, characterName attribute, Templates children) so it is identical for a given <N> across all 3 drift shapes — that IS the AI-drift reconciliation AND the idempotency mechanism (deterministic name substitution → twice-call byte-equal). No `CharacterDatabase` literal in the template or pass source → AC8 grep passes. Returns the spike minimal shape: .characterName (string), .gameObject (clonable), .accessories = {} (populated = follow-on), via <C>.new. Lives in contract_pipeline.transpile_with_contract beside camera-facet/trigger-stay/rifle-rig-retarget. GetTagged is RS-scoped (IsDescendantOf(ReplicatedStorage)) + name-sorted for determinism. Unlocatable LoadDatabase/GetCharacter anchor → roster_unresolved fail-closed.
+
+## D-P2-3 — Keep the re-lowered module LIVE via a deterministic exemption carrier (roster_binding); do NOT rely on the incidental _PROP_WRITE veto (NEW-FINDING-B)
+Classification: User-Challenge
+EMPIRICALLY verified this session: the current empty-roster CharacterDatabase body classifies Roblox-dead (classify_module_dead: input prior 0.33 <= 0.49 ceiling, output inert) and a re-lowered body only escapes by ACCIDENT (c.gameObject = op is a dotted _PROP_WRITE that trips has_genuine_roblox_effect; Character.new({gameObject=op}) constructor-arg form would NOT veto -> dead-stubbed). Both reviewers: exempt via a carrier (option c), mirroring rig_binding EXACTLY across 6 sites — stamp on TranspiledScript (lower_roster_consumers); add roster_binding to RbxScript; copy at pipeline.py:3135; exempt before classify_module_dead in _subphase_analyze_dead_modules (:3350-3365); persist (:4965/:5135) + rehydrate (:4640/:4704/:4815) + resume-revalidation (:3304). classify_module_dead stays PURE/unchanged. Dead modules with live requirers get rerouted to an inert RS stub (storage_classifier) if not exempted — clobbering the re-lowering.
+
+## D-P2-4 — c.gameObject binds the SCRIPT-BEARING ReplicatedStorage.Templates.<characterName> child, NOT the script-stripped RosterMembers member (codex BLOCKING)
+Classification: Mechanical
+Phase 1 strips Script children from roster members (clone-sources, roster_assembly.strip_member_scripts:55). LoadoutState:SetupAccessory calls host.getComponent(m_Character,"Character") on the cloned character; if .gameObject were the stripped member the clone carries no Character script -> getComponent nil -> crash. The roster member is discovery+identity (tag + characterName attribute); the clonable script-bearing object is the Templates child (scripts retained per Phase-1 §1.4a). Fallback to the tagged member when no Templates match. RESIDUAL: Phase 1 allows characterName != template_name, so FindFirstChild(characterName) can miss; a fully-generic bind keys on the member->template prefab_id relation -> followups (not boot-blocking for Trash-Dash where characterName == template stem).
+
+## D-P2-5 — GetTagged(L) is global+unordered -> scope to IsDescendantOf(ReplicatedStorage) + sort by name (codex)
+Classification: Mechanical
+Prevents a future workspace clone carrying the tag, or non-deterministic ordering, from corrupting m_CharactersDict.
+
+## D-P2-6 — ONE slice (the roster_binding carrier is a shared producer->consumer contract; the lowerer is unsafe without the exemption)
+Classification: Taste (architecture)
+Two responsibilities (re-lowering pass + dead-module exemption), one shared contract (roster_binding), not independently shippable (a re-lowered-but-dead-stubbed CharacterDatabase = empty loadout). Shared-contract rule -> one slice. No fan-out, no staged-risk seam inside Phase 2 (that boundary was the Phase-1->Phase-2 split).
+
+---
+## Phase-2 detailed-design REVISION 1 after dual-voice round 1 (review-phasedesign2-1.md) — 2026-06-17
+
+## D-P2-7 — SPLIT the §1.3 orchestrator wiring: lowering + roster fail-closed COMPUTED at ~:618, AGGREGATED into fail_closed AFTER its definition at contract_pipeline.py:625
+Classification: Mechanical (review P1)
+fail_closed first exists at contract_pipeline.py:625 (`fail_closed: list[FailClosed] = list(player_fail_closed)`), AFTER the lowering passes at :567/:602/:615; a single-site `fail_closed.extend(...)` near :619 would NameError (verified this session). Site A (~:618) imports find_roster_consumers/lower_roster_consumers, derives by_label + csharp_by_path + roster_facts, computes roster_fail_closed via the new _roster_fail_closed helper, and runs lower_roster_consumers when no fail-closed. Site B (after :625) does `fail_closed.extend(roster_fail_closed)`. _roster_fail_closed mirrors the player_signal_absent guard shape at contract_pipeline.py:510: roster_signal_absent fires when by_label is non-empty but scene_runtime has no `addressables` block (artifact predates the Unit-4 surface, unrecomputable here); roster_ambiguous fires on >1 distinct module consuming one label. roster_unresolved (unlocatable method) is raised by the lowerer and drained through the same path. FailClosed.kind ∈ {roster_ambiguous, roster_signal_absent, roster_unresolved}.
+
+## D-P2-8 — The roster_binding dead-set `continue` is a PURE exemption placed before the _DECISIVE_STRATEGIES gate (pipeline.py:3358); re-lowering does NOT change `strategy`. FOLDER-shape .gameObject is not boot-critical
+Classification: Mechanical (review P2)
+The continue is placed right after the existing `csharp is None` skip (pipeline.py:3357) and BEFORE the _DECISIVE_STRATEGIES gate at :3358 (frozenset({"ai","stub"})). lower_roster_consumers mutates luau_source + stamps roster_binding but never touches script.strategy, so a re-lowered module keeps "ai" and would still pass the strategy gate into classify_module_dead — i.e. it is NOT masked by the strategy gate; the carrier continue is the SOLE deterministic reason it is skipped. For the FOLDER drift shape (unit1 FindFirstChild / WaitForChild), .gameObject is not the boot-critical path: unit1 LoadoutState does its OWN Templates lookup keyed on .characterName, so the boot is satisfied by GetCharacter returning .characterName + .accessories = {} (clears the #c.accessories guard at LoadoutState:271). .gameObject is boot-critical only for the GetTagged/unit2-proper c.gameObject:Clone() shape (D-P2-4 binds it to the script-bearing Templates child). The re-lowering normalizes the DB module ONLY, never LoadoutState.
+
+---
+## Phase-2 detailed-design REVISION 2 after dual-voice round 2 (review-phasedesign2-2.md) — 2026-06-17
+
+## D-P2-9 — The Character.new wrapper is the canonical GetCharacter/dictionary() return contract; post-boot Instance-expecting consumers (TrackManager, ShopCharacterList) are a KNOWN-DIVERGENT scoped FOLLOWUP, not silently shipped
+Classification: Taste/scope (tier-problems discipline)
+The re-lowering changes the return from a raw tagged Instance to a `Character.new` WRAPPER TABLE — REQUIRED+CORRECT for the boot: LoadoutState derefs c.gameObject/c.accessories/c.characterName, which a raw Instance cannot carry, and the wrapper matches Unity's Character OOP object the C# m_CharactersDict.Add(c.characterName, c) stored. The Gate-A ONE goal is the COLD BOOT (AC9), which the wrapper satisfies. Enumerated consumers (verified against converter/output/trash-dash-unit2-proper-20260616/scripts/ + trash-dash-unit1-20260615/scripts/ in the main repo):
+  - LoadoutState:PopulateCharacters — boot-critical, SATISFIED (the wrapper is built for this deref).
+  - Character.luau (Character.new) — the wrapper type itself, SATISFIED (Phase 2 untouched).
+  - ShopAccessoriesList.luau:55-56 (#c.accessories off dict values) — incidentally SATISFIED (wrapper carries .accessories = {}; member skipped, no error).
+  - TrackManager.luau:204→:209 (unit2-proper, instantiatePrefab(GetCharacter(charName))) — POST-boot, Instance-expecting → DIVERGENT (table → player fails to spawn on Run).
+  - ShopCharacterList.luau:39/:46-49 (dictionary()-value :GetAttribute) — POST-boot → DIVERGENT (table has no :GetAttribute → error on shop open).
+Per the tier-problems rule: root (boot) fixed in Phase 2; downstream-conditional (post-boot character-object consumers) scoped as a follow-on (followups.md). Phase 2 does NOT re-lower TrackManager/Shop and does NOT expand the mechanism, trigger, dead-module carrier, or .gameObject binding. SHAPE-SPECIFIC: unit2-proper affected; unit1 TrackManager.luau:152 passes the name string → unaffected. AC10 makes the boundary explicit so the divergence is disclosed, not a latent regression.

@@ -8,14 +8,16 @@ scene conversion, and output generation in a deterministic, resumable sequence.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
-from typing import Any, cast
+from typing import Any, NamedTuple, TypedDict, cast
 
 if TYPE_CHECKING:
+    from converter.contract_verifier import StaticEventDecl
     from unity.addressables_resolver import PrefabAddressables
     from converter.scene_runtime_topology.build_topology import (
         TopologyArtifact,
@@ -46,15 +48,247 @@ from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Unit-3 theme registration — ownership derivation + drain-bind detector
+# ---------------------------------------------------------------------------
+#
+# Generic (no game literals): the owned addressable LABEL + store KEY field come
+# from the database's C# load method; the WRITE SURFACE the boot shim appends to
+# is bound to the list its consumer-called ``LoadDatabase`` drains.
+# design-phase2 §1.3/§1.4, D13/D16.
+
+
+class AddressableDbSeed(TypedDict):
+    """One per-DB seed record the entrypoint shim replays at boot.
+
+    A DB whose build-time drain-bind FAILED contributes NO record — the
+    converter abstains + warns, so every record emitted is a proven surface.
+    """
+    db_module_path: str
+    load_method_name: str
+    drain_field: str
+    appender_name: str | None
+    key_field: str | None
+    so_module_paths: list[str]
+
+
+class _CsLoadOwnership(NamedTuple):
+    """The ownership facts derived from a DB's C# ``LoadAssetsAsync<T>`` call."""
+    label: str
+    key_field: str | None
+    load_method_name: str
+
+
+# ``Addressables.LoadAssetsAsync<T>("label", op => ... callback ...)``. The
+# label is the first string literal arg; the type ``<T>`` is the owned SO type.
+_CS_LOAD_ASSETS_ASYNC = re.compile(
+    r"LoadAssetsAsync\s*<\s*(?P<sotype>[\w.]+)\s*>\s*\(\s*"
+    r"(?P<q>[\"'])(?P<label>(?:(?!(?P=q)).)*)(?P=q)",
+    re.DOTALL,
+)
+# The store-key field: ``<dict>.Add(op.<field>, op)`` (or ``Add(x.<field>, x)``)
+# in the load callback. The key expression is ``<ident>.<field>``.
+_CS_DICT_ADD_KEY = re.compile(
+    r"\.\s*Add\s*\(\s*[A-Za-z_]\w*\s*\.\s*(?P<field>[A-Za-z_]\w*)\s*,",
+)
+
+
+# A C# method header: ``<modifiers> <ret> <Name>(`` — used to name the load
+# method (the method enclosing the ``LoadAssetsAsync`` call) so the transpiled
+# counterpart's drain body can be isolated by the SAME name.
+_CS_METHOD_HEADER = re.compile(
+    r"(?:public|private|protected|internal|static|virtual|override|async|\s)+"
+    r"[\w<>,.\[\]]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{",
+)
+
+
+def _enclosing_method_name(cs_source: str, pos: int) -> str | None:
+    """Name of the C# method whose header most-recently precedes ``pos`` (the
+    method enclosing the ``LoadAssetsAsync`` call)."""
+    name: str | None = None
+    for hm in _CS_METHOD_HEADER.finditer(cs_source):
+        if hm.start() > pos:
+            break
+        name = hm.group("name")
+    return name
+
+
+def _matched_paren_end(cs_source: str, open_paren_pos: int) -> int | None:
+    """Index just past the ``)`` that closes the ``(`` at ``open_paren_pos``,
+    skipping string/char literals so a paren inside a literal doesn't unbalance
+    the count. Returns ``None`` if unbalanced (truncated source)."""
+    if open_paren_pos >= len(cs_source) or cs_source[open_paren_pos] != "(":
+        return None
+    depth = 0
+    i = open_paren_pos
+    n = len(cs_source)
+    while i < n:
+        c = cs_source[i]
+        if c in ("\"", "'"):
+            quote = c
+            i += 1
+            while i < n:
+                if cs_source[i] == "\\":
+                    i += 2
+                    continue
+                if cs_source[i] == quote:
+                    break
+                i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _derive_cs_load_ownership(cs_source: str) -> _CsLoadOwnership | None:
+    """Parse a DB's C# source for its ``LoadAssetsAsync<T>(LABEL, …Add(op.F,op))``
+    load call. Returns the owned ``label``, the store ``key_field`` (the field
+    the load callback indexes the store by), and the enclosing ``load_method``
+    name — or ``None`` when no such call is present (a non-SO-loading module:
+    generic no-op, edge 6).
+
+    No game literal: the label + key field + method name are READ from the
+    source, never hardcoded. The ``<T>`` type arg is part of the matched call so
+    the derivation is bound to the right ``LoadAssetsAsync`` (not a later bare
+    call), and the key field is searched ONLY within that call's argument list
+    (the callback span) — never the rest of the file, so an unrelated
+    ``.Add(op.otherKey, op)`` elsewhere in the method cannot mis-derive it
+    (codex P1).
+    """
+    m = _CS_LOAD_ASSETS_ASYNC.search(cs_source)
+    if m is None:
+        return None
+    label = m.group("label")
+    if not label:
+        return None
+    load_method = _enclosing_method_name(cs_source, m.start())
+    if not load_method:
+        return None
+    # Scope the ``.Add(op.field, op)`` search to the ``LoadAssetsAsync<T>( … )``
+    # argument list (the callback span), bounded by the matching close paren of
+    # the call's own ``(`` — NOT the rest of the file. The call's open paren is
+    # the ``(`` that opens the arg list; locate it from the matched ``<T>(``.
+    open_paren = cs_source.find("(", m.start())
+    call_end = _matched_paren_end(cs_source, open_paren) if open_paren != -1 else None
+    # The label literal ends inside the arg list; search the span AFTER it up to
+    # the call's close paren. Key field is optional — a DB may index by a
+    # non-``op.field`` expression; the seed still supplies instances and uses the
+    # key field only to abstain on a key-less SO.
+    key_field: str | None = None
+    if call_end is not None:
+        add = _CS_DICT_ADD_KEY.search(cs_source, m.end(), call_end)
+        if add is not None:
+            key_field = add.group("field")
+    return _CsLoadOwnership(label=label, key_field=key_field, load_method_name=load_method)
+
+
+def _derive_drain_field(db_luau_source: str, load_method_name: str) -> str | None:
+    """From the transpiled DB module body, derive the field the C#-derived load
+    method drains — ``for _, op in ipairs(<MODULE>.<DRAIN_FIELD>)`` inside the
+    ``LoadDatabase`` (``load_method_name``) function. ``LoadDatabase``'s NAME is
+    deterministic (C#-derived), so anchoring on it is stable across
+    re-transpiles even though the appender's name is not.
+
+    Returns the single ``DRAIN_FIELD`` the load method iterates. Returns ``None``
+    (→ FAIL-LOUD abstain, edge 7) when EITHER no recognizable drain is found OR
+    the load method iterates MULTIPLE DISTINCT candidate fields (ambiguous —
+    an earlier unrelated ``ipairs`` loop would otherwise silently mis-select the
+    first; abstain loud > mis-bind, codex P1).
+    """
+    # Isolate the ``function <Module>.<load_method>(...) ... end`` body. The
+    # transpiled module functions are top-level ``function X.name(`` defs; the
+    # body runs to the next top-level ``function `` or ``return`` at column 0.
+    fn_re = re.compile(
+        r"function\s+[\w.]+\.%s\s*\(" % re.escape(load_method_name)
+    )
+    fm = fn_re.search(db_luau_source)
+    if fm is None:
+        return None
+    body = db_luau_source[fm.end():]
+    # Bound the body at the next top-level ``function `` def (column 0) so a
+    # later function's ipairs can't be mis-attributed.
+    nxt = re.search(r"\n(?:function\s|return\b)", body)
+    if nxt is not None:
+        body = body[: nxt.start()]
+    fields = {
+        d.group("field")
+        for d in re.finditer(
+            r"\bin\s+ipairs\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*\)", body,
+        )
+    }
+    if len(fields) != 1:
+        # 0 → no drain (edge 7); >1 → ambiguous (which list does the store build
+        # from?) → abstain rather than guess the first.
+        return None
+    return next(iter(fields))
+
+
+# Sentinel: multiple distinct public appenders bind to the drain field → the
+# caller abstains loud rather than guess an ingress.
+_AMBIGUOUS_APPENDER = "\x00<ambiguous-appender>"
+
+
+def _derive_appender_name(db_luau_source: str, drain_field: str) -> str | None:
+    """Find THE PUBLIC appender fn on the DB module whose ``table.insert`` targets
+    ``drain_field`` — the BIND that proves the surface feeds the same list
+    ``LoadDatabase`` drains (D16). Returns the appender fn name, or ``None`` when
+    no public appender binds to ``drain_field`` (the shim then seeds the drain
+    field table directly, since that field IS what ``LoadDatabase`` drains).
+
+    A name match alone is NEVER sufficient: a candidate is kept ONLY when its
+    ``table.insert`` target field == ``drain_field`` (rejects edge 8's
+    mismatched appender that feeds a different list).
+
+    Returns ``_AMBIGUOUS_APPENDER`` when MULTIPLE distinct public fns bind to
+    ``drain_field`` — picking the first could select a ``SeedDefaults()``-style
+    helper over the real consumer ingress; the caller then abstains loud rather
+    than seeding through an arbitrarily-chosen surface (abstain > mis-bind, codex
+    P1). Returns ``None`` when ZERO public fns bind (the shim then seeds the drain
+    table directly, since the drain field IS the proven surface).
+    """
+    # Each ``function <Module>.<name>(arg) ... table.insert(<Module>.<field>, …)``.
+    binders: set[str] = set()
+    for fm in re.finditer(r"function\s+[\w.]+\.(?P<name>[A-Za-z_]\w*)\s*\(", db_luau_source):
+        name = fm.group("name")
+        body = db_luau_source[fm.end():]
+        nxt = re.search(r"\n(?:function\s|return\b)", body)
+        if nxt is not None:
+            body = body[: nxt.start()]
+        for ins in re.finditer(
+            r"table\.insert\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*,", body,
+        ):
+            if ins.group("field") == drain_field:
+                binders.add(name)
+                break
+    if not binders:
+        return None
+    if len(binders) > 1:
+        return _AMBIGUOUS_APPENDER
+    return next(iter(binders))
+
+
+def _drain_field_is_writable_table(db_luau_source: str, drain_field: str) -> bool:
+    """True when the module declares ``<Module>.<drain_field> = {}`` (a writable
+    table the shim can ``table.insert`` into directly when no public appender
+    binds)."""
+    return re.search(
+        r"[\w.]+\.%s\s*=\s*\{\s*\}" % re.escape(drain_field), db_luau_source,
+    ) is not None
+
+
 # Ordered list of pipeline phases.
 PHASES: list[str] = [
     "parse",
     "extract_assets",
     # Plan the scene runtime artifact off parsed scenes + prefabs before
-    # any script-touching phase runs. Inert by default in PR1 — only the
-    # planner data lands in conversion_plan.json; the legacy transpile
-    # path doesn't consume it. PR3a opts in when ``--scene-runtime=generic``
-    # is requested.
+    # any script-touching phase runs. Inert by default — only the planner
+    # data lands in conversion_plan.json; the legacy transpile path doesn't
+    # consume it. Generic mode (``--scene-runtime=generic``) opts in.
     "plan_scene_runtime",
     "moderate_assets",
     "upload_assets",
@@ -63,15 +297,12 @@ PHASES: list[str] = [
     "transpile_scripts",
     "convert_animations",
     "convert_scene",
-    # Phase 2a slice 8: ``materialize_and_classify`` lifts script
-    # materialization (emit-to-disk), the post-transpile coherence pass,
-    # and storage classification out of ``write_output`` into a sibling
-    # phase. The phase is empty in this slice's first commit; subsequent
-    # commits lift the three subphases in order. After the lift,
-    # ``write_output`` consumes the persisted ``StoragePlan`` and a
-    # populated ``rbx_place.scripts`` instead of computing them itself.
-    # Placement rationale: must run AFTER ``convert_scene`` because
-    # ``rbx_place`` (the script container) is only created there.
+    # ``materialize_and_classify`` lifts script materialization
+    # (emit-to-disk), the post-transpile coherence pass, and storage
+    # classification out of ``write_output`` into a sibling phase, so
+    # ``write_output`` consumes the persisted ``StoragePlan`` + a populated
+    # ``rbx_place.scripts`` instead of computing them itself. Must run AFTER
+    # ``convert_scene`` because ``rbx_place`` is only created there.
     "materialize_and_classify",
     "write_output",
 ]
@@ -80,11 +311,10 @@ PHASES: list[str] = [
 def _carry_unconverted(
     animation_result: Any, entries: list[dict[str, str]],
 ) -> None:
-    """Append entries onto ``animation_result.unconverted`` so the existing
-    PR 2b UNCONVERTED.md writer picks them up. Materials use
+    """Append entries onto ``animation_result.unconverted`` so the
+    UNCONVERTED.md writer picks them up. Materials use
     MaterialMapping.warnings (a different channel); this helper exists
-    because prefab-package drops don't own a dataclass of their own and
-    writing a new aggregation channel just for them is overkill.
+    because prefab-package drops don't own a dataclass of their own.
     """
     if animation_result is None or not entries:
         return
@@ -92,6 +322,80 @@ def _carry_unconverted(
     if carrier is None:
         return
     carrier.extend(entries)
+
+
+def _character_name_from_field(
+    pid: str,
+    sub: dict[str, object],
+    modules_dict: dict[str, object],
+) -> str | None:
+    """Rung 1 of the D5 characterName chain: select by FIELD-PRESENCE.
+
+    Returns the str value of the selected instance's ``config["characterName"]``,
+    or ``None`` when no instance carries the key (caller falls through to the
+    address/stem rungs) or the selected value is non-str (skip-with-warning,
+    then fall through — never coerced, never Any). Pure.
+
+    Selection: among the prefab's instances, the one whose ``config`` CONTAINS
+    the key ``characterName`` (the consumer's ``GetAttribute("characterName")``
+    contract key, NOT a class literal). Ties are broken ONLY via
+    ``modules[script_id]["class_name"]``; on remaining ties the first-in-
+    lifecycle instance is chosen and a warning logged.
+    """
+    instances = sub.get("instances")
+    if not isinstance(instances, list):
+        return None
+
+    # Field-presence candidates, in lifecycle/visit order.
+    candidates: list[dict[str, object]] = []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        config = inst.get("config")
+        if isinstance(config, dict) and "characterName" in config:
+            candidates.append(inst)
+
+    if not candidates:
+        return None
+
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        # Tiebreak ONLY via the module class_name. A best-effort,
+        # never-primary signal (class_name may be "").
+        def _class_name(inst: dict[str, object]) -> str:
+            sid = inst.get("script_id")
+            if not isinstance(sid, str):
+                return ""
+            mod = modules_dict.get(sid)
+            if isinstance(mod, dict):
+                cn = mod.get("class_name")
+                if isinstance(cn, str):
+                    return cn
+            return ""
+
+        named = [c for c in candidates if _class_name(c)]
+        if len(named) == 1:
+            chosen = named[0]
+        else:
+            # Remaining tie: deterministic first-in-lifecycle + warn.
+            log.warning(
+                "[roster] prefab_id %s: %d instances carry "
+                "'characterName' and the class_name tiebreak did not "
+                "resolve to one — picking first-in-lifecycle (%r)",
+                pid, len(candidates), candidates[0].get("instance_id"),
+            )
+            chosen = candidates[0]
+
+    config = chosen.get("config")
+    value = config.get("characterName") if isinstance(config, dict) else None
+    if isinstance(value, str):
+        return value
+    log.warning(
+        "[roster] prefab_id %s: non-str characterName %r — falling back to "
+        "address/stem",
+        pid, value,
+    )
+    return None
 
 
 def _scene_needs_collision_recook(parts: list) -> bool:
@@ -182,23 +486,15 @@ class PipelineState:
     # Output of converter/semantic_validators.run_semantic_validators
     # — surfaced via conversion_report.json under ``semantic_warnings``.
     semantic_report: object | None = None
-    # Phase 2b reframe step 2 (R2): TRANSIENT stash of the Class-2
-    # shared-flag channel fact for the ``PlayerSetSharedFlag`` funnel
-    # gate. Set fresh by ``_maybe_run_topology_prepass`` every run at the
-    # point ``compute_shared_flag_channels`` produces it (including the
-    # no-transpile resume fail-open path, where it records ``present:
-    # True``). This is the ONLY ctx/state surface the step-2 gate
-    # (``_shared_flag_funnel_present``) reads — it is NEVER fed into
-    # ``_merge_scene_runtime`` and NEVER persisted, so it cannot re-stale
-    # a recompute-only derived fact (the "save raw facts, recompute
-    # conclusions" rule). The persisted copy in
-    # ``conversion_plan.json`` under ``scene_runtime.topology
-    # .shared_flag_channels`` stays for Phase 3 to read from the plan;
-    # this in-memory stash exists ONLY because the late merged-local
-    # ``scene_runtime`` dict (which carries ``topology``) is never
-    # written back to ``ctx.scene_runtime``, so the gate cannot reach it
-    # off ctx. ``None`` until the prepass runs → gate defaults to
-    # fail-safe ``True`` (legacy mode never computes it, keep the funnel).
+    # TRANSIENT stash of the Class-2 shared-flag channel fact for the
+    # ``PlayerSetSharedFlag`` funnel gate. Set fresh by
+    # ``_maybe_run_topology_prepass`` every run (including the no-transpile
+    # resume fail-open path, where it records ``present: True``). The ONLY
+    # ctx/state surface the gate (``_shared_flag_funnel_present``) reads — it
+    # is NEVER persisted or fed into ``_merge_scene_runtime``, so it cannot
+    # re-stale a recompute-only fact. ``None`` until the prepass runs → gate
+    # defaults to fail-safe ``True`` (legacy mode never computes it, keep the
+    # funnel).
     shared_flag_channels: "SharedFlagChannels | None" = None
 
     # TODO #8 (Roblox-dead module routing): TRANSIENT set of module names the
@@ -585,9 +881,9 @@ class Pipeline:
         # Parse EVERY scene up front. The plan_scene_runtime phase below
         # needs the full set in one call so the per-scene namespacing in
         # the artifact is consistent, and the per-scene loop further down
-        # gets to reuse the parsed result instead of re-parsing. Pre-PR1
-        # only the first scene was parsed before shared phases ran; that
-        # made the planner blind to every other scene's MonoBehaviours.
+        # reuses the parsed result instead of re-parsing. Parsing only the
+        # first scene before shared phases would make the planner blind to
+        # every other scene's MonoBehaviours.
         from unity.scene_parser import parse_scene
         all_parsed: list[ParsedScene] = []
         for scene_path in scene_paths:
@@ -613,18 +909,17 @@ class Pipeline:
         # the multi-scene path used to silently skip resolution and
         # produced visibly broken places. ``resolve_assets`` no-ops when
         # ``--no-upload`` is set or no universe/place IDs are configured.
-        # ``plan_scene_runtime`` sits between extract_assets (which lazy-
-        # loads the prefab library) and transpile_scripts (PR3a will
-        # consume the artifact) — same slot as the single-scene driver.
+        # ``plan_scene_runtime`` sits between extract_assets (which lazy-loads
+        # the prefab library) and transpile_scripts — same slot as the
+        # single-scene driver.
         for phase in ["extract_assets", "plan_scene_runtime",
                        "upload_assets", "convert_materials",
                        "transpile_scripts", "convert_animations",
                        "resolve_assets"]:
             self._run_phase(phase)
 
-        # Per-scene: convert, write. Reuses scenes pre-parsed above —
-        # parsing every scene twice was the pre-PR1 status quo and is the
-        # one cost the planner's "all scenes up front" move eliminates.
+        # Per-scene: convert, write. Reuses scenes pre-parsed above rather
+        # than parsing every scene twice.
         parsed_by_path: dict[str, ParsedScene] = {
             str(p.scene_path): p for p in all_parsed
         }
@@ -645,16 +940,12 @@ class Pipeline:
             # Convert scene
             self._run_phase("convert_scene")
 
-            # Phase 2a slice 8 (round 2): the single-scene path runs
-            # ``materialize_and_classify`` between ``convert_scene`` and
-            # ``write_output`` via ``run_through`` honoring the PHASES
-            # ordering. The multi-scene loop drove ``_run_phase`` directly
-            # and silently skipped the lifted phase per scene — every
-            # per-scene rbxlx lost the script-set materialization +
-            # classification pass + the late-append safety net stamp.
-            # ``materialize_and_classify`` is in ``ESSENTIAL_PHASES`` so
-            # it re-runs cleanly per scene (no completed-phase short-
-            # circuit on the second iteration).
+            # The multi-scene loop drives ``_run_phase`` directly (unlike the
+            # single-scene ``run_through`` path), so run
+            # ``materialize_and_classify`` explicitly per scene — otherwise
+            # every per-scene rbxlx loses the script-set materialization +
+            # classification pass + the late-append safety-net stamp. It is in
+            # ``ESSENTIAL_PHASES`` so it re-runs cleanly per scene.
             self._run_phase("materialize_and_classify")
 
             # Write output with scene-specific filename
@@ -689,12 +980,11 @@ class Pipeline:
         # them against the current ``prefab_library`` rather than pairing a
         # fresh library with a stale persisted map. Read-only + idempotent.
         "plan_scene_runtime",
-        # Phase 2a slice 8: ``materialize_and_classify`` populates
-        # ``state.rbx_place.scripts`` (in-memory) which write_output
-        # consumes — it must re-run on every resumed invocation so a
-        # ``--phase=write_output`` resume gets a populated script list.
-        # The lifted emit subphase's preserve_scripts/rehydrate path
-        # handles the "transpile was skipped" branch on resume.
+        # ``materialize_and_classify`` populates ``state.rbx_place.scripts``
+        # (in-memory) which write_output consumes — it must re-run on every
+        # resumed invocation so a ``--phase=write_output`` resume gets a
+        # populated script list. The emit subphase's preserve_scripts/rehydrate
+        # path handles the "transpile was skipped" branch on resume.
         "materialize_and_classify",
     })
 
@@ -1061,14 +1351,12 @@ class Pipeline:
 
         Reads parsed scenes + the prefab library (lazy-loaded earlier by
         ``extract_assets``) and emits the deterministic snapshot the host
-        runtime will consume in PR4. The artifact lands on
-        ``self.ctx.scene_runtime`` and round-trips through
-        ``conversion_context.json`` plus the persistence merge inside
-        ``_classify_storage`` so resumes reproduce it verbatim.
+        runtime consumes. The artifact lands on ``self.ctx.scene_runtime`` and
+        round-trips through ``conversion_context.json`` plus the persistence
+        merge inside ``_classify_storage`` so resumes reproduce it verbatim.
 
-        Inert by default in PR1 — only the planner data is written; no
-        legacy phase consumes it. PR3a opts in under
-        ``--scene-runtime=generic``.
+        Inert by default — only the planner data is written; no legacy phase
+        consumes it. Generic mode (``--scene-runtime=generic``) opts in.
         """
         from converter.scene_runtime_planner import plan_scene_runtime as _plan
 
@@ -1184,13 +1472,11 @@ class Pipeline:
             len(artifact["scenes"]), len(artifact["prefabs"]),
         )
 
-        # Strict-classification early gate (PR135 P1.2). The codex review
-        # found that --strict-classification was firing in
-        # ``_classify_storage`` -- which runs INSIDE ``write_output`` AFTER
-        # ``transpile_scripts`` has already emitted Luau to disk. The
-        # design doc requires strict mode to block BEFORE transpile so
-        # the operator never pays the (expensive) AI transpile cost on a
-        # plan that won't ship.
+        # Strict-classification early gate. ``--strict-classification`` must
+        # block BEFORE transpile so the operator never pays the expensive AI
+        # transpile cost on a plan that won't ship — firing it in
+        # ``_classify_storage`` (inside ``write_output``, after
+        # ``transpile_scripts`` emitted Luau) would be too late.
         #
         # The classifier verdicts that matter for strict mode (excluded
         # / low_confidence from Rule 1/4/7) come from C# signals + per-
@@ -2148,12 +2434,10 @@ class Pipeline:
             # Generic path: route through the contract pipeline so
             # runtime-bearing MonoBehaviours get the generic prompt,
             # ModuleScript target flip, verifier + reprompt, and
-            # require-resolution pass. PR3a built the orchestrator;
-            # this wiring completes PR3a's "runtime_mode threaded
-            # through transpiler" deliverable (the legacy entry never
-            # passed ``runtime_mode``, so without this branch every
-            # ``--scene-runtime=generic`` run silently transpiled in
-            # legacy mode and produced non-compliant modules).
+            # require-resolution pass. The legacy entry never passes
+            # ``runtime_mode``, so without this branch every
+            # ``--scene-runtime=generic`` run would silently transpile in
+            # legacy mode and produce non-compliant modules.
             from converter.contract_pipeline import transpile_with_contract
             contract_result = transpile_with_contract(
                 unity_project_path=self.unity_project_path,
@@ -2173,8 +2457,8 @@ class Pipeline:
             )
             self.state.transpilation_result = contract_result.transpilation
             # Plumb contract telemetry to ctx so downstream consumers
-            # (PR5 auto-mode fallback decision, post-run reports) can
-            # read it without re-running the orchestrator. ``setdefault``
+            # (auto-mode fallback decision, post-run reports) can read it
+            # without re-running the orchestrator. ``setdefault``
             # preserves rows from prior runs in a resume flow; the
             # generic-mode pipeline only transpiles once per conversion
             # but resume paths replay the phase.
@@ -2206,9 +2490,9 @@ class Pipeline:
                 str(p) for p in contract_result.runtime_bearing_paths
             )
         else:
-            # Legacy path -- must stay byte-identical to pre-PR3a
-            # behaviour. Do NOT thread ``runtime_mode`` or any other
-            # new kwargs here; legacy emit is a tested invariant.
+            # Legacy path -- must stay byte-identical. Do NOT thread
+            # ``runtime_mode`` or any other new kwargs here; legacy emit is a
+            # tested invariant.
             self.state.transpilation_result = transpile_scripts(
                 unity_project_path=self.unity_project_path,
                 script_infos=script_infos,
@@ -2643,11 +2927,11 @@ return table.concat(allData, "\\n")'''
             mesh_hierarchies=mesh_hierarchies,
             fbx_bounding_boxes=fbx_bounding_boxes,
             unity_project_root=self.unity_project_path,
-            # PR3c: thread the planner artifact + mode through so the
-            # generic-only inactive-retention carve-out in ``_convert_node``
-            # can see which inactive GameObjects the host runtime needs to
-            # bind. Legacy mode passes an unused artifact (the carve-out
-            # gates on mode first), so legacy emit stays byte-identical.
+            # Thread the planner artifact + mode through so the generic-only
+            # inactive-retention carve-out in ``_convert_node`` can see which
+            # inactive GameObjects the host runtime needs to bind. Legacy mode
+            # passes an unused artifact (the carve-out gates on mode first), so
+            # legacy emit stays byte-identical.
             scene_runtime=self.ctx.scene_runtime,
             scene_runtime_mode=self.ctx.scene_runtime_mode,
         )
@@ -2675,17 +2959,16 @@ return table.concat(allData, "\\n")'''
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
         "_subphase_inject_scene_runtime",
-        # Phase 2a slice 8 commit 5 — Option (b) safety net. Runs AFTER
-        # the three injection subphases that append scripts to
-        # ``rbx_place.scripts`` post-classify. Stamps an explicit
-        # ``parent_path`` on any late-appended script whose generator
-        # left the field as ``None``, freezing the rbxlx_writer default
-        # routing into the storage plan as an explicit decision.
+        # Safety net: runs AFTER the three injection subphases that append
+        # scripts to ``rbx_place.scripts`` post-classify. Stamps an explicit
+        # ``parent_path`` on any late-appended script whose generator left the
+        # field ``None``, freezing the rbxlx_writer default routing into the
+        # storage plan as an explicit decision.
         "_classify_late_appended_scripts",
         "_generate_prefab_packages",
-        # Phase 1 (relation #8): emit the standalone scale-faithful-gravity
-        # server script. Runs AFTER _generate_prefab_packages so the emit-gate
-        # can scan replicated_templates (materialized there) as well as scene
+        # Emit the standalone scale-faithful-gravity server script. Runs AFTER
+        # _generate_prefab_packages so the emit-gate can scan
+        # replicated_templates (materialized there) as well as scene
         # workspace_parts -- a prefab-clone-only game has no dynamic part in
         # workspace_parts but still needs the correction.
         "_subphase_inject_gravity_correction",
@@ -2744,9 +3027,7 @@ return table.concat(allData, "\\n")'''
                     )
 
     MATERIALIZE_AND_CLASSIFY_ORDER: tuple[str, ...] = (
-        # Phase 2a slice 8: lifted out of ``write_output``. ``emit`` lifted
-        # in commit 2; ``cohere`` lifted in commit 3; ``classify`` lifted
-        # in commit 4.
+        # Lifted out of ``write_output`` into this ordered phase.
         "_subphase_emit_scripts_to_disk",
         "_subphase_cohere_scripts",
         "_subphase_analyze_dead_modules",
@@ -2755,12 +3036,7 @@ return table.concat(allData, "\\n")'''
     )
     """Order in which :meth:`materialize_and_classify` invokes its subphases.
 
-    Empty in slice 8 commit 1 (phase introduced empty). Subsequent
-    commits lift ``_subphase_emit_scripts_to_disk``,
-    ``_subphase_cohere_scripts``, and ``_classify_storage`` into it from
-    ``SUBPHASE_ORDER`` in that order. Ordering rationale (carried over
-    from ``SUBPHASE_ORDER``):
-
+    Ordering rationale:
     - cohere must run AFTER emit (needs scripts in place)
     - classify must run AFTER cohere (Script→ModuleScript reclassification
       affects which storage container each script belongs in)
@@ -2769,18 +3045,12 @@ return table.concat(allData, "\\n")'''
     def materialize_and_classify(self) -> None:
         """Phase: materialize the script set + cohere + classify storage.
 
-        Phase 2a slice 8: lifts the three subphases
-        (:meth:`_subphase_emit_scripts_to_disk`,
-        :meth:`_subphase_cohere_scripts`, :meth:`_classify_storage`) out
-        of :meth:`write_output` so a single ordered phase computes the
-        authoritative script set + storage plan upstream of
-        ``write_output``. ``write_output`` then consumes the persisted
-        ``StoragePlan`` and the populated ``rbx_place.scripts`` instead
-        of computing them itself.
-
-        Slice 8 lifts the subphases over multiple commits; this method
-        is the orchestration hook. The first commit introduces the phase
-        empty; subsequent commits move emit → cohere → classify into it.
+        Lifts the three subphases (:meth:`_subphase_emit_scripts_to_disk`,
+        :meth:`_subphase_cohere_scripts`, :meth:`_classify_storage`) out of
+        :meth:`write_output` so a single ordered phase computes the
+        authoritative script set + storage plan upstream of ``write_output``,
+        which then consumes the persisted ``StoragePlan`` + populated
+        ``rbx_place.scripts`` instead of computing them itself.
         """
         log.info("[materialize_and_classify] Starting ...")
 
@@ -2817,10 +3087,10 @@ return table.concat(allData, "\\n")'''
         # write_output is the assembly + serialization pipeline. Each subphase
         # below mutates self.state.rbx_place and/or writes files to self.output_dir.
         # Order is load-bearing — see SUBPHASE_ORDER for dependency rationale.
-        # Phase 2a slice 8 commits 2-4: ``_subphase_emit_scripts_to_disk``,
-        # ``_subphase_cohere_scripts``, and ``_classify_storage`` are owned
-        # by ``materialize_and_classify``; write_output consumes the cohered
-        # ``rbx_place.scripts`` list and the persisted ``StoragePlan``.
+        # ``_subphase_emit_scripts_to_disk``, ``_subphase_cohere_scripts``, and
+        # ``_classify_storage`` are owned by ``materialize_and_classify``;
+        # write_output consumes the cohered ``rbx_place.scripts`` list and the
+        # persisted ``StoragePlan``.
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
@@ -3041,16 +3311,14 @@ return table.concat(allData, "\\n")'''
                     name=ts.output_filename.replace(".luau", ""),
                     source=ts.luau_source,
                     script_type=ts.script_type,
-                    # Phase 2a slice 5 round 2: stamp the intrinsic
-                    # class at transpile-time. ``ts.script_type`` is
-                    # the output of ``code_transpiler._classify_script_type``
-                    # (plus generic-runtime override), which is the
-                    # pre-classifier signal we want to preserve.
-                    # ``classify_storage`` later mutates the live
-                    # ``script_type`` field but leaves
+                    # Stamp the intrinsic class at transpile-time.
+                    # ``ts.script_type`` is the output of
+                    # ``code_transpiler._classify_script_type`` (plus
+                    # generic-runtime override). ``classify_storage`` later
+                    # mutates the live ``script_type`` field but leaves
                     # ``intrinsic_script_type`` untouched, so
-                    # ``derive_intrinsic_script_class`` can read the
-                    # original C# code-analysis decision.
+                    # ``derive_intrinsic_script_class`` can read the original
+                    # C# code-analysis decision.
                     intrinsic_script_type=ts.script_type,
                     source_path=ts.output_filename,
                     # Generic-mode child-ref resolution tally (or None) for the
@@ -3059,6 +3327,10 @@ return table.concat(allData, "\\n")'''
                     # Generic-mode rig-retarget binding carrier (or None) for the
                     # contract verifier's binding-present fail-closed check.
                     rig_binding=ts.rig_binding,
+                    # Generic-mode roster-consumer binding carrier (or None) for
+                    # the dead-module exemption (a re-lowered roster consumer is
+                    # live by construction; its canonical body is inert).
+                    roster_binding=ts.roster_binding,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -3072,12 +3344,10 @@ return table.concat(allData, "\\n")'''
                     name=script_name,
                     source=luau_source,
                     script_type="Script",
-                    # Phase 2a slice 5 round 2: animation_converter
-                    # emits Anim_* scripts as plain ``"Script"`` at
-                    # birth. ``_build_and_apply_topology`` may later
-                    # flip ``script_type`` to ``"LocalScript"`` when
-                    # the driver lives on the client; the intrinsic
-                    # value remains the original ``"Script"``.
+                    # Anim_* scripts are born as plain ``"Script"``;
+                    # ``_build_and_apply_topology`` may later flip
+                    # ``script_type`` to ``"LocalScript"`` for a client driver,
+                    # but the intrinsic value remains ``"Script"``.
                     intrinsic_script_type="Script",
                     source_path=f"animations/{script_name}.luau",
                 ))
@@ -3099,9 +3369,8 @@ return table.concat(allData, "\\n")'''
                     name=stem,
                     source=asset.luau_source,
                     script_type="ModuleScript",
-                    # Phase 2a slice 5 round 2: ScriptableObjects are
-                    # always ModuleScripts by definition; the intrinsic
-                    # value mirrors the constructed ``script_type``.
+                    # ScriptableObjects are always ModuleScripts; the
+                    # intrinsic value mirrors the constructed ``script_type``.
                     intrinsic_script_type="ModuleScript",
                     source_path=f"scriptable_objects/{stem}.luau",
                 ))
@@ -3230,6 +3499,14 @@ return table.concat(allData, "\\n")'''
             for s in self.state.rbx_place.scripts:
                 if s.name not in persisted_set:
                     continue
+                if getattr(s, "roster_binding", None):
+                    # Unit-4 Phase 2 (NEW-FINDING-B): a rehydrated roster consumer
+                    # carrying the re-lowering carrier is live by construction even
+                    # though its canonical body is output-inert -- never re-add it
+                    # to the dead set on resume (it would otherwise be re-flagged
+                    # and rerouted to an inert stub, clobbering the re-lowering).
+                    dropped.append(s.name)
+                    continue
                 if is_output_inert(s.source) and not has_genuine_roblox_effect(
                     s.source
                 ):
@@ -3280,6 +3557,15 @@ return table.concat(allData, "\\n")'''
             if csharp is None:
                 # No C# source for this module (injected runtime helper,
                 # autogen, etc.) -- never a Roblox-dead Unity module.
+                continue
+            if getattr(s, "roster_binding", None):
+                # Unit-4 Phase 2 (NEW-FINDING-B): a roster consumer that was
+                # deterministically re-lowered to read the by_label tagged surface
+                # is LIVE BY CONSTRUCTION, even though its canonical body is
+                # output-inert (no dotted prop write to veto). Exempt it from the
+                # dead set BEFORE the strategy gate so the storage classifier does
+                # not reroute it to an inert stub and clobber the re-lowering. Pure
+                # exemption -- does not touch ``strategy`` (D-P2-8).
                 continue
             if strategy_by_name.get(s.name) not in _DECISIVE_STRATEGIES:
                 # Non-deterministic fallback body -- inertness is unreliable.
@@ -3414,7 +3700,7 @@ return table.concat(allData, "\\n")'''
     }
 
     def _classify_late_appended_scripts(self) -> None:
-        """Phase 2a slice 8 commit 5 — Option (b) safety-net classify pass.
+        """Safety-net classify pass for late-appended scripts.
 
         Stamps an explicit ``parent_path`` on any script in
         ``rbx_place.scripts`` whose generator left the field as ``None``.
@@ -3433,15 +3719,10 @@ return table.concat(allData, "\\n")'''
         explicit ``parent_path`` — no script is silently routed by a
         fallback during serialization. This:
 
-        - Pins late-appended scripts' container at slice-8 boundary so
-          a later refactor of the rbxlx writer can't drift their routing.
+        - Pins late-appended scripts' container so a later refactor of the
+          rbxlx writer can't drift their routing.
         - Lets golden-output tests assert ZERO ``parent_path`` drift on
-          autogen / runtime-injection scripts after the lift (acceptance
-          gate from the design doc).
-        - Documents that Option (a) — moving autogen-script construction
-          earlier so they go through the full classifier — is the
-          long-term direction; (b) is the small, low-risk safety net
-          shipped first.
+          autogen / runtime-injection scripts.
 
         Idempotent: scripts that already carry an explicit ``parent_path``
         (the SceneRuntime* entrypoints and the SceneRuntimePlan module,
@@ -3486,32 +3767,13 @@ return table.concat(allData, "\\n")'''
     def _shared_flag_funnel_present(self) -> bool:
         """Read the ``PlayerSetSharedFlag`` gate from the topology fact.
 
-        Phase 2b reframe step 2 (R2): the topology prepass
-        (``_maybe_run_topology_prepass``, run inside
-        ``materialize_and_classify`` BEFORE ``write_output``) computes the
-        Class-2 shared-flag channel fact via
-        ``compute_shared_flag_channels`` and stashes it on the TRANSIENT
-        run-scoped field ``self.state.shared_flag_channels``. The
-        ``present`` flag is ``True`` iff a cross-domain server reader of a
-        shared flag exists on a fresh transpile (and ``True`` as the
-        resume / unmappable-reader fail-open).
-
-        R2 NO-OP FIX: this previously read
-        ``ctx.scene_runtime["topology"]["shared_flag_channels"]``, but
-        ``ctx.scene_runtime`` is the planner's PRE-topology structural
-        dict — the ``topology`` block is built only on the MERGED LOCAL
-        dict inside ``_classify_storage`` (``_merge_scene_runtime``
-        returns a fresh copy) and is never written back to
-        ``ctx.scene_runtime``, persisted to ``conversion_plan.json``
-        instead. So in real conversions the old lookup always missed →
-        fail-open default → the funnel stayed unconditional (the gate was
-        a production no-op). The transient stash is the run-scoped surface
-        that actually carries the fact into ``write_output``. The persisted
-        ``topology["shared_flag_channels"]`` copy stays for Phase 3 to read
-        from the plan; it is intentionally NOT the gate's read site, to
-        avoid writing the merged dict back to ``ctx.scene_runtime`` (which
-        would re-stale a recompute-only fact through
-        ``_merge_scene_runtime``).
+        The topology prepass stashes the Class-2 shared-flag channel fact on
+        the transient run-scoped field ``self.state.shared_flag_channels``;
+        the gate reads it there (NOT from ``ctx.scene_runtime``, which holds
+        the planner's pre-topology dict and never carries the recomputed
+        fact). ``present`` is ``True`` iff a cross-domain server reader of a
+        shared flag exists on a fresh transpile (and ``True`` as the resume /
+        unmappable-reader fail-open).
 
         FAIL-SAFE DEFAULT ``True``: when the stash is unset (legacy mode,
         which never runs the prepass; or any code path that reaches
@@ -3600,10 +3862,9 @@ return table.concat(allData, "\\n")'''
         from converter.autogen import generate_game_server_script
         existing_server_mgr = [s for s in self.state.rbx_place.scripts if s.name == "GameServerManager"]
         if not existing_server_mgr:
-            # Phase 2b slice 3: gate the PlayerSetSharedFlag funnel on the
-            # shared_flag_channels topology fact (fail-safe True when the
-            # fact is absent). The rest of GameServerManager is always
-            # injected.
+            # Gate the PlayerSetSharedFlag funnel on the shared_flag_channels
+            # topology fact (fail-safe True when the fact is absent). The rest
+            # of GameServerManager is always injected.
             include_funnel = self._shared_flag_funnel_present()
             self.state.rbx_place.scripts.append(
                 generate_game_server_script(
@@ -3704,7 +3965,7 @@ return table.concat(allData, "\\n")'''
                 for s in self.state.rbx_place.scripts
             )
         )
-        # Generic-runtime mode: PR4's host runtime owns the lifecycle of
+        # Generic-runtime mode: the host runtime owns the lifecycle of
         # every runtime-bearing MonoBehaviour. If the legacy bootstrap
         # also requires them, their top-level code fires once via the
         # bootstrap and then ``host.require`` instantiates them again —
@@ -3883,12 +4144,8 @@ return table.concat(allData, "\\n")'''
             )
         ]
         removed_scripts = len(original) - len(kept)
-        # PR #75 codex round preempt: also delete pruned scripts from
-        # disk so the next resume's rehydrate doesn't resurrect them
-        # (matching PR #74 round-10 [P2] behaviour for the adapter-
-        # mode pre-pass). The opt-out branch doesn't carry the
-        # adapter-mode injected counter; the disk delete is purely
-        # cosmetic for the rehydrate invariant.
+        # Also delete pruned scripts from disk so the next resume's rehydrate
+        # doesn't resurrect them.
         for s in original:
             if s not in kept:
                 self._delete_pruned_script_from_disk(s)
@@ -4197,13 +4454,11 @@ script.Disabled = true
         in-memory mutation so the on-disk ``scripts/`` tree mirrors what
         gets serialized into the rbxlx.
 
-        PR #74 codex round-5 [P3]: walks part-bound scripts too (not
-        just ``rbx_place.scripts``). The rehydration prune pass and
-        any future post-binding mutation can change the source on a
-        bound-script clone WITHOUT touching its global counterpart,
-        so a global-only walk would let the on-disk ``scripts/*.luau``
-        cache drift from the in-memory state. Per-script identity
-        dedup keeps the work O(scripts), not O(scripts × parts).
+        Walks part-bound scripts too (not just ``rbx_place.scripts``): a
+        mutation can change the source on a bound-script clone without
+        touching its global counterpart, so a global-only walk would let the
+        on-disk cache drift. Per-script identity dedup keeps the work
+        O(scripts), not O(scripts × parts).
         """
         # Final write: ensure .luau files on disk match the fully processed
         # sources (after require injection, reclassification, and all other
@@ -4564,6 +4819,7 @@ script.Disabled = true
         plan_lookup = self._load_storage_plan_for_rehydration()
         child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
         rig_binding_lookup = self._load_rig_binding_for_rehydration()
+        roster_binding_lookup = self._load_roster_binding_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -4583,11 +4839,9 @@ script.Disabled = true
 
             source = luau_path.read_text(encoding="utf-8")
 
-            # Phase 2a slice 5 round 3: ``intrinsic_script_type`` is
-            # restored from the on-disk plan when the producing run
-            # stamped it. ``None`` for orphans (no plan row) and for
-            # rows that pre-date round 3 — both cases leave the field
-            # unset, falling through to the documented
+            # ``intrinsic_script_type`` is restored from the on-disk plan
+            # when the producing run stamped it; ``None`` for orphans (no plan
+            # row) leaves the field unset, falling through to the
             # ``derive_intrinsic_script_class`` heuristic.
             intrinsic_type: str | None = None
             if name in plan_lookup:
@@ -4630,6 +4884,12 @@ script.Disabled = true
             rb = rig_binding_lookup.get(name)
             if rb is not None:
                 script.rig_binding = rb
+            # Restore the roster-consumer carrier so the dead-module exemption
+            # survives a preserve/resume assemble (else the inert canonical body
+            # is re-classified dead and rerouted to an inert stub).
+            rob = roster_binding_lookup.get(name)
+            if rob is not None:
+                script.roster_binding = rob
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -4646,15 +4906,13 @@ script.Disabled = true
 
         Returns {} on missing or malformed plan.
 
-        Phase 2a slice 5 round 3: ``intrinsic_script_type`` is the
-        immutable transpile-time class persisted on each
-        ``storage_plan.decisions[]`` row. It is read from the decisions
-        rowset (NOT the bucket map, which only reflects the post-
-        classifier ``script_type``). If a row is missing the field
-        (older serialized plan), ``None`` is returned and the rehydrate
-        path leaves ``RbxScript.intrinsic_script_type`` unset, falling
-        back to the documented ``script_type`` heuristic in
-        ``derive_intrinsic_script_class``. Additive, backward-compat.
+        ``intrinsic_script_type`` is the immutable transpile-time class
+        persisted on each ``storage_plan.decisions[]`` row. It is read from
+        the decisions rowset (NOT the bucket map, which only reflects the
+        post-classifier ``script_type``). A row missing the field (older
+        serialized plan) yields ``None``, leaving
+        ``RbxScript.intrinsic_script_type`` unset and falling back to the
+        ``derive_intrinsic_script_class`` heuristic.
         """
         plan_path = self.output_dir / "conversion_plan.json"
         if not plan_path.exists():
@@ -4680,7 +4938,7 @@ script.Disabled = true
             sname_obj = row.get("script")
             if not isinstance(sname_obj, str) or not sname_obj:
                 continue
-            # ``get`` returns ``None`` if the row pre-dates round 3 —
+            # ``get`` returns ``None`` for an older row missing the field —
             # falls through to the heuristic fallback.
             val_obj = row.get("intrinsic_script_type")
             val = val_obj if isinstance(val_obj, str) else None
@@ -4774,8 +5032,8 @@ script.Disabled = true
             present = rb.get("present")
             cam_receiver = rb.get("cam_receiver")
             cam_ordinal = rb.get("cam_ordinal")
-            # REDESIGN r3: ALL FIVE keys must be well-formed or the whole row is
-            # dropped (-> None -> abstain). A partial carrier would let check D's
+            # ALL FIVE keys must be well-formed or the whole row is dropped
+            # (-> None -> abstain). A partial carrier would let check D's
             # exemption anchor on a missing receiver/ordinal and exempt blind.
             # ``bool`` is a subclass of ``int`` in Python, so reject a bool
             # masquerading as cam_ordinal.
@@ -4798,6 +5056,47 @@ script.Disabled = true
             out[name] = row
         return out
 
+    def _load_roster_binding_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Load the persisted per-script roster-consumer binding carrier from
+        ``conversion_plan.json`` into ``name -> {label, receiver, lowered}``.
+
+        Mirrors the ``rig_binding`` rehydration. Returns ``{}`` on a
+        missing/malformed plan or a plan that pre-dates the field; a malformed row
+        is dropped (absent -> the dead-module exemption does not fire, the safe
+        pre-field default). All THREE keys must be well-formed (str label, str
+        receiver, ``lowered is True``) or the row is dropped -- a partial carrier
+        would exempt a module blind from the dead set."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("roster_binding")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, object]] = {}
+        for name, rb in block.items():
+            if not isinstance(name, str) or not isinstance(rb, dict):
+                continue
+            label = rb.get("label")
+            receiver = rb.get("receiver")
+            lowered = rb.get("lowered")
+            if not (isinstance(label, str) and isinstance(receiver, str)
+                    and lowered is True):
+                continue
+            out[name] = {
+                "label": label,
+                "receiver": receiver,
+                "lowered": True,
+            }
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -4806,32 +5105,24 @@ script.Disabled = true
         to ``self.ctx.storage_plan`` and to ``conversion_plan.json`` in the
         output directory.
 
-        Phase 2a slice 6: runs the scene-runtime topology PREPASS
-        (``infer_module_domains`` + ``derive_reachability_requirements``)
-        before ``classify_storage`` so slice 7's storage decision tree
-        can read per-module domain verdicts + reachability requirements
-        as inputs. The prepass uses ``self.ctx.scene_runtime`` (planner
-        artifact, available since the ``plan_scene_runtime`` phase) +
-        the on-disk merged ``domain_overrides`` (so operator-supplied
-        overrides flow through the prepass too). The prepass is gated
-        identically to the late classifier today — generic mode only,
-        and only when ``scene_runtime.modules`` is non-empty + the
-        ``__skip_domain_classifier__`` probe flag is unset. Slice 6's
-        kwarg into ``classify_storage`` defaults to ``None`` (legacy
-        path); slice 7 will flip the consumer to the prepass output.
+        Runs the scene-runtime topology PREPASS (``infer_module_domains`` +
+        ``derive_reachability_requirements``) before ``classify_storage`` so
+        the storage decision tree can read per-module domain verdicts +
+        reachability requirements as inputs. The prepass uses
+        ``self.ctx.scene_runtime`` + the on-disk merged ``domain_overrides``,
+        and is gated identically to the late classifier (generic mode only,
+        ``scene_runtime.modules`` non-empty, ``__skip_domain_classifier__``
+        probe unset).
 
         Safe to call multiple times — the classifier is idempotent.
         """
-        # Phase 2b reframe step 2 R3 (Codex P3, 2026-06-01): reset the
-        # shared-flag stash at the START of every classification attempt —
-        # BEFORE the no-scripts early-return below — so the funnel-gate
-        # decision is SCENE-LOCAL. Otherwise a multi-scene driver reusing
+        # Reset the shared-flag stash at the START of every classification
+        # attempt — BEFORE the no-scripts early-return below — so the funnel-
+        # gate decision is SCENE-LOCAL. Otherwise a multi-scene driver reusing
         # this Pipeline state could leak a prior scene's ``present=False``
-        # verdict into a later scene that skips classification (no user
-        # scripts) → ``write_output`` would omit the funnel instead of
-        # taking the documented fail-open path. Clearing here means a
-        # skipped/early-returned classify leaves the stash ``None`` → the
-        # gate reads fail-open ``True`` (keep the funnel).
+        # verdict into a later scene that skips classification. Clearing here
+        # means a skipped/early-returned classify leaves the stash ``None`` →
+        # the gate reads fail-open ``True`` (keep the funnel).
         self.state.shared_flag_channels = None
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
@@ -4839,19 +5130,18 @@ script.Disabled = true
         from converter.storage_classifier import classify_storage
         import json as _json
 
-        # Phase 2a slice 6: pre-merge scene_runtime so the prepass runs
-        # against the same artifact the legacy classifier sees (sticky
-        # ``domain_overrides`` + legacy-domain migration + any unknown
-        # on-disk keys preserved forward-compat). The same merged dict
-        # is reused after ``classify_storage`` -- _merge_scene_runtime
+        # Pre-merge scene_runtime so the prepass runs against the same
+        # artifact the legacy classifier sees (sticky ``domain_overrides`` +
+        # legacy-domain migration + unknown on-disk keys preserved). The same
+        # merged dict is reused after ``classify_storage``; _merge_scene_runtime
         # is idempotent in its observable output.
         plan_path = self.output_dir / "conversion_plan.json"
         scene_runtime = self._merge_scene_runtime(plan_path)
 
-        # Phase 2a slice 6: early prepass. Same gate as the late classifier
-        # (see the comment block in the post-classify_storage branch
-        # below). Produces the per-module domain + reachability-requirement
-        # map slice 7 will consume from inside ``classify_storage``.
+        # Early prepass. Same gate as the late classifier (see the comment
+        # block in the post-classify_storage branch below). Produces the
+        # per-module domain + reachability-requirement map ``classify_storage``
+        # consumes.
         topology_inputs = self._maybe_run_topology_prepass(scene_runtime)
 
         plan = classify_storage(
@@ -4894,28 +5184,33 @@ script.Disabled = true
             if s.rig_binding is not None
         }
 
+        # Persist each re-lowered roster consumer's carrier so a preserve/resume
+        # assemble that rehydrates from disk keeps the dead-module exemption
+        # (without it the inert canonical body is re-classified dead on resume).
+        # Keyed by script name; ``None`` carriers are dropped (no re-lowering).
+        roster_binding: dict[str, dict[str, object]] = {
+            s.name: s.roster_binding
+            for s in self.state.rbx_place.scripts
+            if s.roster_binding is not None
+        }
+
         # Animation routing (Phase 4.5): per-clip target + reason.
         animation_routing: dict[str, dict[str, dict[str, str]]] = {}
         if self.state.animation_result is not None:
             animation_routing = getattr(self.state.animation_result, "routing", {}) or {}
 
-        # ``plan_path`` + ``scene_runtime`` already computed pre-classify_storage
-        # (see slice-6 prepass block above). ``_merge_scene_runtime`` is
-        # behavior-equivalent at this point in the run -- on-disk plan
-        # hasn't been rewritten yet, so re-running it here would produce
-        # the same dict. Slice 6 deduplicates the call.
+        # ``plan_path`` + ``scene_runtime`` were already computed in the
+        # pre-classify_storage prepass block above; re-running
+        # ``_merge_scene_runtime`` here would produce the same dict.
 
-        # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
-        # / ``domain_signals`` once the storage classifier has finalized
-        # every script's ``parent_path``. **Gated on
-        # ``ctx.scene_runtime_mode != "legacy"`` so the legacy emit path
-        # stays byte-identical** (per PR3a's "default output byte-identical"
-        # invariant). The reachability sub-pass mutates RbxScript.parent_path
-        # in service of the contract pipeline -- running it under legacy
-        # would shift script placement for ANY project whose code matches
-        # PR3b's new generic-only client patterns (RenderStepped, etc.)
-        # without an operator opt-in, which is exactly what PR3a's
-        # invariant prohibits.
+        # Stamp per-module ``domain`` / ``container`` / ``module_path`` /
+        # ``domain_signals`` once the storage classifier has finalized every
+        # script's ``parent_path``. **Gated on
+        # ``ctx.scene_runtime_mode != "legacy"`` so the legacy emit path stays
+        # byte-identical**: the reachability sub-pass mutates
+        # RbxScript.parent_path, so running it under legacy would shift script
+        # placement for any project matching the generic-only client patterns
+        # (RenderStepped, etc.) without an operator opt-in.
         #
         # Tests can override the gate either by setting
         # ``ctx.scene_runtime_mode = "generic"`` or, for the narrow
@@ -4937,13 +5232,10 @@ script.Disabled = true
             # on-disk plan we just merged (the on-disk plan may have been
             # produced by an older converter run). Idempotent.
             migrate_legacy_domain_values(cast("dict", scene_runtime))
-            # Phase 2a slice 2: backfill ``character_attached`` /
-            # ``is_loader`` on runtime-bearing module rows that pre-date
-            # slice 2. Without this, a user resuming a pre-slice-2
-            # conversion hits ``build_topology`` invariant 7 on every
-            # runtime-bearing row. The backfill uses the same
-            # ``REPLICATED_FIRST_HINTS`` regex the planner stamps with,
-            # so a resume produces the same artifact a fresh replan
+            # Backfill ``character_attached`` / ``is_loader`` on
+            # runtime-bearing module rows from an older on-disk plan, using
+            # the same ``REPLICATED_FIRST_HINTS`` regex the planner stamps
+            # with, so a resume produces the same artifact a fresh replan
             # would. Idempotent.
             backfill_lifecycle_role_inputs(cast("dict", scene_runtime))
             networking = getattr(self.ctx, "networking_mode", "none")
@@ -4970,8 +5262,8 @@ script.Disabled = true
                     "Consider --networking=none or expand annotations. "
                     "See conversion report for module-level detail."
                 )
-            # Strict mode defense-in-depth (PR135 P1.2). The primary
-            # gate is in ``plan_scene_runtime`` (pre-transpile) so an
+            # Strict mode defense-in-depth. The primary gate is in
+            # ``plan_scene_runtime`` (pre-transpile) so an
             # operator never pays the AI transpile cost on a plan that
             # won't ship. This late check should NEVER fire when the
             # early gate is reachable; it's kept so a code path that
@@ -4991,66 +5283,31 @@ script.Disabled = true
                     + violations
                 )
 
-            # Scene-runtime topology (Phase 1, PR #148). Runs AFTER the
-            # classifier has populated ``modules[*].domain`` and BEFORE
-            # the on-disk plan is written. Consumes the per-emission
-            # rowset animation_converter accumulated + the script
-            # objects' final ``script_type`` to build the topology
-            # artifact, then applies the artifact's animation_drivers
-            # decisions to the corresponding ``Anim_*`` RbxScripts
-            # (script_type + parent_path) so the topology is the
-            # authority for animation placement.
+            # Scene-runtime topology. Runs AFTER the classifier has populated
+            # ``modules[*].domain`` and BEFORE the on-disk plan is written.
+            # Builds the topology artifact from the per-emission rowset +
+            # final ``script_type``s, then applies its animation_drivers
+            # decisions to the ``Anim_*`` RbxScripts (script_type +
+            # parent_path) so the topology is the authority for animation
+            # placement. ``plan`` is passed so the same call patches the
+            # legacy storage_plan buckets in-place (move topology-flipped
+            # Anim_* names from server_scripts → client_scripts), else the
+            # on-disk plan contradicts the live RbxScript metadata.
             #
-            # ``plan`` is passed so the same call can patch the legacy
-            # storage_plan buckets in-place (move topology-flipped
-            # Anim_* names from server_scripts → client_scripts). This
-            # honors the design doc's §Migration discipline rule:
-            # "Each phase deletes the displaced logic in the same PR
-            # that wires the new consumer." Without this, the on-disk
-            # plan contradicts the live RbxScript metadata + the
-            # scene_runtime.topology block.
-            #
-            # Phase 2a slice 9a: ``topology_inputs`` from the prepass
-            # is passed through. Resume contract: on a
-            # ``--phase=write_output`` (or any) resume,
-            # ``materialize_and_classify`` is in ``ESSENTIAL_PHASES``
-            # (pipeline.py:612) so this method (``_classify_storage``)
-            # re-runs, ``_maybe_run_topology_prepass`` re-runs, and a
-            # fresh ``TopologyInputs`` is produced for this call —
-            # no persistence to ``StoragePlan`` is needed (and would
-            # violate slice 6's "save raw facts, recompute conclusions"
-            # rule, which keeps ``reachability_requirements`` /
-            # ``domains`` recomputed every run). Same gates fire on
-            # both the prepass and this branch (``scene_runtime_mode
-            # != "legacy"`` + non-empty ``modules`` + no
-            # ``__skip_domain_classifier__``) plus ``rbx_place``
-            # presence (checked inside both methods), so
-            # ``topology_inputs`` is non-None whenever this call site
-            # is reached; the kwarg's ``None`` default exists so unit
-            # tests + future callers can still invoke the method
-            # without forcing the prepass dependency.
-            #
-            # Phase 2a slice 9b R1 fold-in: the prepass also returns
-            # ``None`` when ``rbx_place.scripts`` is empty
-            # (``_maybe_run_topology_prepass`` line ~4440). The
-            # ``_classify_storage`` early-return at line ~4193 today
-            # covers the same condition, so this branch's gate
-            # (``modules`` non-empty + not legacy + not probe-skip)
-            # cannot legitimately be reached with empty scripts.
-            # Guard defensively anyway — a future caller that bypasses
-            # the early return (e.g. unit test rebinding state mid-
-            # method, an injected mid-method hook) should NOT crash
-            # the topology branch, just skip it. The check is
-            # conservative: ``topology_inputs is None`` is exactly the
-            # signal that the prepass declined to run.
+            # ``topology_inputs`` from the prepass is passed through; it is
+            # non-None whenever this call site is reached (the same gates fire
+            # on the prepass and this branch). It is not persisted to
+            # ``StoragePlan`` — on resume the prepass re-runs and produces a
+            # fresh one. The ``is not None`` guard is defensive against a
+            # future caller that bypasses ``_classify_storage``'s early return.
             if topology_inputs is not None:
                 self._build_and_apply_topology(
                     scene_runtime, plan,
                     topology_inputs=topology_inputs,
                 )
-                # Phase 3: run the shadow-mode contract verifier now that the
-                # topology artifact + final placements coexist. Unconditional so
-                # the verifier's smoke check can fire if topology is missing.
+                # Run the shadow-mode contract verifier now that the topology
+                # artifact + final placements coexist. Unconditional so the
+                # verifier's smoke check can fire if topology is missing.
                 self._run_contract_verifier(scene_runtime)
 
         plan_path.write_text(
@@ -5059,6 +5316,7 @@ script.Disabled = true
                 "script_paths": script_paths,
                 "child_ref_resolution": child_ref_resolution,
                 "rig_binding": rig_binding,
+                "roster_binding": roster_binding,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),
@@ -5069,6 +5327,63 @@ script.Disabled = true
             len(plan.decisions),
             plan_path.name,
         )
+
+    def _static_events_by_module_id(
+        self, scene_runtime: dict[str, object],
+    ) -> "dict[str, StaticEventDecl]":
+        """Map each runtime-bearing PRODUCER MODULE — keyed by its FULL UNIQUE
+        ``module_id`` (the ``modules`` dict key) — to a ``StaticEventDecl`` (its
+        emitted name, the C# ``static event`` members it declares, and the
+        producer's resolved domain).
+
+        Deterministic upstream signal for the rendezvous verifier: enumerate the
+        C# ``static event`` declarations off the ``.cs`` source via the GUID. Keying
+        by ``module_id`` (NOT the emitted-name tail) keeps two modules that lower to
+        the SAME emitted name (e.g. two ``Player`` classes on different VMs)
+        SEPARATE and verified INDEPENDENTLY, so a canonical one cannot mask a
+        different broken one. ``decl.name`` carries the emitted name the verifier
+        scans the Luau for (``<name>.<field>``). NEVER reads the AI output to decide
+        WHICH channels should exist.
+        """
+        from converter.contract_verifier import StaticEventDecl
+        from unity.script_analyzer import analyze_script
+
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict):
+            return {}
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return {}
+        result: dict[str, StaticEventDecl] = {}
+        for script_id, module in modules_obj.items():
+            if not isinstance(module, dict):
+                continue
+            # Apply the SAME same-domain gate as ``build_static_event_channels``
+            # so the verifier only demands a rendezvous for channels the runtime
+            # actually pre-sets. A helper/excluded/cross-domain/unstamped or
+            # non-runtime-bearing module gets NO channel, so flagging its static
+            # events would be spurious noise.
+            domain = module.get("domain")
+            if domain not in ("client", "server"):
+                continue
+            if not module.get("runtime_bearing"):
+                continue
+            module_path = module.get("module_path")
+            if not isinstance(module_path, str) or not module_path:
+                continue
+            cs_path = guid_index.resolve(script_id)
+            if cs_path is None or cs_path.suffix != ".cs":
+                continue
+            events = analyze_script(cs_path).static_events
+            if not events:
+                continue
+            name = module_path.rsplit(".", 1)[-1]
+            # Key by the UNIQUE ``module_id`` (``script_id``), not the emitted
+            # ``name`` tail (see the docstring), so same-name modules stay distinct.
+            result[script_id] = StaticEventDecl(
+                name=name, events=list(events), domain=str(domain),
+            )
+        return result
 
     def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:
         """Run the shadow-mode contract verifier and store the current run's
@@ -5083,8 +5398,8 @@ script.Disabled = true
 
         from converter import contract_verifier
 
-        # Shadow-only disable hatch; the fail-closed promotion gate gets its own
-        # hatch in slice 4.
+        # Shadow-only disable hatch; the fail-closed promotion gate has its
+        # own hatch below.
         if os.environ.get("U2R_CONTRACT_VERIFIER_DISABLE", "").strip().lower() in (
             "1", "true", "yes",
         ):
@@ -5093,7 +5408,10 @@ script.Disabled = true
 
         topology = cast("TopologyArtifact", scene_runtime.get("topology", {}))
         scripts = list(self.state.rbx_place.scripts or [])
-        result = contract_verifier.verify_contract(topology, scripts)
+        static_events_by_module = self._static_events_by_module_id(scene_runtime)
+        result = contract_verifier.verify_contract(
+            topology, scripts, static_events_by_module,
+        )
 
         # REPLACE the rows (not append): ``ctx.scene_runtime`` persists + reloads
         # across a resume (conversion_context.json), so an append-only stash
@@ -5108,22 +5426,21 @@ script.Disabled = true
             result.counts_by_check(),
         )
 
-        # Slice-4 per-check fail-closed promotion. The metric above is always
+        # Per-check fail-closed promotion. The metric above is always
         # recorded (shadow). Here a FLIPPED check's ``warning`` rows
         # (``FAIL_CLOSED_CHECKS``) promote to ``ctx.errors``, so
         # ``conversion_report.success`` becomes False on a real contract
         # breach. The escape hatch is read AT THIS GATE
         # (compute-the-metric-but-don't-abort), distinct from the
-        # shadow-disable hatch at entry — so the metric stays populated even
+        # shadow-disable hatch at entry, so the metric stays populated even
         # when promotion is suppressed for a release.
         #
-        # REPLACE the verifier-owned rows, don't append (codex review P0):
-        # ``ctx.errors`` persists + reloads across a ``materialize_and_classify``
-        # resume, so a prior run's promotion would survive a now-clean rerun (or
-        # a fail-open rerun) and keep ``success=False`` for the wrong reason —
-        # the same ownership bug the metric stash already fixed. Drop every prior
-        # verifier-prefixed error FIRST (both directions: clean + fail-open), then
-        # re-add the current run's (unless the hatch suppresses promotion).
+        # REPLACE the verifier-owned rows, don't append: ``ctx.errors``
+        # persists + reloads across a ``materialize_and_classify`` resume, so
+        # a prior run's promotion would survive a now-clean rerun and keep
+        # ``success=False`` for the wrong reason. Drop every prior
+        # verifier-prefixed error FIRST (clean + fail-open), then re-add the
+        # current run's (unless the hatch suppresses promotion).
         prefix = contract_verifier.CONTRACT_ERROR_PREFIX
         self.ctx.errors[:] = [
             e for e in self.ctx.errors if not e.startswith(prefix)
@@ -5151,9 +5468,8 @@ script.Disabled = true
 
         Returns ``None`` when the same gate the late classifier uses
         rejects the call -- legacy mode, no ``modules`` block, or the
-        ``__skip_domain_classifier__`` probe flag is set. Slice 6's
-        ``classify_storage`` treats ``topology_inputs=None`` as the
-        legacy decision path (byte-identical to slice 5).
+        ``__skip_domain_classifier__`` probe flag is set. ``classify_storage``
+        treats ``topology_inputs=None`` as the legacy decision path.
 
         When the gate accepts, this function:
           - Backfills lifecycle-role inputs on pre-slice-2 module rows.
@@ -5168,24 +5484,18 @@ script.Disabled = true
             already by ``plan_scene_runtime``).
 
         The returned ``TopologyInputs`` is NOT persisted onto
-        ``StoragePlan``. Per the slice-6 "save raw facts, recompute
-        conclusions" rule, ``domains`` and ``reachability_requirements``
-        depend on operator-editable inputs
-        (``scene_runtime.domain_overrides``, ``networking_mode``) +
-        current source, so they are recomputed by this function on
-        every run -- including assemble-no-retranspile resumes. On
-        resume, ``state.dependency_map`` is empty (set only inside
-        ``transpile_scripts``); ``derive_reachability_requirements``
-        intentionally returns ``{}`` in that case, and slice 7's
-        consumer falls back to the "unconstrained helper" path for
-        any module not present in the requirements map. This is the
-        same trade slice 3 already accepts for ``caller_graph``;
-        ``caller_graph`` itself remains persisted via
-        ``resolve_caller_graph``'s ``preserved_caller_graph`` path,
-        which is the explicit non-recomputable exception (it depends
-        on the transpile-time ``dependency_map`` surface that is
-        absent on no-transpile resumes). See ``slice-6.md`` handoff
-        for the rule + the two-point Codex amendment.
+        ``StoragePlan``. ``domains`` and ``reachability_requirements`` depend
+        on operator-editable inputs (``scene_runtime.domain_overrides``,
+        ``networking_mode``) + current source, so they are recomputed on
+        every run, including assemble-no-retranspile resumes. On resume,
+        ``state.dependency_map`` is empty (set only inside
+        ``transpile_scripts``); ``derive_reachability_requirements`` returns
+        ``{}`` in that case, and the consumer falls back to the
+        "unconstrained helper" path for any module absent from the
+        requirements map. ``caller_graph`` is the explicit non-recomputable
+        exception: it remains persisted via ``resolve_caller_graph``'s
+        ``preserved_caller_graph`` path, since it depends on the
+        transpile-time ``dependency_map`` absent on no-transpile resumes.
         """
         if self.ctx.scene_runtime_mode == "legacy":
             return None
@@ -5227,22 +5537,20 @@ script.Disabled = true
             TopologyInputs,
         )
 
-        # Migration + backfill mirror what the post-classify_storage
-        # branch does today (and are idempotent), so doing them here
-        # too keeps slice 5's "consistent classifier inputs across
-        # both passes" invariant.
+        # Migration + backfill mirror what the post-classify_storage branch
+        # does (and are idempotent), keeping consistent classifier inputs
+        # across both passes.
         migrate_legacy_domain_values(cast("SceneRuntimeArtifact", scene_runtime))
         backfill_lifecycle_role_inputs(scene_runtime)
 
         networking = getattr(self.ctx, "networking_mode", "none")
 
-        # Pre-classify-storage caller_graph derivation. Slice 3 round 5
-        # codified the ``state.transpilation_result is not None``
-        # signal as "did transpile run this invocation" -- empty
-        # dependency_map alongside a populated transpilation_result is
-        # the legitimate "fresh ran with no edges" case (don't
-        # preserve); populated dep_map alongside a None transpilation_result
-        # is the resume case (preserve the prior block).
+        # Pre-classify-storage caller_graph derivation, using
+        # ``state.transpilation_result is not None`` as the "did transpile
+        # run this invocation" signal: empty dependency_map alongside a
+        # populated transpilation_result is the legitimate "fresh ran with no
+        # edges" case (don't preserve); populated dep_map alongside a None
+        # transpilation_result is the resume case (preserve the prior block).
         preserved_caller_graph: dict[str, list[str]] | None
         if self.state.transpilation_result is not None:
             preserved_caller_graph = None
@@ -5277,51 +5585,23 @@ script.Disabled = true
         domains: dict[str, str] = {
             sid: res["domain"] for sid, res in domain_results.items()
         }
-        # Slice 7 round 2 (Codex P1 #2 fix): compute ``lifecycle_role``
-        # INLINE here so the storage classifier's slice-7 decision tree
-        # actually sees a populated dict on a fresh run. Pre-round-2
-        # this dict was populated by reading
-        # ``row.get("lifecycle_role")``, but no upstream stamper writes
-        # that key onto the source row -- ``build_topology._build_modules_block``
-        # computes it for the artifact entry but does not mutate the
-        # row, and the planner stamps only the RAW inputs
-        # (``is_loader`` / ``character_attached``). So the prepass
-        # produced an empty dict, the consumer at
-        # ``storage_classifier._decide_script_container_from_topology``
-        # got ``""`` for every sid, and the ``character_attached`` /
-        # ``loader`` branches were dead in production. Unit tests
-        # passed because ``_mk_topology_inputs`` pre-stamped the dict
-        # directly, bypassing the producer/consumer ordering.
+        # Compute ``lifecycle_role`` INLINE via
+        # ``derive_module_lifecycle_role`` (no row mutation) so the storage
+        # classifier sees a populated dict on a fresh run: no upstream
+        # stamper writes ``lifecycle_role`` onto the source row (the planner
+        # stamps only the raw ``is_loader`` / ``character_attached`` inputs),
+        # so reading ``row.get("lifecycle_role")`` produced an empty dict and
+        # the consumer's ``character_attached`` / ``loader`` branches were
+        # dead. The late ``_build_modules_block`` calls the same helper with
+        # the same inputs, so the prepass dict and artifact entry match.
         #
-        # Option A.2 from the round 1 decision doc: recompute inline
-        # via ``derive_module_lifecycle_role`` -- no row mutation. The
-        # late ``build_topology._build_modules_block`` also calls
-        # ``derive_module_lifecycle_role`` with the same inputs, so
-        # the prepass dict and the artifact entry are byte-identical.
-        # See ``slice-7-r1-decision.md`` for the verification chain.
-        #
-        # Round 4 (R3 review P2-NEW-B): unify the prepass join key with
-        # the routing join key. Pre-R4 the prepass joined on class_name
-        # only (via ``build_scripts_by_class_name``) but the routing
-        # path in ``_decide_script_container_from_topology`` joined on
-        # ``script_id_by_name`` (class_name with stem fallback, both
-        # collision-excluded). Disagreement case: two modules with
-        # colliding ``class_name`` but distinct stems pass routing's
-        # lookup via the stem fallback, but the prepass excludes them
-        # both (class_name collision) and silently demotes
-        # ``character_attached`` / ``loader`` to the default role —
-        # exactly the failure mode the slice-3 contract was designed
-        # to surface.
-        #
-        # Fix (option c per memory's "canonical contract" rule):
-        # invert ``script_id_by_name`` to build a ``script_by_sid``
-        # map keyed on the same join the routing path uses. One source
-        # of truth for class_name + stem + collision exclusion across
-        # both consumers. ``build_scripts_by_class_name`` is still
-        # used downstream by ``_build_and_apply_topology`` /
-        # ``_build_modules_block`` for the class_name keyspace there
-        # (see TODO in this method's R4 commit message for the
-        # symmetric follow-up).
+        # Unify the prepass join key with the routing join key: invert
+        # ``script_id_by_name`` to a ``script_by_sid`` map keyed on the same
+        # join ``_decide_script_container_from_topology`` uses (class_name
+        # with stem fallback, collision-excluded). Joining on class_name only
+        # would silently demote ``character_attached`` / ``loader`` to the
+        # default role for two modules with colliding class_name but distinct
+        # stems.
         modules_dict = cast("dict[str, dict[str, object]]", modules)
         scripts_by_name: dict[str, RbxScript] = {
             s.name: s for s in self.state.rbx_place.scripts if s.name
@@ -5388,26 +5668,18 @@ script.Disabled = true
         #   - Class 2 (dynamic shared-flag): ``compute_shared_flag_channels``
         #     scans the live ``transpilation_result`` for cross-domain
         #     ``:GetAttribute("...")`` reads.
-        # ``build_topology`` is pure-assembly: it reads
-        # ``cross_domain_edges`` + ``shared_flag_channels`` off
-        # ``TopologyInputs`` rather than calling the producers itself.
-        #
-        # Reframe (2026-06-01): the slices-1-2
-        # ``compute_shared_attribute_candidates`` fan-out producer was
-        # RETIRED (it mis-modeled Class 2 as Class 1); the
-        # ``shared_flag_channels`` fact replaces it.
+        # ``build_topology`` is pure-assembly: it reads ``cross_domain_edges``
+        # + ``shared_flag_channels`` off ``TopologyInputs`` rather than
+        # calling the producers itself.
         scene_runtime_typed = cast(
             "SceneRuntimeArtifact", scene_runtime,
         )
-        # P1-A fix (Phase 2b slice 2 R1, 2026-05-31): the prepass runs
-        # BEFORE ``classify_scene_runtime_domains()`` stamps
-        # ``modules[*].domain`` back onto ``scene_runtime``. The
-        # producer internally reads ``modules.get(sid, {}).get("domain", "")``,
-        # so on a fresh run every domain reads as ``""`` and the
-        # ``NON_RUNTIME_DOMAINS`` filter drops every edge. Pass the
-        # locally-computed ``domains`` dict (populated above from
-        # ``infer_module_domains``) as the override so the producer sees
-        # the inferred values.
+        # The prepass runs BEFORE ``classify_scene_runtime_domains()`` stamps
+        # ``modules[*].domain`` back onto ``scene_runtime``. The producer
+        # reads ``modules.get(sid, {}).get("domain", "")``, so on a fresh run
+        # every domain reads as ``""`` and the ``NON_RUNTIME_DOMAINS`` filter
+        # drops every edge. Pass the locally-computed ``domains`` dict as the
+        # override so the producer sees the inferred values.
         component_ref_edges = compute_cross_domain_edges(
             scene_runtime_typed,
             domains_override=domains,
@@ -5432,22 +5704,11 @@ script.Disabled = true
             script_id_by_name=script_id_by_name,
             domains=domains,
         )
-        # Phase 2b reframe step 2 (R2): stash the fact on the TRANSIENT
-        # run-scoped ``state`` so the step-2 funnel gate
-        # (``_shared_flag_funnel_present``, read in ``write_output``) can
-        # reach it. The gate previously read
-        # ``ctx.scene_runtime["topology"]["shared_flag_channels"]``, but
-        # ``ctx.scene_runtime`` is the planner's PRE-topology dict — the
-        # ``topology`` block is built only on the MERGED LOCAL dict
-        # (``_merge_scene_runtime`` returns a fresh copy) and is never
-        # written back to ctx, so that read always missed → fail-open →
-        # the gate was a production NO-OP. ``state`` is rebuilt fresh
-        # every run (incl. resume, where this code re-runs and stashes the
-        # fail-open ``present: True``), is never persisted, and is never
-        # fed into ``_merge_scene_runtime``, so this does not re-stale the
-        # recompute-only fact. The persisted copy in
-        # ``scene_runtime.topology`` stays for Phase 3 to read from the
-        # plan.
+        # Stash the fact on the TRANSIENT run-scoped ``state`` so the funnel
+        # gate (``_shared_flag_funnel_present``, read in ``write_output``)
+        # can reach it. ``state`` is rebuilt fresh every run, is never
+        # persisted, and is never fed into ``_merge_scene_runtime``. The
+        # persisted copy in ``scene_runtime.topology`` stays for Phase 3.
         self.state.shared_flag_channels = shared_flag_channels
 
         return TopologyInputs(
@@ -5456,35 +5717,18 @@ script.Disabled = true
             lifecycle_roles=lifecycle_roles,
             script_id_by_name=script_id_by_name,
             caller_graph=caller_graph,
-            # Slice 7: raw fact -- did transpile run this invocation?
-            # ``state.transpilation_result is not None`` is the
-            # canonical signal (see slice 3 round 5 + slice 6 handoff).
-            # Lets the consumer distinguish "no-transpile resume with
-            # degraded reachability_requirements" from "real
-            # classification bug." Per the slice-6 persistence rule
-            # this is a RAW FACT about pipeline execution, not a
-            # derived conclusion, so it is safe to carry.
-            #
-            # Slice 10 R2: kept for potential future use; the current
-            # ``_build_modules_block`` read site at
-            # build_topology.py:719 intentionally does NOT consult
-            # ``transpile_ran`` (Option Y -- accept + document the
-            # ``reachability_required_container == ""`` on no-transpile
-            # resume rather than reviving the legacy audit-signal
-            # read or persisting reachability_requirements). The flag
-            # is still consumed by ``storage_classifier``'s slice-6
-            # unconstrained-helper amendment (storage_classifier.py:577),
-            # so the wiring is load-bearing for storage routing even
-            # though it is not consumed by the topology artifact read.
+            # Raw fact: did transpile run this invocation? Lets a consumer
+            # distinguish a no-transpile resume (degraded
+            # reachability_requirements) from a real classification bug. The
+            # topology artifact read does NOT consult it, but
+            # ``storage_classifier``'s unconstrained-helper amendment does,
+            # so the wiring is load-bearing for storage routing.
             transpile_ran=self.state.transpilation_result is not None,
-            # Phase 2b: cross-domain facts carried on ``TopologyInputs``
-            # so ``build_topology`` is pure-assembly. The producer ran
-            # above; ``edge_enrichment`` populated ``bridge_member_scripts``
-            # on the component-ref edges; ``compute_shared_flag_channels``
-            # produced the Class-2 funnel channel fact (recompute-only,
-            # fail-open on resume). ``build_topology`` reads these off
-            # ``TopologyInputs`` and writes them straight into the
-            # artifact dict.
+            # Cross-domain facts carried on ``TopologyInputs`` so
+            # ``build_topology`` is pure-assembly: ``edge_enrichment``
+            # populated ``bridge_member_scripts`` on the component-ref edges
+            # and ``compute_shared_flag_channels`` produced the Class-2 funnel
+            # channel fact (recompute-only, fail-open on resume).
             cross_domain_edges=enriched_edges,
             shared_flag_channels=shared_flag_channels,
         )
@@ -5496,76 +5740,46 @@ script.Disabled = true
         *,
         topology_inputs: "TopologyInputs | None" = None,
     ) -> None:
-        """Phase 1, PR #148 of the scene-runtime topology authority refactor.
+        """Build the scene-runtime topology artifact + apply its
+        animation_drivers decisions to the corresponding ``Anim_*``
+        RbxScripts. Called inside ``_classify_storage`` AFTER
+        ``classify_scene_runtime_domains`` populates module domains + BEFORE
+        the on-disk plan is written.
 
-        Build the topology artifact + apply its animation_drivers decisions
-        to the corresponding ``Anim_*`` RbxScripts. Called inside
-        ``_classify_storage`` AFTER ``classify_scene_runtime_domains``
-        populates module domains + BEFORE the on-disk plan is written.
+        ``topology_inputs`` is the same ``TopologyInputs`` row
+        ``_maybe_run_topology_prepass`` produced earlier (or ``None`` if the
+        prepass gate rejected the call). Plumbed through so this method
+        consumes the canonical ``script_id_by_name`` index (and the inverted
+        ``script_by_sid``) without re-deriving via the class_name-only join.
+        ``TopologyInputs`` is NOT persisted; on a ``--phase=write_output``
+        resume the prepass re-runs and produces a fresh one.
 
-        ``topology_inputs`` (Phase 2a slice 9a): the same
-        ``TopologyInputs`` row ``_maybe_run_topology_prepass`` produced
-        earlier in ``_classify_storage`` (or ``None`` if the prepass
-        gate rejected the call -- legacy mode / no ``modules`` block /
-        ``__skip_domain_classifier__`` probe). Plumbed through so this
-        method can consume the canonical ``script_id_by_name`` index
-        (and the inverted ``script_by_sid`` derived from it) without
-        re-deriving via the legacy class_name-only join — closes the
-        same asymmetric-join hole slice 7 round 4 fixed at the prepass
-        boundary, this time on the late ``_build_modules_block`` side.
-        Per slice 6's "save raw facts, recompute conclusions" rule
-        ``TopologyInputs`` itself is NOT persisted to ``StoragePlan``;
-        plumbing means in-memory pass-through, and on a
-        ``--phase=write_output`` resume the prepass re-runs (because
-        ``materialize_and_classify`` is essential) and produces a fresh
-        ``TopologyInputs`` for this call.
+        The artifact lands at ``scene_runtime["topology"]``. Consumers should
+        read through this method's outputs / the package's accessor surface,
+        not by indexing the dict directly.
 
-        The artifact lands at ``scene_runtime["topology"]`` per design
-        doc open-question D4 (option b). Consumers should read through
-        this method's outputs / the package's accessor surface — not by
-        indexing the dict directly — so a future relocation to a
-        sidecar file is a one-file change.
-
-        For each ``Anim_*`` script the topology returns a
-        ``routing_status`` + ``script_class``. Resolved entries override
-        the RbxScript's ``script_type`` (Script→LocalScript for client
-        drivers) and ``parent_path`` (ServerScriptService →
-        StarterPlayer.StarterPlayerScripts). Unresolved + orphan
-        entries leave the RbxScript at today's server placement.
-
-        ``plan`` is also patched in-place to reflect the topology
-        overrides: a Script→LocalScript flip moves the script name from
-        ``plan.server_scripts`` to ``plan.client_scripts`` so the
-        on-disk ``conversion_plan.json`` doesn't contradict the live
-        RbxScript metadata or the persisted ``scene_runtime.topology``
-        block. This honors the design doc's §Migration discipline
-        ("Each phase deletes the displaced logic in the same PR that
-        wires the new consumer") for the Anim_* slice; non-animation
-        scripts continue through classify_storage's regex pass until
-        Phase 2a wires script_storage as a bound consumer.
+        For each ``Anim_*`` script the topology returns a ``routing_status``
+        + ``script_class``. Resolved entries override the RbxScript's
+        ``script_type`` (Script→LocalScript for client drivers) and
+        ``parent_path`` (ServerScriptService → StarterPlayer.StarterPlayerScripts);
+        unresolved + orphan entries leave the RbxScript at today's server
+        placement. ``plan`` is also patched in-place: a Script→LocalScript
+        flip moves the script name from ``plan.server_scripts`` to
+        ``plan.client_scripts`` so the on-disk ``conversion_plan.json``
+        doesn't contradict the live RbxScript metadata.
         """
         if self.state.rbx_place is None:
             return
 
-        # Phase 2a slice 3 round 4 fix (Claude P1.A + P1.B): the
-        # round-3 "early return when animation_result is None" guard
-        # over-fired in two ways. (1) It fired on legitimate
-        # fresh-no-animations paths (--no-animations flag, projects
-        # without .anim files, test paths skipping convert_animations)
-        # and regressed slice 3 round 1's "topology always built"
-        # goal. (2) It preserved the WHOLE persisted topology on
-        # resume, including a now-stale caller_graph alongside a
-        # freshly-rebuilt state.dependency_map — silent divergence
-        # by construction.
-        #
-        # The structural fix is to ALWAYS rebuild modules + edges +
-        # caller_graph from current state, AND preserve the prior
-        # animation_drivers block ONLY when we lack fresh emission
-        # data. The prior topology block lives at
-        # ``scene_runtime["topology"]`` after ``_merge_scene_runtime``
-        # rehydrates it from a previous ``conversion_plan.json``;
-        # ``animation_result is None`` is the signal for "no fresh
-        # emissions available."
+        # ALWAYS rebuild modules + edges + caller_graph from current state,
+        # and preserve the prior animation_drivers block ONLY when we lack
+        # fresh emission data (an early-return guard on ``animation_result
+        # is None`` over-fired on fresh-no-animations paths and left a stale
+        # caller_graph alongside a freshly-rebuilt dependency_map). The prior
+        # topology block lives at ``scene_runtime["topology"]`` after
+        # ``_merge_scene_runtime`` rehydrates it from a previous
+        # ``conversion_plan.json``; ``animation_result is None`` is the
+        # signal for "no fresh emissions available."
         prior_topology = scene_runtime.get("topology", {})
         if not isinstance(prior_topology, dict):
             prior_topology = {}
@@ -5588,23 +5802,15 @@ script.Disabled = true
                 pad if isinstance(pad, dict) and pad else None
             )
 
-        # Phase 2a slice 3 round 5 (codex P2): on
-        # assemble-without-retranspile workflows, ``transpile_scripts``
-        # doesn't rerun and ``state.dependency_map`` stays empty —
-        # preserve the prior ``caller_graph`` so we don't overwrite
-        # it with ``{}``.
-        #
-        # Round 6 (codex P2): use ``transpilation_result`` rather
-        # than the dep_map's truthiness as the "did transpile run
-        # this invocation?" signal. A genuine retranspile that
-        # removes the last cross-script reference ALSO leaves
-        # dep_map empty — using dep_map alone would silently carry
-        # forward stale callers in that case. ``transpilation_result``
-        # is set IFF transpile_scripts ran this invocation (both are
-        # populated in the same code path, pipeline.py:1942-1971);
-        # an empty dep_map alongside a populated transpilation_result
-        # is the legitimate "ran with no edges" case (use the empty
-        # fresh graph, don't preserve).
+        # On assemble-without-retranspile workflows ``transpile_scripts``
+        # doesn't rerun, so preserve the prior ``caller_graph`` rather than
+        # overwrite it with ``{}``. Use ``transpilation_result`` (set IFF
+        # transpile ran this invocation) rather than dep_map truthiness as
+        # the signal: a genuine retranspile that removes the last
+        # cross-script reference ALSO leaves dep_map empty, so dep_map alone
+        # would silently carry forward stale callers. An empty dep_map
+        # alongside a populated transpilation_result is the legitimate "ran
+        # with no edges" case (use the empty fresh graph, don't preserve).
         if self.state.transpilation_result is not None:
             preserved_caller_graph = None
         else:
@@ -5617,14 +5823,10 @@ script.Disabled = true
             build_topology,
         )
 
-        # Phase 2a slice 4 round 3 review (Claude P1.A): use the
-        # shared ``build_scripts_by_class_name`` helper so the
-        # pipeline + planner share ONE source of truth for the
-        # class_name → script join. Pre-fix the pipeline keyed by
-        # ``script.name`` (file stem) but downstream consumers
-        # (build_topology._build_modules_block) looked up via
-        # module rows' ``class_name`` — same name-vs-class-name
-        # conflation slice 4 round 2 fixed in the planner.
+        # Use the shared ``build_scripts_by_class_name`` helper so the
+        # pipeline + planner share ONE source of truth for the class_name →
+        # script join (downstream ``_build_modules_block`` looks up via
+        # module rows' ``class_name``, not the file stem).
         from converter.scene_runtime_planner import (
             build_scripts_by_class_name,
         )
@@ -5634,32 +5836,26 @@ script.Disabled = true
             cast("dict", modules_in),
         )
 
-        # Phase 2a slice 9a (followup task #10 fold-in): invert
-        # ``topology_inputs.script_id_by_name`` (``s.name -> sid``,
-        # built via the canonical ``build_script_id_by_name`` helper
-        # which honors collision exclusion on BOTH the class_name and
-        # stem keyspaces) into ``sid -> RbxScript``. Pass to
-        # ``build_topology`` so ``_build_modules_block`` can join on
-        # ``script_id`` directly instead of the class_name-only
-        # ``scripts_by_class`` lookup — closes the same
-        # asymmetric-join hole slice 7 round 4 fixed at the prepass
-        # boundary, this time on the late-assembly side. Modules
-        # whose class_name + stem both collide (or both miss) are
-        # absent from ``script_id_by_name`` and therefore also absent
+        # Invert ``topology_inputs.script_id_by_name`` (``s.name -> sid``,
+        # built via ``build_script_id_by_name`` which honors collision
+        # exclusion on BOTH the class_name and stem keyspaces) into
+        # ``sid -> RbxScript``. Pass to ``build_topology`` so
+        # ``_build_modules_block`` can join on ``script_id`` directly instead
+        # of the class_name-only ``scripts_by_class`` lookup. Modules whose
+        # class_name + stem both collide (or both miss) are absent from
+        # ``script_id_by_name`` and therefore also absent
         # from ``script_by_sid``; ``_build_modules_block`` then falls
         # through to ``derive_intrinsic_script_class(None)`` ->
         # ``"ModuleScript"``, the same safe-default outcome
         # ``scripts_by_class`` already produces for those rows.
         script_by_sid: dict[str, RbxScript] | None = None
-        # Phase 2a slice 10: also plumb the raw analysis output so
-        # ``_build_modules_block`` reads ``reachability_required_container``
-        # from ``TopologyInputs.reachability_requirements`` rather than
-        # the planner-row audit signal. See the slice-10 block comment
-        # in ``build_topology._build_modules_block``.
+        # Plumb the raw analysis output so ``_build_modules_block`` reads
+        # ``reachability_required_container`` from
+        # ``TopologyInputs.reachability_requirements`` rather than the
+        # planner-row audit signal.
         reachability_requirements: dict[str, str] | None = None
-        # Phase 2b: ``build_topology`` is pure-assembly for the
-        # cross-domain facts; the prepass produces them, we forward them
-        # via these inputs.
+        # ``build_topology`` is pure-assembly for the cross-domain facts; the
+        # prepass produces them, we forward them via these inputs.
         cross_domain_edges_input: "list[CrossDomainEdge] | None" = None
         shared_flag_channels_input: "SharedFlagChannels | None" = None
         if topology_inputs is not None:
@@ -5689,35 +5885,27 @@ script.Disabled = true
                 emitted_animations=emitted_animations,
                 scripts_by_class=scripts_by_class,
                 guid_index=self.state.guid_index,
-                # Phase 2a slice 3: pass the planner's class-keyed
-                # dependency_map so build_topology can curate it into
-                # the artifact's `caller_graph` (script_id-keyed
-                # incoming-edge view). `None` is treated as empty
-                # graph — back-compat for callers pre-dating slice 3.
+                # Planner's class-keyed dependency_map, curated into the
+                # artifact's ``caller_graph`` (script_id-keyed incoming-edge
+                # view). ``None`` is treated as empty graph.
                 dependency_map=self.state.dependency_map or None,
-                # Phase 2a slice 3 round 4: preserve prior
-                # animation_drivers on resume / no-fresh-emissions
-                # builds (caller computed above). Build_topology
-                # uses the preserved block verbatim and skips
-                # invariant 3 — see its docstring for the contract.
+                # Preserve prior animation_drivers on resume / no-fresh-
+                # emissions builds; build_topology uses the preserved block
+                # verbatim and skips invariant 3.
                 preserved_animation_drivers=preserved_animation_drivers,
-                # Phase 2a slice 3 round 5: preserve prior
-                # caller_graph on assemble-no-retranspile workflows
-                # where state.dependency_map is empty. Without this
-                # the prior populated graph would be overwritten
-                # with {} on every assemble rerun.
+                # Preserve prior caller_graph on assemble-no-retranspile
+                # workflows where state.dependency_map is empty, else the
+                # prior populated graph is overwritten with {} on every rerun.
                 preserved_caller_graph=preserved_caller_graph,
-                # Phase 2a slice 9a (#10 fold-in): script_id-keyed
-                # join for ``_build_modules_block`` (see block
-                # comment above for the asymmetric-join rationale).
+                # script_id-keyed join for ``_build_modules_block`` (see the
+                # asymmetric-join rationale above).
                 script_by_sid=script_by_sid,
-                # Phase 2a slice 10: raw analysis output for the
-                # topology entry's ``reachability_required_container``
-                # surface. See block comment above.
+                # raw analysis output for the topology entry's
+                # ``reachability_required_container`` surface.
                 reachability_requirements=reachability_requirements,
-                # Phase 2b: pure-assembly handoff for the cross-domain
-                # facts. The prepass produced them; build_topology writes
-                # them straight into the artifact dict.
+                # pure-assembly handoff for the cross-domain facts; the
+                # prepass produced them, build_topology writes them into the
+                # artifact dict.
                 cross_domain_edges_input=cross_domain_edges_input,
                 shared_flag_channels_input=shared_flag_channels_input,
             )
@@ -5732,8 +5920,8 @@ script.Disabled = true
             raise
 
         # Persist the artifact under the scene_runtime block. Consumers
-        # (animation_converter post-emission, contract_pipeline in
-        # Phase 3) read through this key.
+        # (animation_converter post-emission, contract_pipeline) read through
+        # this key.
         scene_runtime["topology"] = cast("object", artifact)
 
         # Apply animation_drivers decisions to the matching Anim_*
@@ -5746,15 +5934,11 @@ script.Disabled = true
         if not animation_drivers:
             return
         # The application loop below maps emissions → drivers by
-        # script_name. On resume (animation_result is None) we have
-        # preserved drivers but no fresh emissions to walk. The
-        # persisted animation_drivers in scene_runtime["topology"]
-        # survives the rebuild and downstream readers consult it;
-        # RbxScripts on resume rely on their persisted parent_path
-        # from the cached conversion. Skipping the apply loop here is
-        # the slice-3-scoped fix; deeper resume semantics for
-        # RbxScript application are pre-existing scope (slice 3 round
-        # 4 fix didn't introduce this resume gap).
+        # script_name. On resume (animation_result is None) we have preserved
+        # drivers but no fresh emissions to walk: the persisted
+        # animation_drivers survives the rebuild and downstream readers
+        # consult it, and RbxScripts on resume rely on their persisted
+        # parent_path from the cached conversion, so skip the apply loop.
         if self.state.animation_result is None:
             return
         # Index drivers by script_name so the apply loop is O(n).
@@ -5782,13 +5966,12 @@ script.Disabled = true
         # animation_drivers entry, apply the topology decision AND patch
         # the storage_plan bucket so the on-disk artifact stays
         # consistent with the in-memory state.
-        # Counts (F4): summary log distinguishes "we resolved a driver
-        # and the script existed" (applied) from "driver resolved but
-        # the named script wasn't in rbx_place" (unmatched — consumer
-        # drift) from "topology emitted a row but the routing_status
-        # was unresolved/orphan" (skipped — Phase 1 acknowledged gap).
-        # Without these counters a silent zero-mutation case looks the
-        # same as a healthy run.
+        # Counts: the summary log distinguishes "resolved a driver and the
+        # script existed" (applied) from "driver resolved but the named
+        # script wasn't in rbx_place" (unmatched — consumer drift) from
+        # "topology emitted a row but the routing_status was
+        # unresolved/orphan" (skipped). Without these counters a silent
+        # zero-mutation case looks the same as a healthy run.
         applied_client = 0
         applied_server = 0
         skipped_unresolved = 0
@@ -5829,28 +6012,23 @@ script.Disabled = true
                 script.script_type = "LocalScript"
                 script.parent_path = "StarterPlayer.StarterPlayerScripts"
                 applied_client += 1
-                # F1: patch the storage_plan buckets so the on-disk
-                # plan matches the live RbxScript metadata. Remove
-                # ALL occurrences from server_scripts (the
-                # ``while``-loop guards against a corrupted/duplicated
-                # bucket; classifier output is unique today, but this
-                # is the kind of resilience the audit trail benefits
-                # from — see codex iter-1 review).
+                # Patch the storage_plan buckets so the on-disk plan matches
+                # the live RbxScript metadata. The ``while``-loop removes ALL
+                # occurrences from server_scripts (guards against a
+                # corrupted/duplicated bucket).
                 while sname in plan.server_scripts:
                     plan.server_scripts.remove(sname)
                 if sname not in plan.client_scripts:
                     plan.client_scripts.append(sname)
-                # Audit trail: storage_plan.decisions records the
-                # final placement using the SAME schema classifier
-                # writes (``script`` / ``script_type`` / ``container``
-                # / ``reason``) with a ``source="topology"``
-                # discriminator. Consumers iterating ``decisions`` can
-                # index any of the canonical 4 keys uniformly across
-                # both sources. ``intrinsic_script_type`` is the
-                # script's immutable transpile-time class
-                # (slice 5 round 3) — preserve it from the live
-                # RbxScript so resume-rehydration restores it instead
-                # of falling back to the post-coercion ``script_type``.
+                # Audit trail: storage_plan.decisions records the final
+                # placement using the SAME schema classifier writes
+                # (``script`` / ``script_type`` / ``container`` / ``reason``)
+                # with a ``source="topology"`` discriminator, so consumers
+                # iterate ``decisions`` uniformly across both sources.
+                # ``intrinsic_script_type`` is the script's immutable
+                # transpile-time class — preserve it from the live RbxScript
+                # so resume-rehydration restores it instead of the
+                # post-coercion ``script_type``.
                 plan.decisions.append({
                     "script": sname,
                     "script_type": "LocalScript",
@@ -5891,9 +6069,8 @@ script.Disabled = true
         ``plan_scene_runtime`` phase. ``domain_overrides`` is **sticky**:
         if an operator edited it into a prior on-disk plan, the value
         wins over whatever the planner produced (planner emits ``{}``;
-        PR3b's classifier never touches this key). Unknown keys present
-        on disk are preserved too — forward-compatible with future
-        schema extensions without re-touching every consumer.
+        the classifier never touches this key). Unknown keys present on disk
+        are preserved too — forward-compatible with future schema extensions.
         """
         import json as _json
 
@@ -6131,10 +6308,9 @@ script.Disabled = true
         """Phase 4.10 — emit referenced prefabs as Models in
         ReplicatedStorage.Templates, plus a thin PrefabSpawner helper.
 
-        Filters by ``ctx.serialized_field_refs`` (from PR 4 / Phase
-        4.9) so only prefabs that scripts actually reference get
-        emitted — preventing the rbxlx from bloating with every
-        parsed prefab in the project.
+        Filters by ``ctx.serialized_field_refs`` (from Phase 4.9) so only
+        prefabs that scripts actually reference get emitted — preventing the
+        rbxlx from bloating with every parsed prefab in the project.
         """
         from converter.prefab_packages import (
             generate_prefab_packages, write_packages_manifest,
@@ -6186,8 +6362,8 @@ script.Disabled = true
         if not result.templates:
             if result.unconverted:
                 # Surface drops to UNCONVERTED.md via the shared writer —
-                # the animation_result channel is the only carrier right
-                # now, so append there. Same pattern as PR 3 materials.
+                # the animation_result channel is the only carrier right now,
+                # so append there.
                 _carry_unconverted(self.state.animation_result, result.unconverted)
             return
 
@@ -6225,6 +6401,28 @@ script.Disabled = true
         # turret-fired bullets fall to the ground inert.
         self._attach_monobehaviour_scripts_to_templates()
 
+        # Addressables Unit 4 / Phase 1 — assemble the roster surface from
+        # ``addressables.by_label`` and extend the typed ``rosters`` channel.
+        # Both emit paths (rbxlx_writer + luau_place_builder) materialize a
+        # second, CollectionService-tagged, attributed instance per member under
+        # a dedicated ReplicatedStorage container. Trigger is structural (any
+        # label with >=1 emitted prefab) — no game-specific literal. Reuses
+        # ``resolved_template_names`` (prefab_id->template_name) and
+        # ``addr_block.by_label`` already in scope; no new resolver pass.
+        from converter.roster_assembly import assemble_rosters
+        by_label_raw = addr_block.get("by_label") or {}
+        if isinstance(by_label_raw, dict) and by_label_raw:
+            emitted_names = {
+                t.name for t in self.state.rbx_place.replicated_templates
+            }
+            rosters = assemble_rosters(
+                by_label=by_label_raw,
+                resolved_template_names=resolved_template_names,
+                emitted_template_names=emitted_names,
+                character_names=self._collect_character_names(scene_runtime),
+            )
+            self.state.rbx_place.rosters.extend(rosters)
+
         # Persist a small manifest under packages/ — closes the packages
         # half of Phase 4.11's disk-rewrite deferred item.
         try:
@@ -6237,6 +6435,77 @@ script.Disabled = true
             "ReplicatedStorage.Templates (%d in manifest)",
             len(result.templates), result.manifest.get("total_templates", 0),
         )
+
+    def _collect_character_names(
+        self, scene_runtime: dict[str, object]
+    ) -> dict[str, str]:
+        """Resolve prefab_id -> characterName for the roster surface (D5/P1).
+
+        Full fallback chain, per prefab (D5/§1.2/AC3):
+
+        1. FIELD-PRESENCE — the instance whose ``config`` CONTAINS the key
+           ``characterName`` (the consumer's ``GetAttribute("characterName")``
+           contract key, NOT a "Character" class literal). Ties (multiple
+           instances carrying ``characterName``) are broken ONLY via
+           ``modules[script_id]["class_name"]``; on remaining ties the
+           first-in-lifecycle instance is chosen and a warning logged.
+        2. ADDRESSABLE ADDRESS — when no instance carries a usable str
+           ``characterName``, fall back to the addressable address bound to that
+           prefab_id (the inverse of ``addressables.by_address``).
+        3. PREFAB/TEMPLATE STEM — when there is no address either, fall back to
+           the prefab's resolved Templates child name (``template_name``).
+
+        Every value read is narrowed with ``isinstance(v, str)`` — a non-str
+        candidate is skipped-with-warning (never coerced, never Any) and the
+        chain continues to the next rung. A prefab with no usable value at any
+        rung is omitted (the member is still tagged + clonable downstream).
+        """
+        out: dict[str, str] = {}
+        prefabs = scene_runtime.get("prefabs")
+        if not isinstance(prefabs, dict):
+            return out
+        modules = scene_runtime.get("modules")
+        modules_dict: dict[str, object] = modules if isinstance(modules, dict) else {}
+
+        # Rung 2 source: invert ``addressables.by_address`` (address -> [pid])
+        # into prefab_id -> address. First-seen address wins for a pid under
+        # multiple addresses (deterministic; by_address preserves insertion).
+        address_by_pid: dict[str, str] = {}
+        addr_block = scene_runtime.get("addressables")
+        if isinstance(addr_block, dict):
+            by_address = addr_block.get("by_address")
+            if isinstance(by_address, dict):
+                for address, ids in by_address.items():
+                    if not isinstance(address, str):
+                        continue
+                    if not isinstance(ids, (list, tuple)):
+                        continue
+                    for pid in ids:
+                        if isinstance(pid, str) and pid not in address_by_pid:
+                            address_by_pid[pid] = address
+
+        for pid, sub in prefabs.items():
+            if not isinstance(pid, str) or not isinstance(sub, dict):
+                continue
+
+            # --- Rung 1: field-presence on the prefab's instances ------------
+            name = _character_name_from_field(pid, sub, modules_dict)
+
+            # --- Rung 2: addressable address bound to this prefab_id ---------
+            if name is None:
+                addr = address_by_pid.get(pid)
+                if isinstance(addr, str) and addr:
+                    name = addr
+
+            # --- Rung 3: the prefab/template file stem -----------------------
+            if name is None:
+                stem = sub.get("template_name")
+                if isinstance(stem, str) and stem:
+                    name = stem
+
+            if name is not None:
+                out[pid] = name
+        return out
 
     def _attach_prefab_scoped_animation_scripts_to_templates(self) -> None:
         """Attach copies of prefab-scoped animation scripts under their
@@ -6379,8 +6648,8 @@ script.Disabled = true
         # ``.scripts`` (recursive). First-found wins; ties broken by
         # the flat list (most authoritative source).
         #
-        # PR #75 codex round-5 [P2]: index is Script-only. A user-
-        # authored MonoBehaviour transpiles to ``script_type="Script"``;
+        # Index is Script-only. A user-authored MonoBehaviour transpiles to
+        # ``script_type="Script"``;
         # the canonical ``EventDispatch`` ModuleScript that
         # ``_inject_runtime_modules`` adds shares the user's class
         # name and would otherwise win the flat-list ``setdefault``
@@ -6661,7 +6930,7 @@ script.Disabled = true
         rbx_place.scripts = new_scripts
 
     def _subphase_inject_scene_runtime(self) -> None:
-        """PR4: emit the scene-runtime host runtime + plan + entrypoints.
+        """Emit the scene-runtime host runtime + plan + entrypoints.
 
         Only fires when ``ctx.scene_runtime_mode == "generic"`` and the
         plan carries at least one runtime-bearing module. Injects four
@@ -6714,12 +6983,11 @@ script.Disabled = true
         host_path = runtime_dir / "scene_runtime.luau"
         existing_names = {s.name for s in self.state.rbx_place.scripts}
 
-        # R3-P2: a user (or earlier converter pass) script named e.g.
+        # A user (or earlier converter pass) script named e.g.
         # ``SceneRuntime`` must NOT be silently displaced by the autogen
-        # emit. Replace only scripts whose source carries the autogen
-        # marker we stamped on prior runs (and the runtime engine source
-        # which we identify by the comment at its top). The marker shape
-        # matches what each generator emits.
+        # emit. Replace only scripts whose source carries the autogen marker
+        # we stamped on prior runs; the marker shape matches what each
+        # generator emits.
         _AUTOGEN_MARKERS: dict[str, str] = {
             "SceneRuntime": "-- scene_runtime: PR4 generic host runtime",
             "SceneCameraInput": (
@@ -6782,18 +7050,14 @@ script.Disabled = true
             )
             return
 
-        # PR5 camera/input service: inject runtime/scene_camera_input.luau as a
+        # Camera/input service: inject runtime/scene_camera_input.luau as a
         # ReplicatedStorage ModuleScript UNCONDITIONALLY whenever the host
-        # runtime is emitted (P1-1). The SceneRuntimeClient entrypoint now
-        # ``require``s SceneCameraInput unconditionally (it reuses the camera
-        # service's pure pose helpers for the player-embodiment authority), so
-        # the prior lowering-gated ``any("SceneCameraInput" in s.source)``
-        # heuristic — which fired only when ``lower_camera_facet`` routed a
-        # controller to it — would leave the entrypoint's
-        # ``require(WaitForChild("SceneCameraInput"))`` stalling on a place with
-        # no look-method to lower. Emission only PLACES the ModuleScript; only a
-        # ``require`` executes it, so it is safe on the server too. A
-        # deterministic lowering-layer library, not a coherence pack.
+        # runtime is emitted. The SceneRuntimeClient entrypoint ``require``s
+        # SceneCameraInput unconditionally (it reuses the camera service's
+        # pure pose helpers for the player-embodiment authority), so a
+        # lowering-gated emit would leave that ``require`` stalling on a place
+        # with no look-method to lower. Emission only PLACES the ModuleScript;
+        # only a ``require`` executes it, so it is safe on the server too.
         cam_path = runtime_dir / "scene_camera_input.luau"
         if cam_path.exists():
             _replace_or_add(RbxScript(
@@ -6817,7 +7081,14 @@ script.Disabled = true
         # happen in-place on ``scene_runtime`` so the embedded plan
         # ModuleScript reflects the final shape.
         self._build_scriptable_object_module_map(scene_runtime)
+        self._build_static_event_channels(scene_runtime)
         self._rewrite_scene_runtime_asset_refs(scene_runtime)
+        # Unit-3: RECOMPUTE the addressable-db theme seed onto the in-memory
+        # scene_runtime in THIS window — after the SO map exists, before the
+        # plan module is filtered + emitted — so the (allowlisted) seed key is
+        # on the dict when generate_scene_runtime_plan_module runs. NOT persisted
+        # through conversion_plan.json; recomputed every write_output (D17).
+        self._build_theme_seed_plan(scene_runtime)
 
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
@@ -6923,6 +7194,249 @@ script.Disabled = true
             log.info(
                 "[write_output] scene-runtime generic: emitted %d "
                 "scriptable_object refs in plan map", len(so_map),
+            )
+
+    def _find_cs_source_for_module(self, module_name: str) -> str | None:
+        """Re-read a transpiled module's originating C# source off disk by class
+        name (``<module_name>.cs`` under the Unity project). The ``.cs`` files
+        persist, so this is resume-safe and does NOT depend on transient
+        ``transpilation_result`` (D17). Returns the source text or ``None``.
+        """
+        root = getattr(self, "unity_project_path", None)
+        if root is None:
+            return None
+        for cs in Path(root).rglob(f"{module_name}.cs"):
+            try:
+                return cs.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return None
+
+    def _build_theme_seed_plan(self, scene_runtime: dict[str, object]) -> None:
+        """RECOMPUTE ``scene_runtime["addressable_db_seeds"]`` — the per-DB seed
+        records the entrypoint shim replays at boot to populate an SO-loaded
+        database's write surface before its consumer-called ``LoadDatabase``
+        drains it (design-phase2 §2.2, D17).
+
+        Generic: the owned LABEL + store KEY field are derived from the
+        database's C# load method (``LoadAssetsAsync<T>(LABEL, …Add(op.F,op))``);
+        the WRITE SURFACE is derived from the transpiled DB module body and BOUND
+        to the list ``LoadDatabase`` drains (D16). On a drain-bind miss the DB
+        contributes NO record + a converter WARNING (loud abstain > silent dead).
+
+        RECOMPUTED every ``write_output`` — NOT persisted through
+        ``conversion_plan.json``. All inputs are rehydrated by ESSENTIAL phases
+        on a no-retranspile resume (the addressables groups + ``.cs`` re-read off
+        disk; the transpiled DB body from ``rbx_place.scripts[*].source`` which
+        ``materialize_and_classify`` rehydrates), so the seed is NOT
+        transpile-gated.
+        """
+        # Recompute is AUTHORITATIVE each run: clear any seed left on the dict by
+        # a prior run BEFORE any early-return/abstain, so every abstain path
+        # results in NO seed (loud, not a STALE record onto a now-wrong/dead
+        # registry). Without this, an abstain on a re-run keeps a stale seed and
+        # defeats the D16 fail-loud guarantee (codex P1).
+        scene_runtime.pop("addressable_db_seeds", None)
+        project_root = getattr(self, "unity_project_path", None)
+        if project_root is None:
+            return
+        so_map_obj = scene_runtime.get("scriptable_objects")
+        if not isinstance(so_map_obj, dict) or not so_map_obj:
+            return
+        so_map: dict[str, str] = {
+            g: p for g, p in so_map_obj.items()
+            if isinstance(g, str) and isinstance(p, str)
+        }
+        if not so_map:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # The SO-addressables surface: label/address -> emitted-SO guids. Re-parse
+        # the raw Addressables groups (the persisted ``scene_runtime.addressables``
+        # block is PREFAB-narrowed and has already dropped the .asset SO guids), so
+        # the SO label entries are present. Resume-safe (off-disk parse).
+        from unity.addressables_resolver import (
+            parse_addressables,
+            resolve_scriptable_object_addressables,
+        )
+        index = parse_addressables(project_root)
+        so_addr = resolve_scriptable_object_addressables(
+            index, guid_index, set(so_map.keys()),
+        )
+        if not so_addr.by_label and not so_addr.by_address:
+            return
+
+        scripts = list(getattr(self.state.rbx_place, "scripts", []) or [])
+        source_by_name: dict[str, str] = {}
+        for script in scripts:
+            name = getattr(script, "name", None)
+            src = getattr(script, "source", None)
+            if isinstance(name, str) and isinstance(src, str):
+                source_by_name.setdefault(name, src)
+
+        seeds: list[AddressableDbSeed] = []
+        # Dedupe by DB IDENTITY (module path), NOT the load key: two distinct DB
+        # modules may legitimately share an Addressables key and each needs its
+        # own seed.
+        seeded_db_paths: set[str] = set()
+        # The owning DB is the transpiled module whose originating C# issues a
+        # ``LoadAssetsAsync<T>(key, …)`` whose KEY has emitted SO guids. Unity's
+        # ``LoadAssetsAsync<T>(key)`` accepts a LABEL *or* an ADDRESS, so resolve
+        # the captured load key against BOTH indexes (union, deduped) — a
+        # database loaded by address would resolve to nothing in by_label alone.
+        for db_name, db_luau in sorted(source_by_name.items()):
+            cs_source = self._find_cs_source_for_module(db_name)
+            if cs_source is None:
+                continue
+            ownership = _derive_cs_load_ownership(cs_source)
+            if ownership is None:
+                continue
+            owned_guids: list[str] = []
+            _seen_owned: set[str] = set()
+            for guid in (
+                list(so_addr.by_label.get(ownership.label) or [])
+                + list(so_addr.by_address.get(ownership.label) or [])
+            ):
+                if guid not in _seen_owned:
+                    _seen_owned.add(guid)
+                    owned_guids.append(guid)
+            if not owned_guids:
+                # A derived DB-shaped module (LoadAssetsAsync<T> ownership +,
+                # below, a drain surface) that resolves to NO SO guids in either
+                # index is a likely-dead registry — fail loud, consistent with
+                # the drain-bind abstain warnings, rather than silently skip.
+                if _derive_drain_field(db_luau, ownership.load_method_name) is not None:
+                    log.warning(
+                        "[seed] %s load key %r resolves to no emitted SO guids "
+                        "(by_label or by_address) on %s; skipping — registry "
+                        "would be empty",
+                        ownership.load_method_name, ownership.label, db_name,
+                    )
+                continue
+
+            # The DB's own plan module path (so the runtime can require it). The
+            # DB is a runtime-bearing module; resolve its container the same way
+            # the SO map does — via its parent_path in rbx_place.scripts.
+            db_module_path = self._module_plan_path(db_name)
+            if db_module_path is None:
+                continue
+            if db_module_path in seeded_db_paths:
+                continue  # guard: never double-seed the SAME store
+
+            # Drain-bind detector (P1 — design-phase2 §1.4):
+            drain_field = _derive_drain_field(db_luau, ownership.load_method_name)
+            if drain_field is None:
+                log.warning(
+                    "[seed] could not bind write surface to %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
+            appender = _derive_appender_name(db_luau, drain_field)
+            if appender is _AMBIGUOUS_APPENDER:
+                # Multiple distinct public appenders feed the drained field — no
+                # single ingress can be chosen without guessing. Abstain loud
+                # rather than seed through an arbitrary surface (D16).
+                log.warning(
+                    "[seed] multiple appenders bind to the %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
+            if appender is None and not _drain_field_is_writable_table(db_luau, drain_field):
+                log.warning(
+                    "[seed] could not bind write surface to %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
+
+            so_module_paths: list[str] = []
+            seen_paths: set[str] = set()
+            for guid in owned_guids:
+                path = so_map.get(guid)
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    so_module_paths.append(path)
+            if not so_module_paths:
+                continue
+
+            seeds.append(AddressableDbSeed(
+                db_module_path=db_module_path,
+                load_method_name=ownership.load_method_name,
+                drain_field=drain_field,
+                appender_name=appender,
+                key_field=ownership.key_field,
+                so_module_paths=so_module_paths,
+            ))
+            seeded_db_paths.add(db_module_path)
+
+        if seeds:
+            scene_runtime["addressable_db_seeds"] = seeds
+            log.info(
+                "[write_output] scene-runtime generic: built %d addressable "
+                "db seed(s) (%d SO module(s) total)",
+                len(seeds), sum(len(s["so_module_paths"]) for s in seeds),
+            )
+
+    def _module_plan_path(self, module_name: str) -> str | None:
+        """The dotted DataModel path of a runtime-bearing module by name —
+        ``<parent_path>.<name>`` from ``rbx_place.scripts`` (the same shape the
+        SO map / scene-runtime plan use). Returns ``None`` if not present."""
+        for script in getattr(self.state.rbx_place, "scripts", []) or []:
+            if getattr(script, "name", None) == module_name:
+                container = getattr(script, "parent_path", None) or "ReplicatedStorage"
+                return f"{container}.{module_name}"
+        return None
+
+    def _build_static_event_channels(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """Build ``scene_runtime.static_channels`` — the C#-static-event channels
+        the host runtime pre-sets before any ``Awake`` batch so a producer +
+        consumer share the same BindableEvent field regardless of scene-vs-prefab
+        Awake order (the (d) ordering bug, design-phase1.md §2A).
+
+        Source of truth: the DETERMINISTIC C# ``static event`` enumeration
+        (``script_analyzer.analyze_script(...).static_events``) keyed by the same
+        canonical script id the module rows use (the ``.cs`` GUID). NEVER the
+        AI-emitted Luau. Module ``domain`` / ``container`` / ``module_path`` are
+        read off the now-final module rows (storage-classify already ran), so this
+        must run in write_output, not the planner phase.
+
+        Idempotent: rebuilds the list every run from the same deterministic inputs.
+        """
+        from unity.script_analyzer import analyze_script
+        from converter.scene_runtime_planner import build_static_event_channels
+
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict):
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # Enumerate C# static events for every module that resolves to a .cs path.
+        static_events_by_script_id: dict[str, list[str]] = {}
+        for script_id in modules_obj:
+            cs_path = guid_index.resolve(script_id)
+            if cs_path is None or cs_path.suffix != ".cs":
+                continue
+            events = analyze_script(cs_path).static_events
+            if events:
+                static_events_by_script_id[script_id] = events
+
+        channels = build_static_event_channels(
+            modules_obj, static_events_by_script_id,
+        )
+        scene_runtime["static_channels"] = channels
+        if channels:
+            log.info(
+                "[write_output] scene-runtime generic: emitted %d "
+                "static-event channel(s) across %d module(s)",
+                len(channels), len(static_events_by_script_id),
             )
 
     def _rewrite_scene_runtime_asset_refs(

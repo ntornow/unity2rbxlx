@@ -100,11 +100,11 @@ class ConversionContext:
     # GUID -> sliced sprite PNG path (from sprite_extractor).
     sprite_guid_to_file: dict[str, str] = field(default_factory=dict)
 
-    # Phase 4.9: per-script serialized field references.  Shape:
+    # Per-script serialized field references.  Shape:
     #   { relative_cs_path: { field_name: prefab_name_or_audio_ref } }
     # Populated after parse, before transpile_scripts. Consumed by the
     # transpiler (so the AI prompt knows which fields point at prefabs)
-    # and by 4.10 prefab packages (to know which prefabs to emit).
+    # and by the prefab-package emitter (to know which prefabs to emit).
     serialized_field_refs: dict[str, dict[str, str]] = field(default_factory=dict)
 
     # Project-level scene runtime artifact emitted by the
@@ -112,9 +112,9 @@ class ConversionContext:
     # ``converter.scene_runtime_planner.SceneRuntimeArtifact`` (modules /
     # scenes / prefabs / domain_overrides). Stored loosely typed here to
     # avoid a core→converter dependency; consumers narrow at the call site.
-    # PR1 emits the structural blocks; PR3b fills in per-module ``domain`` /
-    # ``container`` / ``module_path``. Survives ``_classify_storage``
-    # rewrites verbatim — see ``Pipeline._classify_storage``.
+    # Carries the structural blocks plus per-module ``domain`` / ``container`` /
+    # ``module_path``. Survives ``_classify_storage`` rewrites verbatim — see
+    # ``Pipeline._classify_storage``.
     scene_runtime: dict[str, object] = field(default_factory=dict)
 
     # Opt-in genre scaffolding requested by the caller. Persisted as a
@@ -128,30 +128,29 @@ class ConversionContext:
     # is empty.
     scaffolding: list[str] = field(default_factory=list)
 
-    # PR3b: requested scene-runtime contract mode. One of
+    # Requested scene-runtime contract mode. One of
     # ``"legacy"`` / ``"auto"`` / ``"generic"``. Plumbed in from the
     # front-door commands (``u2r convert/publish/eval``,
     # ``convert_interactive transpile/assemble/upload``); read by
     # ``Pipeline._classify_storage`` to gate the domain classifier
-    # so the legacy path stays byte-identical (per the design doc's
-    # "default output byte-identical" invariant carried over from PR3a).
+    # so the legacy path stays byte-identical.
     scene_runtime_mode: str = "legacy"
 
-    # Classifier-v2: requested networking mode for the domain classifier.
+    # Requested networking mode for the domain classifier.
     # ``"none"`` (default): single-player Unity ports — fallback = client.
     # ``"mirror"`` / ``"netcode"``: networked Unity projects — fallback =
     # server, Mirror-only signals active.
     # See ``converter/docs/design/scene-runtime-domain-signals.md``.
     networking_mode: str = "none"
 
-    # Classifier-v2: when True, the domain classifier still runs but the
+    # When True, the domain classifier still runs but the
     # pipeline rejects the conversion if any runtime-bearing module
     # comes out ``"excluded"`` or ``low_confidence`` after override
     # application. Default off so iteration cycles aren't blocked.
     strict_classification: bool = False
 
-    # TODO #8 (Roblox-dead module routing): module names the post-coherence
-    # dead-module pass flagged Roblox-dead on the run that transpiled. Persisted
+    # Module names the post-coherence dead-module pass flagged Roblox-dead
+    # on the run that transpiled. Persisted
     # as a sorted ``list[str]`` for JSON-friendliness; the pipeline reads it back
     # as a frozenset. Round-trips through ``conversion_context.json`` so a
     # no-transpile resume (preserve-scripts / ``--phase=write_output``, where

@@ -239,13 +239,12 @@ def _blank_keep_newlines(text: str) -> str:
 # pushes once; the single ``end`` at the bottom pops once -- regardless
 # of how many ``elseif`` / ``then`` clauses appear in between.
 #
-# This rule was a SPIKE-discovered fix from PR3a's compliance run:
-# the original ``then``+1 / ``end``-1 scheme inflated depth on
-# multi-clause ``if/elseif/elseif/end`` chains (extra ``then`` per
-# clause without matching ``end``) and silently dropped every
-# subsequent top-level statement -- producing rule-(d) false positives
-# on the largest modules (Mine, Pickup, Player, etc.). Test file
-# ``test_runtime_contract.py`` carries the regression fixture.
+# A ``then``+1 / ``end``-1 scheme would inflate depth on multi-clause
+# ``if/elseif/elseif/end`` chains (extra ``then`` per clause without a
+# matching ``end``) and silently drop every subsequent top-level
+# statement -- producing rule-(d) false positives on the largest
+# modules. Test file ``test_runtime_contract.py`` carries the
+# regression fixture.
 #
 # Known limitation (documented, not fixed): a top-level Luau
 # *if-expression* ``local x = if c then a else b`` opens an ``if`` that
@@ -1038,17 +1037,17 @@ def _check_gameobject_touch(stripped: str, source: str) -> list[Violation]:
 # Scope-aware token scan: ``script`` shadowed by a ``local`` only suppresses
 # violations within the SAME lexical scope (or an outer scope still in scope).
 # A harmless ``local script = self.config`` inside one function must not mask
-# a real ``script.Parent`` global access elsewhere in the module -- the
-# original module-wide bail was the Codex P3 finding on Fix #15. The walker
-# maintains a stack of scopes (one bool per enclosing block; True means
+# a real ``script.Parent`` global access elsewhere in the module -- a
+# module-wide bail would over-suppress. The walker maintains a stack of
+# scopes (one bool per enclosing block; True means
 # ``script`` is shadowed at this scope) and pushes/pops on Lua block
 # keywords.
 #
 # ``repeat...until`` has a special wrinkle: locals declared inside the
 # ``repeat`` block remain in scope for the ``until`` condition expression.
 # Popping on the ``until`` keyword itself would falsely flag
-# ``repeat local script = ... until script.Parent`` (Codex R2 finding). We
-# defer the pop to the first token whose position is past the end of the
+# ``repeat local script = ... until script.Parent``. We defer the pop to
+# the first token whose position is past the end of the
 # until-condition line -- in practice every realistic until-condition fits
 # on a single line, and the safe direction (delaying the pop) errs toward
 # fewer false positives, matching the rule's existing bias.

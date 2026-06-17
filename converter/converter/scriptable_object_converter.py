@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from unity.prefab_ref import prefab_id_for_ref, GuidIndexLike
+from unity.prefab_ref import prefab_id_for_ref, prefab_id_for_guid, GuidIndexLike
 
 if TYPE_CHECKING:
     from unity.guid_resolver import GuidIndex
@@ -67,6 +67,23 @@ def _lua_escape_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
+# Unity AssetReference: m_AssetGUID + m_CachedAsset both required;
+# m_SubObjectName (sub-asset) optional.
+_ASSETREF_REQUIRED = {"m_AssetGUID", "m_CachedAsset"}
+_ASSETREF_KEYS = {"m_AssetGUID", "m_CachedAsset", "m_SubObjectName"}
+
+
+def _is_asset_reference(d: dict[object, object]) -> bool:
+    """True iff *d* is a Unity AssetReference struct.
+
+    Requiring m_CachedAsset (not just m_AssetGUID) and subset-bounding the keys
+    keeps an unrelated m_AssetGUID-carrying struct from being swallowed — it
+    falls through to the generic-dict branch with its data intact.
+    """
+    keys = set(d.keys())
+    return _ASSETREF_REQUIRED <= keys <= _ASSETREF_KEYS
+
+
 def _value_to_lua(
     value: object,
     indent: int = 1,
@@ -95,6 +112,27 @@ def _value_to_lua(
     if isinstance(value, dict):
         if not value:
             return "{}"
+        # Unity AssetReference collapses to ONE prefab-id string in place of the
+        # whole struct (checked before the disjoint {fileID,guid,type} arm).
+        # Resolve on the bare-guid m_AssetGUID, falling back to the embedded
+        # m_CachedAsset; both via the shared .prefab filter.
+        if _is_asset_reference(value):
+            pid = None
+            if guid_index is not None:
+                guid = value.get("m_AssetGUID")
+                if isinstance(guid, str):
+                    pid = prefab_id_for_guid(guid, guid_index)
+                if pid is None:
+                    cached = value.get("m_CachedAsset")
+                    if isinstance(cached, dict):
+                        pid = prefab_id_for_ref(cached, guid_index)
+            if pid is not None:
+                if counts is not None:
+                    counts.resolved += 1
+                return f'"{_lua_escape_string(pid)}"'
+            if counts is not None:
+                counts.skipped += 1
+            return "nil --[[(Unity AssetReference)]]"
         # Check if it looks like a Unity object reference (fileID/guid)
         if set(value.keys()) <= {"fileID", "guid", "type"}:
             pid = prefab_id_for_ref(value, guid_index) if guid_index is not None else None

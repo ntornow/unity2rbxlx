@@ -147,6 +147,69 @@ _UNITY_TO_ROBLOX_CLASS.RectTransform = _CLASS_TRANSFORM_SELF
 -- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
+-- Addressable database seeding (Unit-3 theme registration)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim. For each SO-loaded database in
+-- ``plan.addressable_db_seeds`` it requires the DB + owned SO modules and
+-- appends each SO instance onto the DB's PROVEN write surface — the public
+-- appender bound to the drain field, ELSE that drain-field table directly
+-- (design-phase2 §1.4).
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- and BEFORE ``engine:start`` — before any lifecycle fires the once-only,
+-- ``themeDataList == nil``-guarded ``LoadDatabase`` drain. The shim does NOT call
+-- ``LoadDatabase`` or set ``loaded()``; the consumer-called ``LoadDatabase`` owns
+-- the drain + the ``m_Loaded = true`` transition. Generic no-op on an empty plan.
+function SceneRuntime.seedAddressableDatabases(plan, services)
+	assert(type(plan) == "table", "seedAddressableDatabases: plan required")
+	assert(type(services) == "table", "seedAddressableDatabases: services required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.addressable_db_seeds or {}
+	for _, seed in ipairs(seeds) do
+		local db = resolveModule(nil, seed.db_module_path)
+		if type(db) ~= "table" then
+			warn("[seed] database module did not resolve to a table: "
+				.. tostring(seed.db_module_path))
+		else
+			-- Proven write surface (drain-bound at build time): the public
+			-- appender fn, ELSE the drain-field table directly.
+			local append = nil
+			local appenderName = seed.appender_name
+			local drainField = seed.drain_field
+			if appenderName ~= nil and type(db[appenderName]) == "function" then
+				append = function(so) db[appenderName](so) end
+			elseif drainField ~= nil and type(db[drainField]) == "table" then
+				append = function(so) table.insert(db[drainField], so) end
+			else
+				warn("[seed] proven write surface absent at runtime on "
+					.. tostring(seed.db_module_path))
+			end
+
+			if append ~= nil then
+				local keyField = seed.key_field
+				for _, modPath in ipairs(seed.so_module_paths or {}) do
+					local so = resolveModule(nil, modPath)
+					-- Abstain on a require miss AND on a key-less SO: never write
+					-- under a key ``LoadDatabase`` cannot index by. The key field
+					-- is used ONLY to abstain — never to write the registry key
+					-- (that stays ``LoadDatabase``'s job).
+					if type(so) == "table"
+						and (keyField == nil or so[keyField] ~= nil) then
+						append(so)
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Constructor
 -- ---------------------------------------------------------------------
 
@@ -3174,6 +3237,66 @@ function SceneRuntime:_installToggleGraphicWatch()
 	self:_applyToggleGraphicBindings()
 end
 
+-- Static-event channel identity: pre-set module-table fields before Awake
+-- ---------------------------------------------------------------------
+
+-- For each planner ``static_channels`` entry on THIS side (domain matches the
+-- boot filter), require the declaring module and set ``mod[field_name]`` to a
+-- find-or-created BindableEvent named ``channel_name`` (the bare C# field) under a
+-- PER-MODULE ``module_folder`` Folder under ``parent_path`` — BEFORE any
+-- scene/prefab Awake batch. The per-module Folder is the structured identity that
+-- keeps two classes' same-named static events DISTINCT. The producer's inline
+-- ``Player.X = Player.X or (...)`` then short-circuits onto this instance, so the
+-- producer's ``:Fire`` and the consumer's ``if Player.X then ...:Connect`` resolve
+-- the SAME BindableEvent via the shared field regardless of Awake order.
+--
+-- Idempotent: ``findOrCreateChannel`` returns the existing instance on a name
+-- collision (no duplicate event); a re-set of an already-set field re-assigns the
+-- same instance (no duplicate connection). Same-domain only — the planner gates
+-- cross-domain signals out (they route via RemoteEvents).
+function SceneRuntime:_ensureStaticEventChannels(domainFilter)
+	local channels = self._plan.static_channels
+	if type(channels) ~= "table" then return end
+	local findOrCreateChannel = self._services.findOrCreateChannel
+	if type(findOrCreateChannel) ~= "function" then
+		-- No channel service wired (older entrypoint / harness without the
+		-- service): fail closed with a single diagnostic rather than silently
+		-- leaving consumers' Awake reads nil.
+		if #channels > 0 then
+			self._warn(
+				"[scene_runtime] static_channels present but no "
+				.. "findOrCreateChannel service; channel fields not pre-set")
+		end
+		return
+	end
+	for _, ch in ipairs(channels) do
+		-- Same-domain gate: a nil filter (harness) sets every channel; a
+		-- "client"/"server" filter sets only its side.
+		if (domainFilter == nil) or (ch.domain == domainFilter) then
+			local mod = self._services.resolveModule(ch.module_id, ch.module_path)
+			if type(mod) == "table" then
+				local event = findOrCreateChannel(
+					ch.channel_name, ch.parent_path, ch.module_folder)
+				if event ~= nil then
+					mod[ch.field_name] = event
+				else
+					self._warn(string.format(
+						"[scene_runtime] static channel %q under %q/%q could not "
+						.. "be created; consumer connects may be skipped",
+						tostring(ch.channel_name), tostring(ch.parent_path),
+						tostring(ch.module_folder)))
+				end
+			else
+				self._warn(string.format(
+					"[scene_runtime] static channel module %q (path=%s) did not "
+					.. "resolve to a table; field %q not pre-set",
+					tostring(ch.module_id), tostring(ch.module_path),
+					tostring(ch.field_name)))
+			end
+		end
+	end
+end
+
 -- ---------------------------------------------------------------------
 -- Boot: read the plan, drive every scene's lifecycle
 -- ---------------------------------------------------------------------
@@ -3196,6 +3319,18 @@ function SceneRuntime:start(domainFilter)
 			end
 		end
 	end
+
+	-- Phase 0.5: pre-set C#-static-event channel FIELDS before ANY Awake batch.
+	-- A C# ``public static event`` lowers to a BindableEvent stored on the
+	-- module-table field the producer fires (``Player.AmmoUpdate``) and the
+	-- consumer reads. The producer's prefab-batch Awake can run AFTER a
+	-- consumer's scene-batch Awake (scene Awake at the per-scene loop below
+	-- precedes the prefab-placement Awake), so a consumer reading the field at
+	-- its Awake sees nil and skips its ``:Connect``. Setting the field here —
+	-- once, before any Awake — makes the producer's untouched
+	-- ``Player.X = Player.X or (...)`` short-circuit onto this same instance, so
+	-- producer + consumer share the channel regardless of Awake order.
+	self:_ensureStaticEventChannels(domainFilter)
 
 	local sceneOrder = {}
 	for sceneKey, _ in pairs(self._plan.scenes or {}) do

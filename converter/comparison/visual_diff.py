@@ -313,6 +313,19 @@ def compute_pixel_diff(
     return percent_different, heatmap_path
 
 
+def quality_label(ssim: float) -> str:
+    """Return a human-readable quality label for the given SSIM score."""
+    if ssim >= 0.95:
+        return "Excellent"
+    if ssim >= 0.85:
+        return "Good"
+    if ssim >= 0.70:
+        return "Fair"
+    if ssim >= 0.50:
+        return "Poor"
+    return "Very Poor"
+
+
 def compare_images(
     image_a_path: str | Path,
     image_b_path: str | Path,
@@ -345,17 +358,7 @@ def compare_images(
     heatmap_out = output_dir / "diff_heatmap.png"
     pixel_pct, heatmap_path = compute_pixel_diff(image_a_path, image_b_path, heatmap_out)
 
-    # Quality label
-    if ssim_score >= 0.95:
-        label = "Excellent"
-    elif ssim_score >= 0.85:
-        label = "Good"
-    elif ssim_score >= 0.70:
-        label = "Fair"
-    elif ssim_score >= 0.50:
-        label = "Poor"
-    else:
-        label = "Very Poor"
+    label = quality_label(ssim_score)
 
     return {
         "ssim": ssim_score,

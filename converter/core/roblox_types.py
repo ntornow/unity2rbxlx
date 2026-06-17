@@ -73,31 +73,19 @@ class RbxScript:
     name: str
     source: str
     script_type: ScriptType = "Script"
-    # Phase 2a slice 5 round 2: the intrinsic Roblox script class as
-    # determined at the script's birth — either by the C# transpiler's
-    # ``_classify_script_type`` pass (for transpiled scripts) or by the
-    # producing module (animation generators, scaffolding, autogen) when
-    # they construct the RbxScript. Set ONCE at construction (typically
-    # mirrors ``script_type``) and NEVER mutated afterward.
+    # The intrinsic Roblox script class as determined at the script's birth
+    # (by the C# transpiler's classification pass for transpiled scripts, or
+    # by the producing module for generated scripts). Set ONCE at construction
+    # (typically mirrors ``script_type``) and NEVER mutated afterward — unlike
+    # the mutable ``script_type`` above, which storage classification and the
+    # topology apply phase may reassign. Consumers needing the PRE-coercion
+    # class read this immutable field via
+    # ``scene_runtime_planner.derive_intrinsic_script_class``.
     #
-    # The mutable ``script_type`` field above gets reassigned by
-    # ``storage_classifier.classify_storage`` (Script→LocalScript
-    # coercion for StarterPlayer*/StarterCharacterScripts containers,
-    # see ``storage_classifier.py:185-194``) and by
-    # ``pipeline._build_and_apply_topology``'s animation_drivers apply
-    # phase. Consumers that need to branch on the PRE-coercion class —
-    # the topology artifact's ``script_class`` field is the present one,
-    # and slice 6's storage decision tree will be the next — read
-    # through ``scene_runtime_planner.derive_intrinsic_script_class``
-    # which consults this immutable field.
-    #
-    # ``None`` is allowed for the small set of construction paths that
-    # genuinely cannot know the intrinsic value (e.g. rehydration from
-    # an on-disk plan whose stored ``script_type`` reflects the
-    # post-classifier value, never the pre-classifier one). The helper
-    # falls back to ``script_type`` in that case with an explicit
-    # comment that the fallback is for non-transpiled / rehydrated
-    # scripts only.
+    # ``None`` is allowed for construction paths that cannot know the intrinsic
+    # value (e.g. rehydration from an on-disk plan whose stored ``script_type``
+    # reflects the post-classifier value); the helper falls back to
+    # ``script_type`` in that case.
     intrinsic_script_type: ScriptType | None = None
     parent_path: str | None = None     # where to place in hierarchy
     # Relative path within ``<output_dir>/scripts/`` where this script was
@@ -159,10 +147,20 @@ class RbxScript:
     # rig fact. The contract verifier's binding-present fail-closed check reads it
     # via ``.get(...)`` with an absent->abstain guard, then INDEPENDENTLY scans the
     # source (anchored on ``field``/``child``) to confirm discharge — ``present``
-    # is a cross-check, not the gate. ``cam_receiver``/``cam_ordinal`` (REDESIGN r3)
+    # is a cross-check, not the gate. ``cam_receiver``/``cam_ordinal``
     # are deterministic resolver-fact projections that anchor check D's dead-write
-    # exemption (slice 1.2); they are stamped regardless of discharge.
+    # exemption; they are stamped regardless of discharge.
     rig_binding: dict[str, object] | None = None
+    # Per-script roster-consumer binding carrier (mirrors rig_binding): a
+    # JSON-native dict ``{"label": str, "receiver": str, "lowered": True}`` that
+    # survives ``json.dumps`` in the corpus regen, rehydrates as a plain dict via
+    # ``RbxScript(**s)`` in the corpus replay, and is stamped identically live.
+    # ``None`` for every script except an Addressables-label-roster CONSUMER that
+    # ``roster_consumer_lowering`` re-lowered to read Phase 1's by_label tagged
+    # surface. The dead-module analysis EXEMPTS a carrier-bearing module from the
+    # Roblox-dead set: the canonical re-lowered body is deterministically inert
+    # (would otherwise classify dead) yet live by construction (NEW-FINDING-B).
+    roster_binding: dict[str, object] | None = None
 
 
 @dataclass
@@ -478,6 +476,34 @@ class RbxWaterRegion:
 
 
 @dataclass
+class RbxRosterMember:
+    """One member of an Addressables label roster.
+
+    Emitted as a clonable, CollectionService-tagged, attributed instance under a
+    dedicated roster container Folder in ReplicatedStorage. Describes a SECOND
+    materialized instance derived from the ``ReplicatedStorage.Templates.<template_name>``
+    tree (deep-copied with fresh referents/unity_file_ids on the rbxlx path;
+    rebuilt as a distinct live subtree on the luau path) — the canonical
+    Templates child is NEVER tagged/mutated. Both emit paths materialize this
+    second instance identically.
+    """
+    # The ReplicatedStorage.Templates child to clone (== prefab_id→template_name).
+    template_name: str
+    # CollectionService tag == the by_label label (the canonical discovery key).
+    tag: str
+    # At minimum {"characterName": <str>} when resolvable. Scalar-only values.
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
+
+
+@dataclass
+class RbxRoster:
+    """All roster members for one Addressables label."""
+    # The by_label key (e.g. ``<label>``); the tag every member carries.
+    label: str
+    members: list[RbxRosterMember] = field(default_factory=list)
+
+
+@dataclass
 class RbxPlace:
     """Complete Roblox place data."""
     workspace_parts: list[RbxPart] = field(default_factory=list)
@@ -496,6 +522,15 @@ class RbxPlace:
     # at runtime. Each entry is a fully-converted RbxPart tree whose
     # name matches the Unity prefab's stem.
     replicated_templates: list[RbxPart] = field(default_factory=list)
+    # Addressables label rosters (Unit 4 / Phase 1). Each roster describes a
+    # second materialized instance per ``addressables.by_label`` member, emitted
+    # under a dedicated container Folder in ReplicatedStorage, CollectionService-
+    # tagged with the label and carrying identity attributes (e.g. characterName)
+    # — the surface ``CharacterDatabase.LoadDatabase`` reads via
+    # ``CollectionService:GetTagged(<label>)``. Consumed IDENTICALLY by both emit
+    # paths (rbxlx_writer + luau_place_builder); the canonical Templates child is
+    # never tagged/mutated.
+    rosters: list[RbxRoster] = field(default_factory=list)
     # Per-terrain FillBlock Luau bodies, consumed by ``luau_place_builder``
     # ONLY during headless publish (where the Open Cloud Luau Execution API
     # cannot set the ``SmoothGrid`` BinaryString). The rbxlx writer

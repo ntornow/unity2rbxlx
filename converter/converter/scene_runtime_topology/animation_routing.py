@@ -69,9 +69,8 @@ NO_CTRL_KEY: str = "__none__"
 
 
 # Routing status enum. Replaces the older ``__orphan__`` magic-string
-# sentinel that codex flagged as fail-OPEN: stamping every unresolved
-# driver lookup as "orphan" hid resolver bugs behind invariant skips.
-# With an explicit status:
+# sentinel (fail-OPEN: stamping every unresolved driver lookup as "orphan"
+# hid resolver bugs behind invariant skips). With an explicit status:
 #   - ``resolved``: a driver was found in this scope and routes the
 #     animation. Invariants 1 + 6 enforce its module + domain.
 #   - ``unresolved``: same-scope resolution found 0 or 2+ candidates
@@ -147,8 +146,7 @@ class AnimationDriverEntry(TypedDict, total=False):
 
 # Characters reserved for the stable_id grammar. Percent-encoded inside
 # each segment so a Unity name containing ``:`` or ``%`` (rare but legal)
-# can't collide with the separator and produce a non-injective mapping
-# (codex W6).
+# can't collide with the separator and produce a non-injective mapping.
 _STABLE_ID_RESERVED = ":%"
 
 
@@ -178,7 +176,7 @@ def compute_stable_id(
     Format: ``<scope>:<ctrl_key|__none__>:<clip_disp>`` with each segment
     percent-encoded against the reserved chars ``:`` and ``%``. The
     encoding is injective — distinct segment tuples never produce the
-    same string (codex W6 fix).
+    same string.
 
     ``scope`` is the planner-stable scope identifier the topology
     consumes (a scene namespace like ``Assets/Scenes/Main.unity`` or a
@@ -287,7 +285,7 @@ def resolve_driver(
     ``(driver_module_guid, driver_domain)`` or ``None`` (caller marks
     the animation ``routing_status="unresolved"``).
 
-    Phase 1 narrowing — codex B2 fix:
+    Phase 1 narrowing:
       - Walk every reference in the scope.
       - Keep refs with ``target_component_type == "Animator"``.
       - Collapse refs by ``from_instance`` (one MB with two Animator
@@ -306,8 +304,7 @@ def resolve_driver(
     namespace like ``Assets/Scenes/Main.unity`` or a stable prefab id
     like ``<guid>:Assets/Prefabs/Door.prefab``). Bare display names
     (``"Door"``) will not resolve through scene_runtime's keying. See
-    ``EmittedAnimation`` in build_topology for the upstream contract
-    (codex B3 fix).
+    ``EmittedAnimation`` in build_topology for the upstream contract.
 
     Returns ``None`` for orphan scopes, scopes with no Animator-typed
     ref, ambiguous scopes with multiple distinct MB candidates, or a lone
@@ -343,14 +340,14 @@ def resolve_driver(
     if len(candidate_mbs) >= 2:
         # 2+ distinct Animator-referencing MBs → ambiguous. Param-name
         # matching can't establish animator identity (controller GUID +
-        # GO match), so Phase 2 does NOT run here (D11/DP4). Return None
+        # GO match), so Phase 2 does NOT run here. Return None
         # → caller stamps ``routing_status="unresolved"``.
         return None
     if len(candidate_mbs) == 0:
         # No serialized Animator ref pins a driver (the SimpleFPS Door
         # runtime-getter case). Run the Phase-2 C#-source narrowing pass:
         # match the clip's observed_attribute against each scope MB's
-        # Animator-param writes (D10/D12). Yields a unique driver or None.
+        # Animator-param writes. Yields a unique driver or None.
         return _narrow_driver_by_param_writes(
             scope_script_ids=list(instance_to_script.values()),
             modules=modules,
@@ -376,27 +373,26 @@ def _narrow_driver_by_param_writes(
     guid_index: GuidIndex | None,
     observed_attribute: str,
 ) -> tuple[str, str] | None:
-    """Phase-2 source narrowing (D10/D11/D12): when no serialized Animator
-    ref pins a driver, identify the scope MonoBehaviour whose C# writes the
-    clip's ``observed_attribute`` via ``Set*("<param>", …)`` on an
-    Animator-bound receiver. Returns ``(driver_module_guid, driver_domain)``
-    when EXACTLY ONE scope MB writes it, else ``None`` (server fallback).
+    """Phase-2 source narrowing: when no serialized Animator ref pins a
+    driver, identify the scope MonoBehaviour whose C# writes the clip's
+    ``observed_attribute`` via ``Set*("<param>", …)`` on an Animator-bound
+    receiver. Returns ``(driver_module_guid, driver_domain)`` when EXACTLY
+    ONE scope MB writes it, else ``None`` (server fallback).
 
     Args:
       scope_script_ids: every scope instance's ``script_id``
-        (``instance_to_script.values()``, D10/DP3 — NOT ``candidate_mbs``,
-        which is empty in the 0-ref case). Deduped here.
+        (``instance_to_script.values()`` — NOT ``candidate_mbs``, which is
+        empty in the 0-ref case). Deduped here.
       modules: ``scene_runtime.modules`` (for the matched MB's domain).
       guid_index: resolves a script_id GUID to its on-disk .cs path.
       observed_attribute: the clip's first Bool/Int/Trigger controller
-        param. Empty for autoplay clips (D12 fail-fast below).
+        param. Empty for autoplay clips (fail-fast below).
     """
-    # D12 fail-fast: autoplay clips (observed_attribute="") can never match
+    # Fail-fast: autoplay clips (observed_attribute="") can never match
     # a written param — reject before any source read.
     if not observed_attribute:
         return None
-    # No Unity project root → no C# source to read (unit-test default,
-    # edge case 7).
+    # No Unity project root → no C# source to read.
     if guid_index is None:
         return None
     matched: list[str] = []
@@ -411,7 +407,7 @@ def _narrow_driver_by_param_writes(
             matched.append(script_id)
     if len(matched) != 1:
         # 0 matches → no driver; ≥2 → ambiguous (multiple scope MBs write
-        # the same param). Both → None → server fallback preserved (D8).
+        # the same param). Both → None → server fallback preserved.
         return None
     driver_guid = matched[0]
     driver_module = modules.get(driver_guid, {})

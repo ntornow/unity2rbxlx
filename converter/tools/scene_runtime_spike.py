@@ -1,18 +1,18 @@
-"""scene_runtime_spike.py -- Compliance spike runner for PR3a.
+"""scene_runtime_spike.py -- Compliance spike runner.
 
 Drives the generic-runtime contract verifier over every MonoBehaviour
 in a Unity project and reports per-module + aggregate pre/post-reprompt
-pass rate. This is the gate measurement before PR3b/PR4 of the scene-
-runtime effort (see ``converter/docs/design/scene-runtime-contract.md``
-PR3a row -- the verifier pass rate is the single biggest unquantified
-risk in the effort).
+pass rate. This is the gate measurement for the scene-runtime effort
+(see ``converter/docs/design/scene-runtime-contract.md``) -- the
+verifier pass rate is the single biggest unquantified risk in the
+effort.
 
 What it does:
   1. Discovers every ``.cs`` script in the project via
      ``unity.script_analyzer.analyze_all_scripts``.
   2. Builds a SYNTHETIC ``scene_runtime`` artifact -- marks every
      MonoBehaviour/NetworkBehaviour-derived class as runtime_bearing.
-     This OVER-counts (PR1's planner additionally checks scene/prefab
+     This OVER-counts (the real planner additionally checks scene/prefab
      attachment) which is the right direction for a gate measurement:
      it stresses the verifier across the broadest possible MB surface
      the project ships.
@@ -97,8 +97,8 @@ class SpikeReport:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic planner artifact -- mirrors PR1's ``scene_runtime`` shape
-# without depending on PR1's planner code. The contract surface is the
+# Synthetic planner artifact -- mirrors the ``scene_runtime`` shape
+# without depending on the real planner code. The contract surface is the
 # artifact, not the planner.
 # ---------------------------------------------------------------------------
 
@@ -107,7 +107,7 @@ def _build_synthetic_scene_runtime(
 ) -> _SceneRuntimeArtifact:
     """Build a ``scene_runtime``-shaped dict directly from script_infos.
 
-    Marks every MonoBehaviour-derived class as runtime_bearing. PR1's
+    Marks every MonoBehaviour-derived class as runtime_bearing. The
     real planner filters this further (must be attached to a scene
     GameObject or prefab) -- the spike OVER-includes so we get the
     broadest possible compliance measurement.
@@ -118,7 +118,7 @@ def _build_synthetic_scene_runtime(
         # Skip editor / test scripts -- they're never converted.
         if info.is_editor_script or info.is_test_script:
             continue
-        # Use the file path as a synthetic script id (PR1 uses .cs GUID).
+        # Use the file path as a synthetic script id (the real planner uses .cs GUID).
         # The contract pipeline doesn't depend on the id format; it only
         # needs ``stem`` for the require resolver + ``runtime_bearing``
         # for the target switch.
@@ -316,7 +316,7 @@ def main(
 
     Drives every MonoBehaviour through the generic-runtime transpile
     pipeline and records per-module pre/post-reprompt verifier pass
-    rate. Use the report to decide whether the PR3a → PR3b/PR4 gate
+    rate. Use the report to decide whether the scene-runtime gate
     has cleared.
 
     Example (run from the ``converter/`` directory):

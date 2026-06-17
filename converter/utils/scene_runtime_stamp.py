@@ -1,6 +1,6 @@
 """scene_runtime_stamp.py -- ``.scene-runtime-mode`` output-dir sidecar.
 
-Part of PR3b. A generic-mode run produces output that differs from
+A generic-mode run produces output that differs from
 legacy on three persisted surfaces (``storage_plan``, ``.luau`` bodies,
 ``conversion_plan.json``) — per-surface isolation between modes is
 whack-a-mole. The contract pins ``--scene-runtime=legacy|auto|generic``
@@ -25,7 +25,7 @@ The contract:
 
 Stamp file format: a single line, no newline, one of
 ``"legacy"`` / ``"auto"`` / ``"generic"``. Absent file is treated as
-the legacy mode (forward-compat with pre-PR3b output directories).
+the legacy mode (forward-compat with older output directories).
 """
 
 from __future__ import annotations

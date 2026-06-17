@@ -618,12 +618,7 @@ def convert_particle_system(properties: dict[str, Any]) -> RbxParticleEmitter | 
 
             # radiusThickness: 1.0 = surface only, 0.0 = volume fill
             radius_thickness = float(shape.get("radiusThickness", 1.0))
-            if radius_thickness >= 0.9:
-                emitter.shape_in_out = "Outward"
-            elif radius_thickness <= 0.1:
-                emitter.shape_in_out = "InAndOut"
-            else:
-                emitter.shape_in_out = "Outward"
+            emitter.shape_in_out = "InAndOut" if radius_thickness <= 0.1 else "Outward"
 
     # -------------------------------------------------------------------
     # Color over lifetime -> ColorSequence
@@ -1348,7 +1343,7 @@ def _extract_color_gradient(
             r = float(color_key.get("r", 1.0))
             g = float(color_key.get("g", 1.0))
             b = float(color_key.get("b", 1.0))
-            t = float(color_key.get("t", i / 7.0 if i < 8 else 1.0))
+            t = float(color_key.get("t", i / 7.0))
             # Skip keys that look like unused padding
             if i > 1 and t == 0.0 and r == 0.0 and g == 0.0 and b == 0.0:
                 continue

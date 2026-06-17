@@ -750,16 +750,12 @@ def _apply_scroll_properties(element: RbxUIElement, props: dict[str, Any]) -> No
     """Extract scroll properties from Unity ScrollRect → Roblox ScrollingFrame."""
     horizontal = props.get("m_Horizontal", 1)
     vertical = props.get("m_Vertical", 1)
-    if not hasattr(element, 'attributes'):
-        element.attributes = {}
     element.attributes["_ScrollHorizontal"] = bool(int(horizontal))
     element.attributes["_ScrollVertical"] = bool(int(vertical))
 
 
 def _apply_slider_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
     """Extract Slider properties as attributes for runtime scripts."""
-    if not hasattr(element, 'attributes'):
-        element.attributes = {}
     for key in ("m_MinValue", "m_MaxValue", "m_Value", "m_WholeNumbers"):
         val = props.get(key)
         if val is not None:
@@ -785,15 +781,11 @@ def _apply_inputfield_properties(element: RbxUIElement, props: dict[str, Any]) -
     if isinstance(placeholder, dict):
         # The placeholder is a reference to a child Text component
         # Store the reference for post-processing
-        if not hasattr(element, 'attributes'):
-            element.attributes = {}
         element.attributes["_PlaceholderRef"] = str(placeholder.get("fileID", ""))
     char_limit = props.get("m_CharacterLimit", 0)
     try:
         cl = int(char_limit)
         if cl > 0:
-            if not hasattr(element, 'attributes'):
-                element.attributes = {}
             element.attributes["_CharacterLimit"] = cl
     except (TypeError, ValueError):
         pass
@@ -801,8 +793,6 @@ def _apply_inputfield_properties(element: RbxUIElement, props: dict[str, Any]) -
 
 def _apply_dropdown_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
     """Extract Dropdown/TMP_Dropdown properties as attributes."""
-    if not hasattr(element, 'attributes'):
-        element.attributes = {}
     value = props.get("m_Value", 0)
     try:
         element.attributes["DropdownValue"] = int(value)

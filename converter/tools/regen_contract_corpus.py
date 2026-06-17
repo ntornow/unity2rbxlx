@@ -70,17 +70,14 @@ _FIELDS = (
     "parent_path",
     "source_path",
     "requires_part_parent",
-    # The child-ref resolution tally the check-D backstop reads. Without it the
-    # field is never copied into fixture.json and check D goes DEAD on the corpus.
+    # The child-ref resolution tally the check-D backstop reads. Keep it in
+    # _FIELDS: without it the field is never copied into fixture.json and check D
+    # goes DEAD on the corpus.
     "child_ref_resolution",
     # The rig-retarget binding carrier the binding-present fail-closed check reads.
-    # The captured dict carries ALL FIVE keys verbatim ({field, child, present,
-    # cam_receiver, cam_ordinal}); cam_receiver/cam_ordinal are check D's dead-write
-    # exemption anchor. Without "rig_binding" in _FIELDS the carrier is never copied
-    # into fixture.json and rig_binding_present goes DEAD on the corpus (abstains
-    # green-for-the-wrong-reason instead of asserting the discharged Player binding).
-    # The fixture assertion in test_contract_corpus.py confirms both keys land on the
-    # committed Player carrier.
+    # Keep it in _FIELDS: without it the carrier is never copied into fixture.json
+    # and rig_binding_present goes DEAD (abstains green-for-the-wrong-reason
+    # instead of asserting the discharged Player binding).
     "rig_binding",
 )
 
@@ -164,9 +161,7 @@ def _capture(project: str, project_path: Path, networking: str) -> dict[str, obj
         "captured_via": "u2r.py convert --scene-runtime=generic (real AI)",
         "expected_counts": counts,  # info-severity rows allowed; warnings == 0
         # Coverage facts the replay test asserts so a "0 violations" result can't
-        # be vacuous (codex review P1): a flipped check that silently scanned
-        # NOTHING would otherwise pass green-for-the-wrong-reason. Pins the
-        # number of constructs each check actually ran over.
+        # be vacuous: pins the number of constructs each check actually ran over.
         "coverage": _coverage(captured["topology"], scripts),  # type: ignore[arg-type]
         "topology": captured["topology"],
         "scripts": captured["scripts"],

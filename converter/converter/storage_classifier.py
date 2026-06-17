@@ -72,20 +72,11 @@ STARTER_CHARACTER_SCRIPTS = "StarterPlayer.StarterCharacterScripts"
 STARTER_GUI = "StarterGui"
 
 
-# Phase 2a slice 7 round 3 (2026-05-30): the regex-based client-only /
-# server-only API pattern lists were originally DELETED in slice 7
-# because the topology path consumes ``infer_module_domains`` upstream
-# (via the slice-6 prepass). HOWEVER, round 2 review (Codex R2 P1 #4)
-# found this silently degraded the LEGACY FALLBACK path -- a Script
-# using ``Players.LocalPlayer`` that escapes
-# ``code_transpiler._classify_script_type``'s Script -> LocalScript
-# promotion would land in the fallback as ``script_type == "Script"``
-# and route to ServerScriptService where ``LocalPlayer`` is nil at
-# runtime. Round 3 restores the patterns + helpers as
-# **FALLBACK-PATH ONLY** infrastructure. The topology path does NOT
-# consume them. See ``_scripts_with_client_apis`` and
-# ``_scripts_with_server_apis`` below for the contract and deletion
-# pre-condition.
+# Client-only API patterns. FALLBACK-PATH ONLY: the topology path classifies
+# via ``infer_module_domains`` and does NOT consume these. They guard the
+# legacy fallback so a Script using ``LocalPlayer`` (where ``LocalPlayer`` is
+# nil on the server) is not routed to ServerScriptService. See
+# ``_scripts_with_client_apis`` / ``_scripts_with_server_apis``.
 _CLIENT_ONLY_PATTERNS = [
     r"Players\.LocalPlayer",
     r'GetService\(["\']Players["\']\)\.LocalPlayer',
@@ -114,12 +105,8 @@ _SERVER_ONLY_PATTERNS = [
 ]
 
 # Name hints for ReplicatedFirst scripts (loaders / splash screens that must
-# run before full replication). Public: `scene_runtime_planner` imports it
-# as the single source of truth for the loader-name heuristic, stamping
-# `is_loader` on each module row (Phase 2a slice 2). Promoting from the
-# pre-slice-2 `_REPLICATED_FIRST_HINTS` keeps storage_classifier as the
-# canonical owner of the pattern — planner is a reader, not a divergent
-# fork.
+# run before full replication). Public: `scene_runtime_planner` imports it as
+# the single source of truth for the loader-name heuristic.
 REPLICATED_FIRST_HINTS = re.compile(
     r"(?i)(loading|loader|boot|bootstrap|splash|preload|intro)"
 )
@@ -154,34 +141,18 @@ class StoragePlan:
     # Audit trail. Each entry is a dict carrying:
     #   ``script``                 — script name
     #   ``script_type``            — final ``Script`` / ``LocalScript`` /
-    #                                ``ModuleScript`` (post-classifier;
-    #                                may have been coerced from the
-    #                                intrinsic value).
-    #   ``intrinsic_script_type``  — Phase 2a slice 5 round 3: the
-    #                                immutable transpile-time class
-    #                                (``RbxScript.intrinsic_script_type``)
-    #                                captured BEFORE this classifier's
-    #                                ``Script→LocalScript`` coercion. May
-    #                                be ``None`` for scripts produced
-    #                                outside the transpile path (older
-    #                                construction sites that have not been
-    #                                migrated to stamp the field). Used by
-    #                                ``pipeline._rehydrate_scripts_from_disk``
-    #                                to restore the immutable field on
-    #                                resume so the cycle classifier→
-    #                                rehydrate→classifier preserves the
-    #                                intrinsic reading.
+    #                                ``ModuleScript`` (post-classifier).
+    #   ``intrinsic_script_type``  — the immutable transpile-time class
+    #                                captured BEFORE the ``Script→LocalScript``
+    #                                coercion; ``None`` for scripts built
+    #                                outside the transpile path. Restored on
+    #                                resume by ``_rehydrate_scripts_from_disk``.
     #   ``container``              — final dotted DataModel path
     #   ``reason``                 — human-readable decision rationale
-    #   ``source``                 — ``"classifier"`` (regex-based) or
-    #                                ``"topology"`` (scene_runtime_topology
-    #                                overrides — added in PR #148 /
-    #                                scene-runtime topology authority).
-    # Forward-compat: consumers iterating ``decisions`` index ``script`` /
-    # ``script_type`` / ``container`` / ``reason`` uniformly; ``source``
-    # is the discriminator for future per-source filtering. Values are
-    # ``str`` for every key EXCEPT ``intrinsic_script_type`` which may be
-    # ``None`` (older / non-transpile construction paths).
+    #   ``source``                 — ``"classifier"`` or ``"topology"``
+    #                                (scene_runtime_topology override).
+    # Values are ``str`` for every key EXCEPT ``intrinsic_script_type`` which
+    # may be ``None``.
     decisions: list[dict[str, str | None]] = field(default_factory=list)
 
     # Agent-applied overrides from manual editing of conversion_plan.json.
@@ -293,10 +264,9 @@ def classify_storage(
         elif container == SERVER_SCRIPT_SERVICE:
             if s.script_type == "LocalScript":
                 # Client script in SSS would never run — keep LocalScript, place
-                # in StarterPlayerScripts instead. Defense-in-depth: this is
-                # also caught by ``_enforce_hard_constraints`` below (slice 7),
-                # but the in-flow correction preserves the legacy auto-heal
-                # behavior callers expect.
+                # in StarterPlayerScripts instead. Also caught by
+                # ``_enforce_hard_constraints`` below; the in-flow correction
+                # preserves the auto-heal behavior callers expect.
                 s.parent_path = STARTER_PLAYER_SCRIPTS
                 container = STARTER_PLAYER_SCRIPTS
                 reason += " (forced to StarterPlayerScripts: LocalScript cannot live in SSS)"
@@ -861,27 +831,14 @@ def _decide_script_container_legacy(
     if s.script_type == "LocalScript":
         return STARTER_PLAYER_SCRIPTS, "LocalScript (default container)"
 
-    # Round 3 (Codex R2 P1 #4): a Script with client-only API
-    # surface that escaped ``_classify_script_type``'s
-    # ``Script -> LocalScript`` promotion routes to
-    # StarterPlayerScripts. The downstream auto-coercion at
-    # ``classify_storage`` flips ``script_type`` to ``LocalScript``
-    # so ``_enforce_hard_constraints`` does not raise.
-    #
-    # Round 4 (this slice's R3 review, P1 reclassification from
-    # P2-NEW-A): the ``and s.name not in server_touchers`` guard
-    # mirrors legacy slice-6 line 426. Without it, a Script that
-    # touches BOTH ``Players.LocalPlayer`` AND ``DataStoreService``
-    # would coerce to ``LocalScript`` in SPS — but ``DataStoreService``
-    # is server-only and raises "DataStoreService cannot be used on
-    # the client" at runtime. Legacy fail-CLOSED to server (drop
-    # through to the ``server_touchers`` branch / default SSS); slice
-    # 7 R3 had inverted the failure mode to fail-OPEN to client.
-    # Restoring the guard re-establishes the legacy contract: a
-    # dual-surface Script lands in SSS where the server APIs work,
-    # even if some client-side calls fail there (server can call
-    # client-replicated APIs in many cases; the inverse is much
-    # less recoverable).
+    # A Script with client-only API surface that escaped the
+    # ``Script -> LocalScript`` promotion routes to StarterPlayerScripts;
+    # downstream auto-coercion flips ``script_type`` so
+    # ``_enforce_hard_constraints`` does not raise. The
+    # ``not in server_touchers`` guard fails CLOSED to server for a
+    # dual-surface Script (touches both client- and server-only APIs):
+    # it lands in SSS where the server APIs work, since a server can
+    # often call client-replicated APIs but not the inverse.
     if s.name in client_touchers and s.name not in server_touchers:
         return STARTER_PLAYER_SCRIPTS, (
             "fallback: Script with client-only API surface "
@@ -900,10 +857,10 @@ def _decide_script_container_legacy(
 def _enforce_hard_constraints(s: RbxScript, container: str) -> None:
     """Post-decision hard-constraint validator.
 
-    Phase 2a slice 7: defense-in-depth check. The decision tree +
-    in-flow corrections should never produce these pairs, but the
-    validator raises if a future edit slips through. The constraints
-    encode Roblox-engine impossibilities:
+    Defense-in-depth check. The decision tree + in-flow corrections
+    should never produce these pairs, but the validator raises if a
+    future edit slips through. The constraints encode Roblox-engine
+    impossibilities:
 
       * LocalScript in ServerScriptService -- would silently never
         run (engine ignores LocalScripts under server services).

@@ -1,19 +1,9 @@
-"""edge_enrichment -- Phase 2b component-ref (Class 1) bridge-member
-enrichment.
+"""edge_enrichment -- component-ref (Class 1) bridge-member enrichment.
 
 Runs inside ``Pipeline._maybe_run_topology_prepass`` AFTER the structural
-producer (``compute_cross_domain_edges``) emits its raw rows.
-
-**Phase 2b reframe (2026-06-01).** The empirical whole-plan review split
-cross-domain authority into two bridge classes (design doc §"Phase 2b").
-This pass now enriches ONLY the Class-1 component-ref edges. The Class-2
-dynamic shared-flag work (the ``compute_shared_attribute_candidates``
-fan-out + the post-transpile ``:GetAttribute`` Luau scan that fed
-candidate ``consumer`` rows) was RETIRED — the seed mis-modeled the
-dynamic class as the static class. The shared-flag channel is now
-recorded as a distinct ``shared_flag_channels`` fact
-(``shared_flag_channels.py``), which reuses the ``:GetAttribute`` reader
-scan for its own purpose; this module no longer scans transpiled source.
+producer (``compute_cross_domain_edges``) emits its raw rows. Enriches
+ONLY the Class-1 component-ref edges; the Class-2 dynamic shared-flag
+channel is recorded separately in ``shared_flag_channels.py``.
 
 The enrichment fills ``bridge_member_scripts`` on every component-ref
 edge, branching on ``edge["from_domain"]`` (the producer's domain) so the

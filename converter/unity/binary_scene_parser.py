@@ -174,7 +174,7 @@ def parse_binary_scene(scene_path: Path) -> ParsedScene:
         rot = t_data.get("rotation", (0, 0, 0, 1))
         scale = t_data.get("scale", (1, 1, 1))
 
-        # Extract mesh GUID from MeshFilter/MeshRenderer/SkinnedMeshRenderer
+        # Extract mesh GUID from MeshFilter/SkinnedMeshRenderer
         mesh_guid = None
         components = []
         for comp in go_data["components"]:

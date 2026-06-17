@@ -115,8 +115,7 @@ def derive_module_lifecycle_role(
     boolean True falls through to the class-driven default
     (auto_run / requireable). This matches storage_classifier's
     parallel decision tree and surfaces the inconsistency at the
-    output rather than encoding it (codex review 2026-05-28 P2 on
-    slice 2 round 1).
+    output rather than encoding it.
 
     ``is_loader`` is additionally gated by
     ``script_class != "ModuleScript"``: a ModuleScript by definition
@@ -125,12 +124,11 @@ def derive_module_lifecycle_role(
     (e.g. ``LoadingUtils`` required by a real Loader script) routes
     to ``"requireable"``, NOT ``"loader"`` — matches
     ``storage_classifier._decide_script_container``'s
-    ``script_type != "ModuleScript"`` skip (codex review 2026-05-28
-    P2 on slice 2 initial).
+    ``script_type != "ModuleScript"`` skip.
 
     ``character_attached`` is symmetrically gated by
-    ``script_class != "ModuleScript"`` (slice 7 round 3, Claude P2
-    finding): a ModuleScript placed in StarterCharacterScripts does
+    ``script_class != "ModuleScript"``: a ModuleScript placed in
+    StarterCharacterScripts does
     not auto-run on character spawn — Roblox only auto-instantiates
     Script / LocalScript under StarterCharacterScripts. A
     ModuleScript whose name pattern triggered ``character_attached``

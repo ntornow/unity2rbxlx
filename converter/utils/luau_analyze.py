@@ -70,5 +70,5 @@ def syntax_errors_for_source(source: str, timeout: float = 10.0) -> list[str]:
             for line in syntax_errors_for_file(tmp_path, timeout=timeout)
         ]
     finally:
-        f.close()  # idempotent if already closed
+        f.close()
         Path(tmp_path).unlink(missing_ok=True)

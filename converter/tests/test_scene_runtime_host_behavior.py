@@ -3726,6 +3726,196 @@ class TestScenePrefabPlacementDeferredTiers:
 
 
 # ---------------------------------------------------------------------------
+# Static-event channel identity (RED/GREEN ordering-race proof).
+#
+# A UI-owned CONSUMER boots in an early scene batch and reads the producer's
+# module FIELD at its Awake; the PRODUCER boots in a LATER batch and lazily
+# creates + assigns the same field, then fires it. Without the runtime channel
+# pre-set, the consumer's Awake sees the field nil -> skips its :Connect ->
+# the producer's later :Fire reaches nobody. The fix pre-sets the field before
+# any Awake so the producer's ``X = X or (...)`` short-circuits onto the same
+# instance the consumer connected to (object identity ==).
+# ---------------------------------------------------------------------------
+
+class TestStaticEventChannelIdentity:
+
+    # Shared scenario body. The consumer lives in scene "A" (sorted first, so
+    # its Awake batch runs BEFORE scene "B"'s). The producer lives in scene "B".
+    # Both reference one shared ``Producer`` module table (the same cached
+    # require table production shares), so a field set on it is visible to both.
+    _SCENARIO = """\
+        -- The shared producer module table (one cached require table).
+        local Producer = {} ; Producer.__index = Producer
+        function Producer.new(_) return setmetatable({}, Producer) end
+        function Producer:Awake()
+            -- Lazy AI-emitted channel init: create + assign the FIELD, then fire.
+            Producer.Channel = Producer.Channel or (function()
+                local b = {Event = {}, _fired = {}}
+                b.Event.Connect = function(_, fn)
+                    b._fn = fn ; return {Disconnect = function() end}
+                end
+                b.Fire = function(self, v) if self._fn then self._fn(v) end end
+                b._isProducerMade = true
+                return b
+            end)()
+            print("PRODUCER_FIELD=" .. tostring(Producer.Channel))
+            Producer.Channel:Fire(42)
+        end
+
+        -- Consumer reads the producer FIELD at ITS Awake (earlier batch).
+        local Consumer = {} ; Consumer.__index = Consumer
+        function Consumer.new(_) return setmetatable({}, Consumer) end
+        function Consumer:Awake()
+            print("CONSUMER_FIELD_AT_AWAKE=" .. tostring(Producer.Channel))
+            if Producer.Channel then
+                Producer.Channel.Event:Connect(function(v)
+                    print("CONSUMER_RECEIVED=" .. tostring(v))
+                end)
+            else
+                print("CONSUMER_SKIPPED_CONNECT")
+            end
+        end
+
+        local plan = {
+            modules = {
+                prod = {stem = "Producer", runtime_bearing = true,
+                        domain = "client", module_path = "RS.Producer"},
+                cons = {stem = "Consumer", runtime_bearing = true,
+                        domain = "client", module_path = "RS.Consumer"},
+            },
+            scenes = {
+                -- "A" sorts before "B": Consumer's Awake runs first.
+                A = {
+                    instances = {{instance_id = "A:1", script_id = "cons",
+                                  game_object_id = "go_c", active = true,
+                                  enabled = true, config = {}}},
+                    references = {}, lifecycle_order = {"A:1"},
+                },
+                B = {
+                    instances = {{instance_id = "B:1", script_id = "prod",
+                                  game_object_id = "go_p", active = true,
+                                  enabled = true, config = {}}},
+                    references = {}, lifecycle_order = {"B:1"},
+                },
+            },
+            prefabs = {}, domain_overrides = {},
+            STATIC_CHANNELS_PLACEHOLDER
+        }
+        local modules = {prod = Producer, cons = Consumer}
+        local instances = {
+            go_c = {Name = "ConsumerGo", _sceneRuntimeId = "go_c", _children = {}},
+            go_p = {Name = "ProducerGo", _sceneRuntimeId = "go_p", _children = {}},
+        }
+        local services = servicesFor(plan, modules, instances)
+        -- A shared find-or-create BindableEvent service: returns one stable
+        -- instance per channel name (idempotent), mirroring production.
+        local _channels = {}
+        services.findOrCreateChannel = function(name, parentPath, moduleFolder)
+            -- Key by the FULL channel location (parent/folder/name), mirroring the
+            -- real per-module Folder hierarchy — two channels with the same bare
+            -- name under DISTINCT folders are DISTINCT instances.
+            local key = tostring(parentPath) .. "/" .. tostring(moduleFolder)
+                .. "/" .. tostring(name)
+            if _channels[key] == nil then
+                local b = {Event = {}, _isChannelService = true}
+                b.Event.Connect = function(_, fn)
+                    b._fn = fn ; return {Disconnect = function() end}
+                end
+                b.Fire = function(self, v) if self._fn then self._fn(v) end end
+                _channels[key] = b
+            end
+            return _channels[key]
+        end
+        local engine = SceneRuntime.new(services, plan)
+        engine:start("client")
+        runDeferred()
+        print("DONE")
+    """
+
+    def test_red_without_fix_consumer_misses_producer_field(self):
+        """RED proof: with NO ``static_channels`` in the plan, the channel
+        pre-set has nothing to do; the consumer's Awake reads the field nil
+        and skips its connect, so the producer's later :Fire reaches nobody."""
+        scenario = textwrap.dedent(
+            self._SCENARIO.replace("STATIC_CHANNELS_PLACEHOLDER", "")
+        )
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # The consumer ran its Awake BEFORE the producer created the field.
+        assert "CONSUMER_FIELD_AT_AWAKE=nil" in lines, out
+        assert "CONSUMER_SKIPPED_CONNECT" in lines, out
+        # Producer fired, but no subscriber received -> the bug.
+        assert not any(l.startswith("CONSUMER_RECEIVED=") for l in lines), out
+
+    def test_green_with_fix_consumer_connects_same_instance_producer_fires(self):
+        """GREEN proof: with the plan's ``static_channels`` set, the runtime
+        pre-sets ``Producer.Channel`` BEFORE any Awake. The consumer connects
+        to that instance; the producer's ``X = X or (...)`` short-circuits onto
+        the SAME instance (object identity ==) and its :Fire reaches the
+        consumer regardless of scene-vs-scene Awake order."""
+        channels = (
+            'static_channels = {'
+            '{module_id = "prod", field_name = "Channel", '
+            'channel_name = "Channel", module_folder = "sec_Producer_aaaa", '
+            'parent_path = "RS", '
+            'module_path = "RS.Producer", domain = "client"}},'
+        )
+        scenario = textwrap.dedent(
+            self._SCENARIO.replace("STATIC_CHANNELS_PLACEHOLDER", channels)
+        )
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # Field is already set (non-nil) when the consumer's Awake runs.
+        assert "CONSUMER_FIELD_AT_AWAKE=nil" not in lines, out
+        assert "CONSUMER_SKIPPED_CONNECT" not in lines, out
+        # Object identity: the producer's ``or`` short-circuited onto the
+        # pre-set instance -> its :Fire(42) reached the consumer's :Connect.
+        assert "CONSUMER_RECEIVED=42" in lines, out
+
+    def test_idempotent_double_call_creates_no_duplicate(self):
+        """Calling the channel pre-pass twice must reuse the same BindableEvent
+        instance (find-or-create), not create a second one."""
+        scenario = textwrap.dedent("""\
+            local Producer = {} ; Producer.__index = Producer
+            local plan = {
+                modules = {prod = {stem = "Producer", runtime_bearing = true,
+                                   domain = "client", module_path = "RS.Producer"}},
+                scenes = {}, prefabs = {}, domain_overrides = {},
+                static_channels = {
+                    {module_id = "prod", field_name = "Channel",
+                     channel_name = "Channel",
+                     module_folder = "sec_Producer_aaaa", parent_path = "RS",
+                     module_path = "RS.Producer", domain = "client"}},
+            }
+            local services = servicesFor(plan, {prod = Producer}, {})
+            local _created = 0
+            local _channels = {}
+            services.findOrCreateChannel = function(name, parentPath, moduleFolder)
+                local key = tostring(parentPath) .. "/" .. tostring(moduleFolder)
+                    .. "/" .. tostring(name)
+                if _channels[key] == nil then
+                    _created = _created + 1
+                    _channels[key] = {_id = key}
+                end
+                return _channels[key]
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:_ensureStaticEventChannels("client")
+            local first = Producer.Channel
+            engine:_ensureStaticEventChannels("client")
+            local second = Producer.Channel
+            assert(first == second, "field must be the same instance across calls")
+            print("CREATED=" .. tostring(_created))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CREATED=1" in out, out
+        assert "DONE" in out, out
 # Slice 1.4: Addressables host address resolution
 #   instantiatePrefab(address) -> _resolveAddressToPrefabId -> prefab_id.
 #   AC4 (resolved id discriminates colliding base names at the runtime),

@@ -1477,6 +1477,168 @@ class TestHasCharacterController:
 
 
 # ---------------------------------------------------------------------------
+# build_static_event_channels.
+# Pure builder over (modules, C#-static-event map). Generic: no game-specific
+# literals — the channel set is the C# enumeration, gated to same-domain
+# runtime-bearing modules with a stamped module_path/container.
+# ---------------------------------------------------------------------------
+
+from converter.scene_runtime_planner import build_static_event_channels  # noqa: E402
+
+
+class TestBuildStaticEventChannels:
+
+    def _modules(self) -> dict[str, dict[str, object]]:
+        return {
+            "guidPlayer": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Player",
+            },
+            "guidServer": {
+                "runtime_bearing": True, "domain": "server",
+                "container": "ServerScriptService",
+                "module_path": "ServerScriptService.GameManager",
+            },
+            "guidHelper": {  # excluded: helper domain
+                "runtime_bearing": True, "domain": "helper",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Helper",
+            },
+            "guidExcluded": {  # excluded: domain=excluded
+                "runtime_bearing": True, "domain": "excluded",
+                "container": "ServerStorage",
+                "module_path": "ServerStorage.Dead",
+            },
+            "guidUnstamped": {  # excluded: no module_path yet
+                "runtime_bearing": True, "domain": "client",
+            },
+            "guidNotBearing": {  # excluded: not runtime-bearing
+                "runtime_bearing": False, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Lib",
+            },
+        }
+
+    def test_emits_one_row_per_event_same_domain_only(self):
+        se = {
+            "guidPlayer": ["AmmoUpdate", "HealthUpdate"],
+            "guidServer": ["Tick"],
+            "guidHelper": ["HelperEv"],     # gated out (helper)
+            "guidExcluded": ["DeadEv"],      # gated out (excluded)
+            "guidUnstamped": ["NoPath"],     # gated out (no module_path)
+            "guidNotBearing": ["LibEv"],     # gated out (not runtime-bearing)
+        }
+        channels = build_static_event_channels(self._modules(), se)
+        got = {(c["module_id"], c["field_name"]) for c in channels}
+        assert got == {
+            ("guidPlayer", "AmmoUpdate"),
+            ("guidPlayer", "HealthUpdate"),
+            ("guidServer", "Tick"),
+        }
+
+    def test_row_shape_and_parent_path_is_container(self):
+        from converter.scene_runtime_planner import _module_channel_folder
+        se = {"guidPlayer": ["AmmoUpdate"]}
+        [row] = build_static_event_channels(self._modules(), se)
+        # channel_name is now the BARE field; the per-module identity lives in a
+        # ``module_folder`` (opaque, derived from the UNIQUE module_id), and the
+        # event is parented under it within the container.
+        expected_folder = _module_channel_folder(
+            "guidPlayer", "ReplicatedStorage.Player")
+        assert row == {
+            "module_id": "guidPlayer",
+            "field_name": "AmmoUpdate",
+            "channel_name": "AmmoUpdate",
+            "module_folder": expected_folder,
+            "parent_path": "ReplicatedStorage",
+            "module_path": "ReplicatedStorage.Player",
+            "domain": "client",
+        }
+        # The folder token is dot-free (the runtime splits parent_path on ".").
+        assert "." not in expected_folder
+
+    def test_same_field_two_modules_same_container_distinct_channels(self):
+        # Cross-class channel aliasing: two DIFFERENT classes declaring
+        # the SAME static-event member name in the SAME container must NOT alias
+        # onto one BindableEvent. With the bare ``channel_name`` + a per-module
+        # ``module_folder``, each class's event lives under a DISTINCT folder, so
+        # ``findOrCreateChannel`` returns DISTINCT instances. Each row's
+        # ``field_name`` + ``channel_name`` stay the bare member name; the
+        # uniqueness is carried by ``module_folder``.
+        modules = {
+            "guidPlayer": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Player",
+            },
+            "guidEnemy": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Enemy",
+            },
+        }
+        se = {"guidPlayer": ["AmmoUpdate"], "guidEnemy": ["AmmoUpdate"]}
+        channels = build_static_event_channels(modules, se)
+        # Both keep the bare field name AND the bare channel name…
+        assert {c["field_name"] for c in channels} == {"AmmoUpdate"}
+        assert {c["channel_name"] for c in channels} == {"AmmoUpdate"}
+        # …but the per-module folders (hence the full channel locations) are
+        # DISTINCT — no aliasing.
+        folders = sorted(c["module_folder"] for c in channels)
+        assert len(set(folders)) == 2
+        locations = {(c["parent_path"], c["module_folder"], c["channel_name"])
+                     for c in channels}
+        assert len(locations) == 2
+
+    def test_flat_concat_delimiter_ambiguity_distinct_channels(self):
+        # Delimiter-ambiguity collision class: a flat ``<stem>_<field>`` concat
+        # aliases ``stem="A_B",field="C"`` with ``stem="A",field="B_C"`` (both →
+        # ``A_B_C``). The structured per-module folder identity eliminates this:
+        # each module gets a DISTINCT folder keyed on its UNIQUE module_id, so the
+        # two channels never collapse onto one location.
+        modules = {
+            "guidAB": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.A_B",
+            },
+            "guidA": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.A",
+            },
+        }
+        se = {"guidAB": ["C"], "guidA": ["B_C"]}
+        channels = build_static_event_channels(modules, se)
+        assert len(channels) == 2
+        # The full channel LOCATIONS (parent_path, module_folder, channel_name)
+        # must be DISTINCT — the flat concat would have collapsed them.
+        locations = {(c["parent_path"], c["module_folder"], c["channel_name"])
+                     for c in channels}
+        assert len(locations) == 2, (
+            f"delimiter-ambiguous channels must not collide: {channels}")
+        # And the dot-free folder tokens are distinct (keyed on module_id).
+        folders = {c["module_folder"] for c in channels}
+        assert len(folders) == 2
+        assert all("." not in f for f in folders)
+
+    def test_idempotent(self):
+        se = {"guidPlayer": ["AmmoUpdate", "HealthUpdate"], "guidServer": ["Tick"]}
+        modules = self._modules()
+        first = build_static_event_channels(modules, se)
+        second = build_static_event_channels(modules, se)
+        assert first == second
+
+    def test_empty_event_list_emits_nothing(self):
+        channels = build_static_event_channels(self._modules(), {"guidPlayer": []})
+        assert channels == []
+
+    def test_unknown_module_id_skipped(self):
+        channels = build_static_event_channels(
+            self._modules(), {"guidGhost": ["X"]},
+        )
+        assert channels == []
 # Slice 1.2 — prefab_id 3-way parity (AC14 / D6c / D11)
 # ---------------------------------------------------------------------------
 

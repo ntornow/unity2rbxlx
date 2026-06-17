@@ -220,11 +220,6 @@ def _load_fbx_via_assimp(
                     int(max(0, min(255, c.a * 255))),
                 )
 
-            faces = np.zeros((m.mNumFaces, 3), dtype=np.int32)
-            for j in range(m.mNumFaces):
-                f = m.mFaces[0]  # dummy — need pointer arithmetic
-                pass
-
             # Use proper face access via the mFaces pointer
             face_ptr = m.mFaces
             faces_list = []

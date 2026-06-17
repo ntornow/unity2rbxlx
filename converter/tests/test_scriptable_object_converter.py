@@ -578,3 +578,274 @@ class TestPrefabRefResolution:
             {"guid": PICKUP_GUID, "fileID": 184264, "type": 3}, idx
         )
         assert pid == PICKUP_ID
+
+
+class TestAssetReferenceResolution:
+    """Unity AssetReference (Addressables) structs —
+    ``{m_AssetGUID, m_CachedAsset[, m_SubObjectName]}`` — collapse to ONE
+    prefab-id string in place of the whole dict at SO-emit time. Non-prefab /
+    empty / dangling AssetReferences fall soft to ``nil``; a struct that merely
+    carries an ``m_AssetGUID`` (no ``m_CachedAsset``, or with extra fields) is
+    NOT swallowed and falls through to the generic-dict branch with its data
+    intact. Built on ``TestPrefabRefResolution``'s harness."""
+
+    # Reuse the existing harness helpers (same fixture shape).
+    _real_index = TestPrefabRefResolution._real_index
+    _write_asset = TestPrefabRefResolution._write_asset
+
+    def _assetref(self, guid: str, file_id: int = 1000011175313116) -> dict:
+        """A real-shaped Unity AssetReference: bare-guid m_AssetGUID + embedded
+        {fileID,guid,type} m_CachedAsset whose guid matches (as Unity emits)."""
+        return {
+            "m_AssetGUID": guid,
+            "m_CachedAsset": {"fileID": file_id, "guid": guid, "type": 3},
+        }
+
+    # --- AC-3: exact-id byte match on m_AssetGUID ------------------------
+
+    def test_assetref_resolves_to_exact_id(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        fields = {"themePrefab": self._assetref(PICKUP_GUID)}
+        out = _value_to_lua(fields, guid_index=idx)
+        assert f'themePrefab = "{PICKUP_ID}"' in out
+
+    # --- AC-1: prefabList emits a Luau list of STRINGS, not tables -------
+
+    def test_prefab_list_emits_strings_not_tables(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  prefabList:\n"
+            f"    - m_AssetGUID: {PICKUP_GUID}\n"
+            f"      m_CachedAsset: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n"
+            f"    - m_AssetGUID: {PICKUP_GUID}\n"
+            f"      m_CachedAsset: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        # EVERY element collapsed to a bare string literal, not a struct and not
+        # a nil marker: both AssetReferences resolve to the same id, so the
+        # resolved-string literal must appear exactly twice and NO AssetReference
+        # nil marker may leak in. (A bare `"<id>" in src` would pass even if one
+        # element silently collapsed to `nil --[[(Unity AssetReference)]]`.)
+        assert src.count(f'"{PICKUP_ID}"') == 2
+        assert "nil --[[(Unity AssetReference)]]" not in src
+        assert "AssetGUID" not in src
+        assert "CachedAsset" not in src
+
+    # --- AC-2: consumer-shape match (byte-identical to object-ref arm) ----
+
+    def test_assetref_string_matches_object_ref_string(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        # AssetReference and a plain {fileID,guid,type} object-ref on the SAME
+        # guid must emit byte-identical prefab-id strings.
+        ref_out = _value_to_lua(
+            {"collectiblePrefab": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3}},
+            guid_index=idx,
+        )
+        ar_out = _value_to_lua(
+            {"collectiblePrefab": self._assetref(PICKUP_GUID)}, guid_index=idx
+        )
+        assert ref_out == ar_out
+        assert f'"{PICKUP_ID}"' in ar_out
+
+    # --- AC-4: non-prefab / empty / all-zero / dangling -> nil -----------
+
+    def test_non_prefab_assetref_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        guid = "e1a536f74c7ef384a8d7132148ace0c8"
+        idx = self._real_index(proj, (guid, "Assets/UI/themeIcon.png", "texture"))
+        out = _value_to_lua({"themeRef": self._assetref(guid)}, guid_index=idx)
+        assert "themeRef = nil --[[(Unity AssetReference)]]" in out
+
+    def test_empty_assetref_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        fields = {
+            "themeRef": {
+                "m_AssetGUID": "",
+                "m_CachedAsset": {"fileID": 0, "guid": "", "type": 0},
+            }
+        }
+        out = _value_to_lua(fields, guid_index=idx)
+        assert "themeRef = nil --[[(Unity AssetReference)]]" in out
+
+    def test_all_zero_assetref_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        zero = "0" * 32
+        out = _value_to_lua({"themeRef": self._assetref(zero, file_id=0)}, guid_index=idx)
+        assert "themeRef = nil --[[(Unity AssetReference)]]" in out
+
+    def test_dangling_assetref_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        dangling = "deadbeefdeadbeefdeadbeefdeadbeef"
+        out = _value_to_lua({"themeRef": self._assetref(dangling)}, guid_index=idx)
+        assert "themeRef = nil --[[(Unity AssetReference)]]" in out
+
+    # --- AC-8: m_AssetGUID-only struct (no m_CachedAsset) NOT swallowed ---
+
+    def test_assetguid_only_struct_falls_through(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        # No m_CachedAsset -> not an AssetReference -> generic-dict branch.
+        out = _value_to_lua({"themeRef": {"m_AssetGUID": PICKUP_GUID}}, guid_index=idx)
+        assert "AssetReference" not in out
+        # m_ prefix stripped -> AssetGUID key survives with its raw value.
+        assert f'AssetGUID = "{PICKUP_GUID}"' in out
+
+    def test_assetguid_with_subobjectname_only_falls_through(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        # {m_AssetGUID, m_SubObjectName} lacks m_CachedAsset -> not swallowed.
+        fields = {"themeRef": {"m_AssetGUID": PICKUP_GUID, "m_SubObjectName": "wheel"}}
+        out = _value_to_lua(fields, guid_index=idx)
+        assert "AssetReference" not in out
+        assert f'AssetGUID = "{PICKUP_GUID}"' in out
+        assert 'SubObjectName = "wheel"' in out
+
+    # --- AC-5: struct carrying m_AssetGUID + extra field is preserved ----
+
+    def test_assetref_with_extra_field_preserved(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        # Has both required keys PLUS an unrelated field -> fails subset bound,
+        # falls through to generic-dict; the extra field survives.
+        fields = {
+            "themeRef": {
+                "m_AssetGUID": PICKUP_GUID,
+                "m_CachedAsset": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3},
+                "weight": 3,
+            }
+        }
+        out = _value_to_lua(fields, guid_index=idx)
+        assert "AssetReference" not in out
+        assert "weight = 3" in out
+        # The inner m_CachedAsset object-ref still resolves via its own arm.
+        assert f'"{PICKUP_ID}"' in out
+
+    # --- m_SubObjectName present (sub-asset) -> resolves on parent --------
+
+    def test_subobjectname_assetref_resolves(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        fields = {
+            "themeRef": {
+                "m_AssetGUID": PICKUP_GUID,
+                "m_CachedAsset": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3},
+                "m_SubObjectName": "wheel",
+            }
+        }
+        out = _value_to_lua(fields, guid_index=idx)
+        assert f'themeRef = "{PICKUP_ID}"' in out
+
+    # --- m_CachedAsset fallback when m_AssetGUID empty -------------------
+
+    def test_cached_asset_fallback_resolves(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        # m_AssetGUID empty (misses index) -> fallback to m_CachedAsset guid.
+        fields = {
+            "themeRef": {
+                "m_AssetGUID": "",
+                "m_CachedAsset": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3},
+            }
+        }
+        out = _value_to_lua(fields, guid_index=idx)
+        assert f'themeRef = "{PICKUP_ID}"' in out
+
+    # --- AC-8 (no index) -> nil -----------------------------------------
+
+    def test_no_index_assetref_stays_nil(self, tmp_path):
+        out = _value_to_lua({"themeRef": self._assetref(PICKUP_GUID)})  # no index
+        assert "themeRef = nil --[[(Unity AssetReference)]]" in out
+        assert PICKUP_ID not in out
+
+    # --- AC-9: counts tally resolved / skipped ---------------------------
+
+    def test_assetref_counts(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        nonprefab = "e1a536f74c7ef384a8d7132148ace0c8"
+        idx = self._real_index(
+            proj,
+            (PICKUP_GUID, PICKUP_REL, "prefab"),
+            (nonprefab, "Assets/UI/themeIcon.png", "texture"),
+        )
+        fields = {
+            "prefabList": [
+                self._assetref(PICKUP_GUID),
+                self._assetref(nonprefab),
+            ]
+        }
+        counts = RefResolveCounts()
+        out = _value_to_lua(fields, guid_index=idx, counts=counts)
+        assert f'"{PICKUP_ID}"' in out
+        assert "nil --[[(Unity AssetReference)]]" in out
+        assert counts.resolved == 1
+        assert counts.skipped == 1
+
+    # --- empty / mixed list ---------------------------------------------
+
+    def test_empty_prefab_list(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        out = _value_to_lua({"prefabList": []}, guid_index=idx)
+        assert "prefabList = {}" in out
+
+    # --- AC-6/AC-7: object-ref arm still resolves (no regression) --------
+
+    def test_object_ref_arm_unaffected(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        # A plain {fileID,guid,type} object-ref still hits its own arm and emits
+        # the object-ref nil marker for a non-prefab, distinct from AssetReference.
+        out = _value_to_lua(
+            {"collectiblePrefab": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3}},
+            guid_index=idx,
+        )
+        assert f'collectiblePrefab = "{PICKUP_ID}"' in out
+        assert "AssetReference" not in out
+
+    def test_nil_markers_stay_distinct_per_arm(self, tmp_path):
+        # Regression pin: the two unresolved nil markers must stay DISTINCT post
+        # Phase 1. An UNRESOLVABLE legacy object-ref ({fileID,guid,type} whose
+        # guid is a non-prefab) emits the object-ref marker; an UNRESOLVABLE
+        # AssetReference ({m_AssetGUID, m_CachedAsset} on the same non-prefab
+        # guid) emits the AssetReference marker. Both arms exercised here against
+        # the REAL _value_to_lua / GuidIndex (no stubbed state); if a refactor
+        # collapsed the two markers to one string, exactly one of these arms
+        # would flip to the wrong literal and fail.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        nonprefab = "e1a536f74c7ef384a8d7132148ace0c8"
+        idx = self._real_index(proj, (nonprefab, "Assets/UI/themeIcon.png", "texture"))
+        # Legacy object-ref arm -> object-ref nil marker, NOT the AssetReference one.
+        obj_out = _value_to_lua(
+            {"objRef": {"fileID": 21300036, "guid": nonprefab, "type": 3}},
+            guid_index=idx,
+        )
+        assert "objRef = nil --[[(Unity object reference)]]" in obj_out
+        assert "Unity AssetReference" not in obj_out
+        # AssetReference arm (same non-prefab guid) -> AssetReference nil marker,
+        # NOT the object-ref one.
+        ar_out = _value_to_lua({"arRef": self._assetref(nonprefab)}, guid_index=idx)
+        assert "arRef = nil --[[(Unity AssetReference)]]" in ar_out
+        assert "Unity object reference" not in ar_out
