@@ -2790,3 +2790,61 @@ themeIcon (sprite) / skyMesh (mesh) → None.
 - **D-P3-6 (Reversible, codex Major 1):** Planner stamps `target_script_id` on rewritten rows so
   the runtime cross-domain policy classifies the target domain without finding it in scene-local
   `instanceById` (placement-scoped key never appears there). Closes the cross-domain bypass.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 ==== -->
+# Decisions — checkmark-toggle-binding-20260617T075020
+
+Generic Unity Toggle `isOn`→checkmark visual binding (follow-on to PR #202). Recorded per the 6 decision
+principles. Design: `design.md` (re-anchored against worktree `1acd1bb`).
+
+## 2026-06-17 — design revision (3 prior dual-voice findings addressed)
+
+- **D-1 — Scope: Toggle→checkmark only; Slider→fill DEFERRED.** Build the generic `ui_*_bindings` mechanism so the
+  Slider side slots in later as `ui_slider_bindings`; write NO Slider code now. (Right-size-at-design.)
+- **D-2 — Anchor on the Unity Toggle component + its serialized `graphic` fileID, resolved to the checkmark's
+  `_SceneRuntimeId`; never node names.** VERIFIED chain: Toggle `&264237065` `graphic`→component `250410366`→
+  owning GameObject `250410364` "Checkmark" / SRI `...:250410364`; toggle GO SRI `...:264237063` (re-decoded from
+  the real rbxlx this revision). Deterministic upstream source, not an AI-output fingerprint.
+- **D-3 — The component-fileID→GameObject resolver is net-new work and its OWN slice (Slice 1).** Corrects the
+  prior design's assumption that the onClick `m_Target` path already provides it — VERIFIED `target_file_id`
+  (`ui_translator.py:371-376`) has ZERO readers, no such index exists anywhere. The binding (Slice 2) depends on
+  it. (Adversarial BLOCKING reproduced against the REAL source → fix it, do not overrule.)
+- **D-4 — Plan-driven binding (`ui_toggle_bindings`), consumed via `workspaceFind`; NOT a runtime workspace scan,
+  NOT an edit to the AI-generated HudControl.** Mirrors `scene_prefab_placements`/`scriptable_objects`;
+  deterministic + harness-testable lever. The `SetAttribute("isOn")` writer is left untouched; the runtime reads
+  it.
+- **D-5 — `attr_name` single-sourced via a new `_TOGGLE_ISON_ATTR = "isOn"` constant, asserted against the AI
+  writer's literal.** No converter constant named the toggle attribute today (VERIFIED grep; `"isOn"` lives only
+  in AI output / `fixture.json:73`). Introduce one + a pin test (A4) so a lowering-casing drift fails RED rather
+  than silently inert.
+- **D-6 — Initial visibility applied BEFORE Awake.** Deferred path hooks immediately before
+  `engine:_runAwakeEnableStart(batch)` at `scene_runtime.luau:3040`; synchronous/late paths apply before their
+  host's lifecycle. (codex P1 #2 — the prior end-of-`start()` hook was too late; every batch already ran Awake by
+  then.)
+- **D-7 — Generic late-clone coverage via a `PlayerGui.DescendantAdded` watch keyed on unbound binding records,
+  reusing the client `awaitUiHost` primitive (`autogen.py:756-810`); client-only, fail-closed on the server.**
+  Binds a Toggle in a late-cloned ScreenGui whose host has NO deferred runtime component (which never reaches
+  `_completeDeferredBatch`/`_resolveDeferredUiInstances`). Makes "ANY Unity Toggle" actually hold. (codex P1 #3.)
+- **D-8 — Idempotent pass run from hook A, hook B, and the late watch; exactly-once per toggle via a marker**
+  (mirrors `boundClones` `scene_runtime.luau:3213`). Fail-closed on nil SRI resolution (E1/E7/E9).
+
+### Slicing
+- **TWO slices** (was ONE in the prior design). Slice 1 = `build_component_owner_index` resolver (no deps,
+  independently RED-provable, no output change). Slice 2 = the binding (depends on Slice 1; converter capture +
+  plan key + runtime consumer co-locate behind the shared `ToggleBinding` contract). Staged-risk fan-in seam, not
+  a size cut.
+
+### Out-of-scope (→ followups)
+- Health-bar fill (Unity Slider→fill) — DEFERRED, build as `ui_slider_bindings` later.
+- Transparency-based hide vs `.Visible` — revisit only if e2e shows a graphic that must dim.
+- Resolving the long-dead onClick `target_file_id` via the new index — latent cleanup the resolver enables.
+
+## 2026-06-17 — Execute-stage decision (graphic-only-reclone)
+- **D-9 — Revert the `(toggle,graphic)`-pair marker; keep the toggle-only marker (`1abead9`).** The phase-integration
+  review flagged that the toggle-only `_boundRows` marker won't re-bind a graphic re-cloned while its toggle survives
+  (MAJOR). A pair marker was implemented (`66b7ba2`) but its own review found it LEAKS the change-signal listener
+  (connected to the surviving toggle, not auto-disconnected) — a net-negative forward fix. The edge is UNREACHABLE in
+  converter output (a converted checkmark is a child of the toggle's ScreenGui → clones/destroys with it). Per
+  OPERATING.md (net-negative fix → revert to last-good + log residual; right-size: gate hardening on evidence the
+  failure occurs), reverted to `1abead9` and carried the gap as a documented followup. Overruled-with-evidence, not
+  silently dropped; surfaced at Gate B.

@@ -780,3 +780,24 @@ converter/runtime/scene_runtime.luau (queue site ~:1300) — self-contradictory/
 
 ## From Unit 2 phase-3 harden (WARN-timing residual — reverted net-negative patch)
 - converter/runtime/scene_runtime.luau — the residual "stripped ref never resolved" WARN has imperfect timing across MULTIPLE async UI-deferred host groups: it can fire PREMATURELY (a ref that a later group will bind) — that's the last-good behavior we kept. A harden attempt to gate it on a _deferredGroupsPending counter + a final drain was REVERTED because it introduced the opposite bug (WARN SUPPRESSED forever when the last group completes as an empty batch — codex). The WARN is DIAGNOSTIC-ONLY; binding is correct either way (cross-domain refs never queued; same-domain incl. missionPopup bind via the original post-placement + per-batch drains). Getting the WARN's exact multi-group async timing right is deferred (no real game exercises it: Trash-Dash's 3 stripped refs are client→client and their targets register). Fix when a real case appears.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 ==== -->
+# Followups — checkmark-toggle-binding-20260617T075020
+
+- **Structurally canonicalize the Toggle `isOn` writer attribute** (r2 attr-fingerprint residual). The binding reads
+  the `"isOn"` attribute the AI-transpiled writer emits; on a future game whose transpile emits a different
+  name/casing it would bind-but-never-update. Make the converter own the attribute on BOTH writer (lowering) and
+  reader (binding) sides so `attr_name` stops being an AI-output fingerprint. Interim guards: A4 convention pin
+  (RED at converter-build time) + the structural source. (D-4 keeps the AI writer untouched in this slice.)
+- **Graphic-only re-clone with a surviving toggle does not re-bind** (E11 residual, OVERRULED-as-unreachable). The
+  per-row `_boundRows` marker keys re-bind off the toggle instance; a checkmark graphic re-created while its toggle
+  survives would keep the stale binding. UNREACHABLE in converter output (a converted checkmark is a child of the
+  toggle's ScreenGui → re-clones with it). The `(toggle,graphic)`-pair marker was tried + reverted (it leaked the
+  listener on the surviving toggle — net-negative). If a future binding kind decouples the endpoints, the proper
+  fix is a pair marker that ALSO tracks+disconnects the per-row connection on re-bind.
+- **PlayerGui one-time capture never recovers after a 10s WaitForChild timeout** (phase MINOR). The client host
+  captures `PlayerGui` once; if that times out, the toggle watch (like every UI service that closes over the same
+  `PlayerGui`) never installs for the session. Pre-existing shared host infra, not toggle-specific; pathological
+  (>10s PlayerGui). Fix belongs in the host's PlayerGui acquisition, not this feature.
+- **Slider→fill (health) visual binding** — DEFERRED; build as `ui_slider_bindings` reusing this mechanism.
+- **Particle/transparency-based hide** (vs `.Visible`) — revisit only if e2e shows a graphic that must dim.
