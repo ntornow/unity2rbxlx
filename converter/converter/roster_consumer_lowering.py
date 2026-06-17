@@ -139,6 +139,32 @@ def find_roster_consumers(
     return out
 
 
+def csharp_label_loader_paths(csharp_by_path: dict[str, str]) -> list[str]:
+    """Return the source paths whose ORIGINAL C# calls
+    ``Addressables.LoadAssetsAsync<T>("<literal>", ...)`` -- the DETERMINISTIC
+    "a roster was expected" signal, independent of any ``by_label`` block.
+
+    Reuses the SAME ``_RE_LOAD_ASSETS`` regex ``find_roster_consumers`` keys on,
+    so there is ONE source of the "roster expected" truth (no second regex). This
+    is the C#-side signal the orchestrator uses to FAIL CLOSED when a roster IS
+    expected but the ``scene_runtime`` carries no ``addressables`` block at all
+    (a stale artifact predating the Unit-4 surface): in that case
+    ``find_roster_consumers`` -- gated on a non-empty ``by_label`` -- silently
+    returns ``{}``, so this independent C# fact is what makes the gap loud.
+
+    PURE. Sorted for a deterministic order. A module with no string-literal
+    LoadAssetsAsync call is absent (a non-literal label cannot be a roster the
+    by_label surface would have planned).
+    """
+    paths: list[str] = []
+    for path, source in csharp_by_path.items():
+        if not isinstance(path, str) or not isinstance(source, str):
+            continue
+        if _RE_LOAD_ASSETS.search(source) is not None:
+            paths.append(path)
+    return sorted(paths)
+
+
 # A code-level ``function <N>.<method>(`` declaration for one of the four public
 # roster methods. ``<N>`` (group 1) is the receiver-table name — the C# class /
 # file stem, which survives transpilation verbatim (verified against the real

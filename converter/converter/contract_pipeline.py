@@ -45,7 +45,10 @@ from converter.code_transpiler import (
     _is_visual_only_script,
     transpile_scripts,
 )
-from converter.roster_consumer_lowering import RosterConsumerFact
+from converter.roster_consumer_lowering import (
+    RosterConsumerFact,
+    csharp_label_loader_paths,
+)
 from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.script_analyzer import ScriptInfo
 
@@ -653,7 +656,9 @@ def transpile_with_contract(
     }
     csharp_by_path = {s.source_path: s.csharp_source for s in transpilation.scripts}
     roster_facts = find_roster_consumers(csharp_by_path, by_label)
-    roster_fail_closed = _roster_fail_closed(roster_facts, by_label, scene_runtime)
+    roster_fail_closed = _roster_fail_closed(
+        roster_facts, by_label, scene_runtime, csharp_by_path,
+    )
     if not roster_fail_closed:
         # Diagnostic only -- the discovery key is the CollectionService tag, not
         # the container name; the emitted body does not embed it.
@@ -796,6 +801,7 @@ def _roster_fail_closed(
     roster_facts: dict[str, RosterConsumerFact],
     by_label: dict[str, list[str]],
     scene_runtime: _SceneRuntimeArtifact,
+    csharp_by_path: dict[str, str],
 ) -> list[FailClosed]:
     """Roster-consumer fail-closed rows (pure). Mirrors the player-binding
     guards: surface ambiguity / a stale artifact rather than silently skipping
@@ -803,7 +809,14 @@ def _roster_fail_closed(
 
     ``roster_facts`` is already abstaining (empty when ``by_label`` is empty or
     labels are non-literal); this adds the PROJECT-level guards
-    ``find_roster_consumers`` cannot see from a single module (D-P2-7)."""
+    ``find_roster_consumers`` cannot see from a single module (D-P2-7).
+
+    The stale-artifact (``roster_signal_absent``) guard sources its "a roster was
+    expected" signal from the DETERMINISTIC C# fact (``csharp_label_loader_paths``
+    reusing the same LoadAssetsAsync regex as ``find_roster_consumers``), NOT from
+    ``by_label`` -- because in the stale case the ``addressables`` block is
+    missing, so ``by_label`` is empty and ``roster_facts`` is ``{}``; only the
+    C# fact can still see that a roster loader exists."""
     rows: list[FailClosed] = []
 
     # roster_ambiguous: >1 distinct module is the unique consumer of the SAME
@@ -824,20 +837,27 @@ def _roster_fail_closed(
             ))
 
     # roster_signal_absent (STALE-ARTIFACT guard, analogous to
-    # player_signal_absent): a non-empty ``by_label`` is expected (a roster IS
-    # planned) but the artifact carries NO ``addressables`` block at all -- the
-    # planner predates the Unit-4 addressables surface. We cannot recompute the
-    # surface here (no scene access), so surface it instead of shipping an
-    # empty-loadout DB. ``find_roster_consumers`` would silently return {}.
-    addressables = scene_runtime.get("addressables")
-    if by_label and addressables is None:
+    # player_signal_absent): some module's ORIGINAL C# calls
+    # ``Addressables.LoadAssetsAsync<T>("<L>", ...)`` (a roster IS expected,
+    # deterministic upstream) but the artifact carries NO ``by_label`` surface --
+    # the planner predates the Unit-4 addressables block. ``by_label`` is then
+    # empty so ``find_roster_consumers`` silently returns {} and the re-lowering
+    # is skipped with no signal; we surface it instead of shipping an empty-
+    # loadout DB. The signal is the C# fact, NOT ``by_label`` (which is exactly
+    # what is missing in the stale case). We cannot recompute the surface here
+    # (no scene access), so fail closed loudly. ``by_label`` truthy + the C# fact
+    # present is the NORMAL, healthy path -- ``find_roster_consumers`` handles it,
+    # so the guard requires the surface to be MISSING.
+    loader_paths = csharp_label_loader_paths(csharp_by_path)
+    if loader_paths and not by_label:
         rows.append(FailClosed(
             kind="roster_signal_absent",
             detail=(
-                "a by_label roster is expected but scene_runtime carries no "
-                "addressables block (artifact predates the Unit-4 addressables "
-                "surface); the roster consumer cannot be re-lowered. Re-run "
-                "plan_scene_runtime (re-convert) so the block is stamped."
+                f"{len(loader_paths)} module(s) load an Addressables prefab "
+                f"roster ({', '.join(loader_paths)}) but scene_runtime carries "
+                f"no by_label addressables surface (artifact predates the Unit-4 "
+                f"addressables block); the roster consumer cannot be re-lowered. "
+                f"Re-run plan_scene_runtime (re-convert) so the block is stamped."
             ),
         ))
     return rows
