@@ -147,6 +147,75 @@ _UNITY_TO_ROBLOX_CLASS.RectTransform = _CLASS_TRANSFORM_SELF
 -- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
+-- Addressable database seeding (Unit-3 theme registration)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim. For each SO-loaded database the converter
+-- routed (``plan.addressable_db_seeds``), this requires the database module
+-- and the owned ScriptableObject modules and appends each SO instance onto the
+-- database's PROVEN write surface — the public appender fn whose target field
+-- is the same list the database's (C#-derived, consumer-called) ``LoadDatabase``
+-- drains, ELSE that drain-field table directly (drain-bind, design-phase2 §1.4).
+--
+-- Boot order is load-bearing: the entrypoint calls this AFTER
+-- ``SceneRuntime.new`` and BEFORE ``engine:start`` — i.e. before any lifecycle
+-- method fires ``LoadDatabase`` — so the seed lands before the (once-only,
+-- ``themeDataList == nil``-guarded) drain. It does NOT call ``LoadDatabase`` and
+-- does NOT set ``loaded()``: the deterministic consumer-called ``LoadDatabase``
+-- drains the seeded list and owns the ``m_Loaded = true`` transition.
+--
+-- A database whose build-time drain-bind FAILED contributes NO record (the
+-- converter abstained + warned), so every record present is a proven surface.
+-- Generic no-op when ``plan.addressable_db_seeds`` is absent/empty.
+function SceneRuntime.seedAddressableDatabases(plan, services)
+	assert(type(plan) == "table", "seedAddressableDatabases: plan required")
+	assert(type(services) == "table", "seedAddressableDatabases: services required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.addressable_db_seeds or {}
+	for _, seed in ipairs(seeds) do
+		local db = resolveModule(nil, seed.db_module_path)
+		if type(db) ~= "table" then
+			warn("[seed] database module did not resolve to a table: "
+				.. tostring(seed.db_module_path))
+		else
+			-- Proven write surface (drain-bound at build time): the public
+			-- appender fn, ELSE the drain-field table directly.
+			local append = nil
+			local appenderName = seed.appender_name
+			local drainField = seed.drain_field
+			if appenderName ~= nil and type(db[appenderName]) == "function" then
+				append = function(so) db[appenderName](so) end
+			elseif drainField ~= nil and type(db[drainField]) == "table" then
+				append = function(so) table.insert(db[drainField], so) end
+			else
+				warn("[seed] proven write surface absent at runtime on "
+					.. tostring(seed.db_module_path))
+			end
+
+			if append ~= nil then
+				local keyField = seed.key_field
+				for _, modPath in ipairs(seed.so_module_paths or {}) do
+					local so = resolveModule(nil, modPath)
+					-- Abstain on a require miss AND on a key-less SO: never write
+					-- under a key ``LoadDatabase`` cannot index by. The key field
+					-- is used ONLY to abstain — never to write the registry key
+					-- (that stays ``LoadDatabase``'s job).
+					if type(so) == "table"
+						and (keyField == nil or so[keyField] ~= nil) then
+						append(so)
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Constructor
 -- ---------------------------------------------------------------------
 

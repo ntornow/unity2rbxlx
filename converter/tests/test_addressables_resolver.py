@@ -9,6 +9,7 @@ from core.unity_types import GuidEntry, GuidIndex
 from unity.addressables_resolver import (
     parse_addressables,
     resolve_prefab_addressables,
+    resolve_scriptable_object_addressables,
 )
 
 GROUP = """\
@@ -110,6 +111,25 @@ class TestResolve:
         assert res.by_address == {}
         assert res.prefab_ids == set()
 
+    def test_prefab_surface_unchanged_by_so_surface(self, tmp_path):
+        """AC-8: the SO surface is additive and does NOT relax the shared
+        ``.prefab`` filter — ``resolve_prefab_addressables`` output is identical
+        whether or not the SO resolver is also called."""
+        idx = parse_addressables(_project(tmp_path, GROUP))
+        gi = _guid_index({
+            "catguid": "Assets/Bundles/Characters/Cat/character.prefab",
+            "raccoonguid": "Assets/Bundles/Characters/Raccoon/character.prefab",
+            "uiguid": "Assets/Prefabs/UI/Header.prefab",
+            "spriteguid": "Assets/Sprites/SomeIcon.png",
+        })
+        before = resolve_prefab_addressables(idx, gi)
+        # Run the SO surface over the same index; it must not mutate anything.
+        resolve_scriptable_object_addressables(idx, gi, {"spriteguid"})
+        after = resolve_prefab_addressables(idx, gi)
+        assert before.by_address == after.by_address
+        assert before.by_label == after.by_label
+        assert before.prefab_ids == after.prefab_ids
+
     def test_prefab_id_rel_is_posix_normalized(self, tmp_path):
         """The resolver routes through the shared ``canonical_prefab_id`` core,
         whose project-relative segment is always ``.as_posix()`` forward-
@@ -125,3 +145,63 @@ class TestResolve:
             "catguid:Assets/Bundles/Characters/Cat/character.prefab",
         ]
         assert "\\" not in next(iter(res.prefab_ids))
+
+
+THEME_GROUP = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_Name: Themes
+  m_GroupName: Themes
+  m_SerializeEntries:
+  - m_GUID: dayguid
+    m_Address: themeData
+    m_SerializedLabels:
+    - themeData
+  - m_GUID: nightguid
+    m_Address: themeData
+    m_SerializedLabels:
+    - themeData
+  - m_GUID: spriteguid
+    m_Address: themeData
+    m_SerializedLabels:
+    - themeData
+"""
+
+
+class TestScriptableObjectSurface:
+    """The PARALLEL SO-addressables surface (gated on positive evidence:
+    an emitted SO module exists for the guid — not the absence of a .prefab)."""
+
+    def test_retains_only_emitted_so_guids(self, tmp_path):
+        idx = parse_addressables(_project(tmp_path, THEME_GROUP))
+        # dayguid + nightguid emitted SO modules; spriteguid did NOT.
+        so = resolve_scriptable_object_addressables(
+            idx, _guid_index({}), {"dayguid", "nightguid"},
+        )
+        assert so.by_label["themeData"] == ["dayguid", "nightguid"]
+        assert "spriteguid" not in so.so_guids
+        assert so.so_guids == {"dayguid", "nightguid"}
+
+    def test_address_axis_also_retained(self, tmp_path):
+        idx = parse_addressables(_project(tmp_path, THEME_GROUP))
+        so = resolve_scriptable_object_addressables(
+            idx, _guid_index({}), {"dayguid", "nightguid"},
+        )
+        assert so.by_address["themeData"] == ["dayguid", "nightguid"]
+
+    def test_empty_so_guids_yields_empty_surface(self, tmp_path):
+        """Positive-evidence gate: with NO emitted SO modules, nothing is
+        retained (never retained merely for failing the .prefab filter)."""
+        idx = parse_addressables(_project(tmp_path, THEME_GROUP))
+        so = resolve_scriptable_object_addressables(idx, _guid_index({}), set())
+        assert so.by_label == {}
+        assert so.by_address == {}
+        assert so.so_guids == set()
+
+    def test_dedupes_repeated_guid_per_label(self, tmp_path):
+        group = THEME_GROUP.replace("nightguid", "dayguid")  # force dup guid
+        idx = parse_addressables(_project(tmp_path, group))
+        so = resolve_scriptable_object_addressables(idx, _guid_index({}), {"dayguid"})
+        assert so.by_label["themeData"] == ["dayguid"]  # appears once

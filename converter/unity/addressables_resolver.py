@@ -67,6 +67,22 @@ class PrefabAddressables:
     skipped_non_prefab: int = 0                                     # addresses pointing at non-prefab assets
 
 
+@dataclass
+class ScriptableObjectAddressables:
+    """Label/address → SO asset guids, the PARALLEL non-prefab surface.
+
+    Keyed by the SAME parsed ``AddressablesIndex``; values are raw guids (NOT
+    prefab ids — these are ``.asset`` SO guids resolved later via the
+    ``scene_runtime.scriptable_objects`` guid→module map). Built alongside
+    ``PrefabAddressables`` but gated on ``so_guids`` (positive evidence an SO
+    module was emitted for the guid) rather than on the absence of a ``.prefab``
+    — the latter would also retain sprites/audio/scenes that produced no module.
+    """
+    by_label: dict[str, list[str]] = field(default_factory=dict)    # label -> [so_guid]
+    by_address: dict[str, list[str]] = field(default_factory=dict)  # address -> [so_guid]
+    so_guids: set[str] = field(default_factory=set)                 # all retained SO guids
+
+
 def _as_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -157,4 +173,46 @@ def resolve_prefab_addressables(
         if ids:
             out.by_label[label] = ids
             out.prefab_ids.update(ids)
+    return out
+
+
+def resolve_scriptable_object_addressables(
+    index: AddressablesIndex,
+    guid_index: object,
+    so_guids: set[str],
+) -> ScriptableObjectAddressables:
+    """Retain addressable guids whose asset is a non-``.prefab`` SO the
+    converter actually emitted a module for.
+
+    PARALLEL to ``resolve_prefab_addressables`` — it does NOT touch the shared
+    ``.prefab`` filter (``prefab_ref.prefab_id_for_guid``), so the prefab maps
+    are unaffected (AC-8). Membership is gated on ``so_guids`` (the set of guids
+    that produced an emitted SO ModuleScript) — positive evidence an SO module
+    exists, NOT merely that the guid failed the ``.prefab`` filter (which would
+    also catch sprites/audio/scenes). ``guid_index`` is accepted for symmetry
+    with the prefab resolver / future asset-path use but is not required for the
+    so_guids gate.
+    """
+    del guid_index  # symmetry with resolve_prefab_addressables; gate is so_guids
+    out = ScriptableObjectAddressables()
+
+    def _retained(guids: list[str]) -> list[str]:
+        seen: set[str] = set()
+        kept: list[str] = []
+        for g in guids:
+            if g in so_guids and g not in seen:
+                seen.add(g)
+                kept.append(g)
+        return kept
+
+    for address, guids in index.by_address.items():
+        kept = _retained(guids)
+        if kept:
+            out.by_address[address] = kept
+            out.so_guids.update(kept)
+    for label, guids in index.by_label.items():
+        kept = _retained(guids)
+        if kept:
+            out.by_label[label] = kept
+            out.so_guids.update(kept)
     return out
