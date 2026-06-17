@@ -159,6 +159,20 @@ def test_suggest_candidates_includes_close_real_method() -> None:
     assert "ApplyImpulse" in result
 
 
+def test_rbxscriptsignal_members_callable() -> None:
+    """ACCEPTANCE 9: RBXScriptSignal members are callable with signatures.
+
+    These belong to the RBXScriptSignal DATA TYPE (outside the API dump's
+    ``Classes`` array), unioned into the corpus by the refresh tool so a valid
+    ``signal:Connect(fn)`` is not a false positive.
+    """
+    for name in ("Connect", "Once", "Wait", "ConnectParallel"):
+        assert is_callable_member(name) is True, f"{name} must be callable"
+        sig = signature(name)
+        assert isinstance(sig, str) and sig, f"{name} must have a non-None signature"
+        assert name in sig
+
+
 def test_suggest_candidates_garbage_input_is_bounded() -> None:
     result = suggest_candidates("Xqzptv")
     assert isinstance(result, list)
