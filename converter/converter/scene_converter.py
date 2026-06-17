@@ -1666,7 +1666,9 @@ def convert_scene(
     # suppression carve-out (Piece 4) can fire for runtime-bearing UI
     # controllers. Legacy mode passes the empty set + mode="legacy" so
     # the static-emit path is byte-identical to pre-PR3c.
-    from converter.ui_translator import find_canvas_nodes, convert_canvas
+    from converter.ui_translator import (
+        find_canvas_nodes, convert_canvas, build_component_owner_index,
+    )
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
         ui_suppress_ids = (
@@ -1674,11 +1676,17 @@ def convert_scene(
             if scene_runtime_mode == "generic" and scene_runtime
             else frozenset()
         )
+        # Scene-wide component fileID -> owning GameObject fileID map, built
+        # once. Threaded into canvas conversion so a serialized component
+        # reference can be resolved to its owning GameObject (consumed by a
+        # later slice; dead plumbing here, output is byte-identical).
+        component_owner_index = build_component_owner_index(parsed_scene.roots)
         place.screen_guis = convert_canvas(
             canvas_nodes,
             scene_namespace=_ctx().scene_runtime_namespace,
             scene_runtime_mode=scene_runtime_mode,
             suppress_static_children_ids=ui_suppress_ids,
+            component_owner_index=component_owner_index,
         )
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 

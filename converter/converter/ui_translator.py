@@ -132,11 +132,34 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
     return isinstance(guid, str) and guid.startswith(_UI_IMAGE_SCRIPT_GUID_PREFIX)
 
 
+def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
+    """Map each component's fileID to its owning GameObject's fileID, scene-wide.
+
+    Walks every node in ``roots`` and all of their ``children`` recursively;
+    for each component on a node, records ``comp.file_id -> node.file_id``.
+    Built scene-wide (not just the canvas subtree) because a serialized
+    component reference (e.g. a Unity ``Toggle.graphic``) may legally point
+    at a component owned by a GameObject outside the canvas subtree.
+
+    Pure: builds and returns a fresh ``dict[str, str]``; no mutation of input.
+    No name matching, no regex -- keyed solely on scene-local fileIDs.
+    """
+    index: dict[str, str] = {}
+    stack: list[SceneNode] = list(roots)
+    while stack:
+        node = stack.pop()
+        for comp in node.components:
+            index[comp.file_id] = node.file_id
+        stack.extend(node.children)
+    return index
+
+
 def convert_canvas(
     canvas_nodes: list[SceneNode],
     scene_namespace: str = "",
     scene_runtime_mode: str = "legacy",
     suppress_static_children_ids: frozenset[str] | None = None,
+    component_owner_index: dict[str, str] | None = None,
 ) -> list[RbxScreenGui]:
     """Convert a list of Unity Canvas root nodes to Roblox ScreenGui objects.
 
@@ -164,6 +187,13 @@ def convert_canvas(
             instantiates the content via ``host.instantiatePrefab``.
             Empty / None means no suppression (the generic test fires on
             membership, so legacy passes ``None`` and gets the old path).
+        component_owner_index: Scene-wide
+            ``component fileID -> owning GameObject fileID`` map (built once
+            per scene via ``build_component_owner_index``). Threaded down to
+            element conversion so a serialized component reference can be
+            resolved to its owning GameObject. ``None`` for legacy / synthetic
+            callers (no resolution). Currently dead plumbing -- the consumer
+            lands in a later slice; output is byte-identical regardless.
 
     Returns:
         List of RbxScreenGui objects.
@@ -192,6 +222,7 @@ def convert_canvas(
                 suppress_static_children_ids=(
                     suppress_ids if suppression_active else frozenset()
                 ),
+                component_owner_index=component_owner_index,
             )
             if element is not None:
                 screen_gui.elements.append(element)
@@ -294,6 +325,7 @@ def _apply_canvas_scaler(screen_gui: RbxScreenGui, canvas_node: SceneNode) -> No
 def _convert_ui_element(
     node: SceneNode, scene_namespace: str = "",
     suppress_static_children_ids: frozenset[str] = frozenset(),
+    component_owner_index: dict[str, str] | None = None,
 ) -> RbxUIElement | None:
     """Recursively convert a SceneNode (under a Canvas) to an RbxUIElement.
 
@@ -313,6 +345,11 @@ def _convert_ui_element(
             ``host.instantiatePrefab``). Empty frozenset disables the
             carve-out — legacy mode passes empty, so child emit is
             byte-identical to pre-PR3c.
+        component_owner_index: Scene-wide
+            ``component fileID -> owning GameObject fileID`` map, threaded
+            through recursion so a serialized component reference can be
+            resolved to its owning GameObject. ``None`` for legacy / synthetic
+            callers. Currently dead plumbing -- consumed in a later slice.
 
     Returns:
         An RbxUIElement, or None if the node should be skipped.
@@ -451,6 +488,7 @@ def _convert_ui_element(
         child_element = _convert_ui_element(
             child_node, scene_namespace,
             suppress_static_children_ids=suppress_static_children_ids,
+            component_owner_index=component_owner_index,
         )
         if child_element is not None:
             element.children.append(child_element)

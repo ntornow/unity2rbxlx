@@ -2,6 +2,7 @@
 
 from converter.ui_translator import _extract_rect_transform, _apply_text_properties
 from core.roblox_types import RbxUIElement
+from core.unity_types import ComponentData, SceneNode
 
 
 class TestRectTransform:
@@ -316,3 +317,122 @@ class TestImageScriptGuidFallback:
         assert not _is_ui_image_mb({"m_Script": {"guid": "abc123"}})
         assert not _is_ui_image_mb({})
         assert not _is_ui_image_mb({"m_Script": "not-a-dict"})
+
+
+class TestBuildComponentOwnerIndex:
+    """A5 — the component fileID -> owning GameObject fileID resolver.
+
+    The Toggle's serialized ``graphic`` ref is a *component* fileID; the
+    runtime binds the *owning* GameObject (the node carrying a
+    ``_SceneRuntimeId``). This pure resolver makes that mapping.
+    """
+
+    @staticmethod
+    def _node(
+        name: str, file_id: str,
+        components: list[ComponentData] | None = None,
+        children: list[SceneNode] | None = None,
+    ) -> SceneNode:
+        return SceneNode(
+            name=name,
+            file_id=file_id,
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=components or [],
+            children=children or [],
+            parent_file_id=None,
+        )
+
+    def test_component_maps_to_owning_gameobject(self):
+        """Component fileID C on GameObject G -> index maps C -> G."""
+        from converter.ui_translator import build_component_owner_index
+
+        go = self._node(
+            "G", file_id="G",
+            components=[
+                ComponentData(component_type="Image", file_id="C", properties={}),
+            ],
+        )
+        index = build_component_owner_index([go])
+        assert index["C"] == "G"
+
+    def test_out_of_canvas_subtree_component_still_resolves(self):
+        """E4 — the resolver is scene-wide: a component on a GameObject in a
+        sibling root (outside the canvas subtree) still resolves."""
+        from converter.ui_translator import build_component_owner_index
+
+        canvas_root = self._node(
+            "Canvas", file_id="100",
+            components=[
+                ComponentData(component_type="Canvas", file_id="1001", properties={}),
+            ],
+        )
+        # A separate top-level root (NOT under the canvas subtree).
+        other_root = self._node(
+            "OffCanvasGO", file_id="500",
+            components=[
+                ComponentData(component_type="Image", file_id="5001", properties={}),
+            ],
+        )
+        index = build_component_owner_index([canvas_root, other_root])
+        assert index["5001"] == "500"
+        assert index["1001"] == "100"
+
+    def test_recurses_into_nested_children(self):
+        """Components on deeply nested children are indexed (recursive walk)."""
+        from converter.ui_translator import build_component_owner_index
+
+        grandchild = self._node(
+            "Checkmark", file_id="250410364",
+            components=[
+                ComponentData(
+                    component_type="Image", file_id="250410366", properties={},
+                ),
+            ],
+        )
+        child = self._node("Background", file_id="1614370918", children=[grandchild])
+        toggle_go = self._node(
+            "Battery", file_id="264237063",
+            components=[
+                ComponentData(
+                    component_type="Toggle", file_id="264237065", properties={},
+                ),
+            ],
+            children=[child],
+        )
+        index = build_component_owner_index([toggle_go])
+        # The graphic ref (Image component 250410366) resolves to the
+        # Checkmark GameObject (250410364) — the chain §1d pins.
+        assert index["250410366"] == "250410364"
+        assert index["264237065"] == "264237063"
+
+    def test_unowned_fileid_absent(self):
+        """E1 — a fileID with no owning node is absent (not present, no crash)."""
+        from converter.ui_translator import build_component_owner_index
+
+        go = self._node(
+            "G", file_id="G",
+            components=[
+                ComponentData(component_type="Image", file_id="C", properties={}),
+            ],
+        )
+        index = build_component_owner_index([go])
+        assert "no-such-fileid" not in index
+        assert index.get("0") is None
+
+    def test_empty_roots_yields_empty_index(self):
+        from converter.ui_translator import build_component_owner_index
+
+        assert build_component_owner_index([]) == {}
+
+    def test_pure_does_not_mutate_input(self):
+        """Pure: input nodes/components are not mutated."""
+        from converter.ui_translator import build_component_owner_index
+
+        comps = [ComponentData(component_type="Image", file_id="C", properties={})]
+        go = self._node("G", file_id="G", components=comps)
+        before = [(c.component_type, c.file_id) for c in go.components]
+        build_component_owner_index([go])
+        after = [(c.component_type, c.file_id) for c in go.components]
+        assert before == after
