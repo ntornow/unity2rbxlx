@@ -1051,7 +1051,11 @@ class TestLuauGeneration:
         assert "TweenService" in luau
         assert "CFrame" in luau
         assert "math.rad" in luau
-        assert "while true do" in luau  # Looping animation
+        # Looping animation now uses a task.spawn loop with a Heartbeat yield
+        # floor (placement-order-robust scaffold), not a top-level `while true do`.
+        assert "task.spawn(" in luau
+        assert "RunService.Heartbeat:Wait()" in luau
+        assert "while true do" not in luau
 
     def test_generate_scale_tween(self) -> None:
         """Generate a scale tween script."""
@@ -1177,6 +1181,188 @@ class TestLuauGeneration:
         # Script should be generated but won't have any tween calls
         # (the curve has only 1 keyframe, so no tween is generated)
         assert "playAnimation" in luau
+
+
+# ---------------------------------------------------------------------------
+# Placement-order-robust binding (door-binding-race) — AC1..AC14
+# ---------------------------------------------------------------------------
+
+def _pos_curve(path: str = "") -> AnimCurve:
+    """A two-keyframe position curve (survives simplification -> has content)."""
+    return AnimCurve(
+        property_type="position",
+        path=path,
+        keyframes=[
+            AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+            AnimKeyframe(time=1.0, value=(0.0, 4.0, 0.0)),
+        ],
+    )
+
+
+def _bool_clip(name: str = "open", loop: bool = False) -> AnimClip:
+    return AnimClip(name=name, duration=1.0, loop=loop, sample_rate=60,
+                    curves=[_pos_curve()])
+
+
+def _bool_controller(param: str = "open") -> AnimatorController:
+    return AnimatorController(name="door",
+                              parameters=[AnimParameter(name=param, param_type=4)])
+
+
+def _int_controller(param: str = "actionNumber") -> AnimatorController:
+    return AnimatorController(name="holder",
+                              parameters=[AnimParameter(name=param, param_type=3)])
+
+
+def _loop_clip(name: str = "Flying") -> AnimClip:
+    return AnimClip(name=name, duration=2.0, loop=True, sample_rate=60,
+                    curves=[_pos_curve()])
+
+
+def _once_clip(name: str = "open") -> AnimClip:
+    return AnimClip(name=name, duration=1.0, loop=False, sample_rate=60,
+                    curves=[_pos_curve()])
+
+
+class TestPlacementRobustBinding:
+    """Structural assertions on the placement-order-robust emitted scaffold."""
+
+    def test_ac1_bool_late_arrival(self) -> None:
+        luau = generate_tween_script(_bool_clip(), game_object_name="Door",
+                                     controller=_bool_controller())
+        assert "workspace.DescendantAdded" in luau
+        assert 'GetAttributeChangedSignal("open")' in luau
+
+    def test_ac2_int_late_arrival(self) -> None:
+        luau = generate_tween_script(
+            AnimClip(name="holder1", duration=1.0, loop=False, sample_rate=60,
+                     curves=[_pos_curve()]),
+            game_object_name="Plane", controller=_int_controller())
+        assert "workspace.DescendantAdded" in luau
+        assert 'GetAttributeChangedSignal("actionNumber")' in luau
+
+    def test_ac3_loop_late_arrival_yield_floor(self) -> None:
+        luau = generate_tween_script(_loop_clip(), game_object_name="Plane")
+        assert "workspace.DescendantAdded" in luau
+        assert "task.spawn(" in luau
+        assert "RunService.Heartbeat:Wait()" in luau
+        assert "while true do" not in luau
+
+    def test_ac4_play_once_late_arrival(self) -> None:
+        luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        assert "workspace.DescendantAdded" in luau
+        assert "bindTarget" in luau
+        assert "playAnimation(_t)" in luau
+        # No bare top-level playAnimation() call (concrete-arg only).
+        assert "\nplayAnimation()" not in luau
+        assert "\tplayAnimation()" not in luau
+
+    def test_ac5_prefab_scoped_no_listener(self) -> None:
+        for clip, controller in (
+            (_bool_clip(), _bool_controller()),
+            (_once_clip(), _int_controller()),
+            (_loop_clip(), None),
+            (_once_clip(), None),
+        ):
+            luau = generate_tween_script(clip, game_object_name="Door",
+                                         controller=controller, prefab_scoped=True)
+            # The listener/fanout are emitted unconditionally inside the source but
+            # guarded at runtime by `if not _ownerIsContainer`. Structural check:
+            # they live under that guard (the embedded path binds only `target`).
+            assert "if not _ownerIsContainer then" in luau
+
+    def test_ac6_early_return_gated(self) -> None:
+        luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        assert "if not target and _ownerIsContainer then" in luau
+        # No bare unconditional prologue early-return.
+        assert "if not target then" not in luau
+
+    def test_ac7_no_unguarded_target_deref(self) -> None:
+        luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        # _initialTarget DECLARATION appears once, before the `if target then` guard.
+        decl_idx = luau.index("local _initialTarget = target")
+        guard_idx = luau.index("if target then")
+        assert decl_idx < guard_idx
+        # Model-normalization (target:IsA('Model')) appears only inside the guard.
+        norm_idx = luau.index("if target:IsA('Model') then")
+        assert norm_idx > guard_idx
+        # The value re-assignment of _initialTarget (indented, inside the guard).
+        reassign_idx = luau.index("    _initialTarget = target")
+        assert reassign_idx > guard_idx
+
+    def test_ac8_idempotency(self) -> None:
+        luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        assert '__mode = "k"' in luau
+        assert "if _bound[" in luau
+
+    def test_ac9_apply_current_state_on_bind_bool(self) -> None:
+        luau = generate_tween_script(_bool_clip(), game_object_name="Door",
+                                     controller=_bool_controller())
+        # Default write guarded by == nil.
+        assert 'if _t:GetAttribute("open") == nil then' in luau
+        assert '_t:SetAttribute("open", false)' in luau
+        # On-bind snap reads the attribute and conditionally plays.
+        assert 'if _t:GetAttribute("open") and not _isActive then' in luau
+
+    def test_ac10_apply_current_state_on_bind_int(self) -> None:
+        luau = generate_tween_script(
+            AnimClip(name="holder1", duration=1.0, loop=False, sample_rate=60,
+                     curves=[_pos_curve()]),
+            game_object_name="Plane", controller=_int_controller())
+        assert 'if _t:GetAttribute("actionNumber") == nil then' in luau
+        assert '_t:SetAttribute("actionNumber", 0)' in luau
+        # On-bind snap conditioned on a non-default value.
+        assert '~= nil and _t:GetAttribute("actionNumber") ~= 0 then' in luau
+
+    def test_ac11_match_name_compile_time_literal(self) -> None:
+        # Explicit game_object_name -> literal "Door".
+        luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        assert 'local _matchNames = { "Door" }' in luau
+        # Empty name + single curve root "Plane" -> literal "Plane".
+        clip = AnimClip(name="fly", duration=1.0, loop=False, sample_rate=60,
+                        curves=[_pos_curve(path="Plane")])
+        luau2 = generate_tween_script(clip)
+        assert 'local _matchNames = { "Plane" }' in luau2
+        # No emission keys the listener on a runtime target.Name match expression.
+        assert "_inst.Name == target.Name" not in luau2
+
+    def test_ac12_no_regression_boot_present_bool(self) -> None:
+        luau = generate_tween_script(_bool_clip(), game_object_name="Door",
+                                     controller=_bool_controller())
+        assert "SetAttribute" in luau
+        assert "GetAttributeChangedSignal" in luau
+        assert "bindTarget" in luau
+        # Removed shapes are gone.
+        assert "_targets" not in luau
+        assert "while true do" not in luau
+
+    def test_ac13_loop_and_once_share_scaffold(self) -> None:
+        loop_luau = generate_tween_script(_loop_clip(), game_object_name="Plane")
+        once_luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        for luau in (loop_luau, once_luau):
+            assert "workspace:GetDescendants()" in luau
+            assert "if not _ownerIsContainer then" in luau
+
+    def test_ac14_match_name_superset(self) -> None:
+        luau = generate_tween_script(_once_clip(), game_object_name="Door")
+        # _matchNames built from the compile-time literal...
+        assert 'local _matchNames = { "Door" }' in luau
+        # ...and the resolved target.Name appended under an `if target` guard.
+        assert "if target and not _seenName[target.Name] then" in luau
+        assert "table.insert(_matchNames, target.Name)" in luau
+
+    def test_ac3_contentless_loop_skips_spin(self) -> None:
+        # A loop clip whose only curve simplifies to <2 keyframes must not emit
+        # the task.spawn loop (D9 — would spin); it plays once instead.
+        clip = AnimClip(
+            name="static", duration=1.0, loop=True, sample_rate=60,
+            curves=[AnimCurve(property_type="position", path="",
+                              keyframes=[AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0))])],
+        )
+        luau = generate_tween_script(clip, game_object_name="Door")
+        assert "task.spawn(" not in luau
+        assert "while true do" not in luau
+        assert "playAnimation(_t)" in luau
 
 
 # ---------------------------------------------------------------------------
