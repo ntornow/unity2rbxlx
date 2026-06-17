@@ -7247,9 +7247,12 @@ script.Disabled = true
                 source_by_name.setdefault(name, src)
 
         seeds: list[AddressableDbSeed] = []
-        seeded_labels: set[str] = set()
+        seeded_keys: set[str] = set()
         # The owning DB is the transpiled module whose originating C# issues a
-        # ``LoadAssetsAsync<T>(label, …)`` whose label has emitted SO guids.
+        # ``LoadAssetsAsync<T>(key, …)`` whose KEY has emitted SO guids. Unity's
+        # ``LoadAssetsAsync<T>(key)`` accepts a LABEL *or* an ADDRESS, so resolve
+        # the captured load key against BOTH indexes (union, deduped) — a
+        # database loaded by address would resolve to nothing in by_label alone.
         for db_name, db_luau in sorted(source_by_name.items()):
             cs_source = self._find_cs_source_for_module(db_name)
             if cs_source is None:
@@ -7257,11 +7260,30 @@ script.Disabled = true
             ownership = _derive_cs_load_ownership(cs_source)
             if ownership is None:
                 continue
-            owned_guids = so_addr.by_label.get(ownership.label)
+            owned_guids: list[str] = []
+            _seen_owned: set[str] = set()
+            for guid in (
+                list(so_addr.by_label.get(ownership.label) or [])
+                + list(so_addr.by_address.get(ownership.label) or [])
+            ):
+                if guid not in _seen_owned:
+                    _seen_owned.add(guid)
+                    owned_guids.append(guid)
             if not owned_guids:
+                # A derived DB-shaped module (LoadAssetsAsync<T> ownership +,
+                # below, a drain surface) that resolves to NO SO guids in either
+                # index is a likely-dead registry — fail loud, consistent with
+                # the drain-bind abstain warnings, rather than silently skip.
+                if _derive_drain_field(db_luau, ownership.load_method_name) is not None:
+                    log.warning(
+                        "[seed] %s load key %r resolves to no emitted SO guids "
+                        "(by_label or by_address) on %s; skipping — registry "
+                        "would be empty",
+                        ownership.load_method_name, ownership.label, db_name,
+                    )
                 continue
-            if ownership.label in seeded_labels:
-                continue  # dedupe: a label is owned by exactly one DB
+            if ownership.label in seeded_keys:
+                continue  # dedupe: a load key is owned by exactly one DB
 
             # The DB's own plan module path (so the runtime can require it). The
             # DB is a runtime-bearing module; resolve its container the same way
@@ -7316,7 +7338,7 @@ script.Disabled = true
                 key_field=ownership.key_field,
                 so_module_paths=so_module_paths,
             ))
-            seeded_labels.add(ownership.label)
+            seeded_keys.add(ownership.label)
 
         if seeds:
             scene_runtime["addressable_db_seeds"] = seeds

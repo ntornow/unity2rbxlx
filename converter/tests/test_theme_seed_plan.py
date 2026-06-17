@@ -277,13 +277,31 @@ def _theme_group_asset() -> str:
     )
 
 
+def _theme_group_asset_address_only() -> str:
+    """A group whose entries carry an ``m_Address`` of ``themeData`` but NO
+    ``m_SerializedLabels`` — so the SO guids land ONLY in ``by_address``
+    (``by_label`` has no ``themeData`` entry). Models a database whose C# load
+    key is an ADDRESS, not a label."""
+    return (
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+        "--- !u!114 &11400000\nMonoBehaviour:\n"
+        "  m_Name: Themes\n  m_GroupName: Themes\n"
+        "  m_SerializeEntries:\n"
+        "  - m_GUID: dayguid\n    m_Address: themeData\n"
+        "  - m_GUID: nightguid\n    m_Address: themeData\n"
+    )
+
+
 def _make_project(tmp_path: Path, *, cs: str = THEME_DB_CS,
-                  db_luau: str = THEME_DB_LUAU) -> Path:
+                  db_luau: str = THEME_DB_LUAU,
+                  group_asset: str | None = None) -> Path:
     root = tmp_path / "proj"
     (root / "Assets").mkdir(parents=True)
     groups = root / "Assets" / "AddressableAssetsData" / "AssetGroups"
     groups.mkdir(parents=True)
-    (groups / "Themes.asset").write_text(_theme_group_asset(), encoding="utf-8")
+    (groups / "Themes.asset").write_text(
+        group_asset if group_asset is not None else _theme_group_asset(),
+        encoding="utf-8")
     (root / "Assets" / "ThemeDatabase.cs").write_text(cs, encoding="utf-8")
     return root
 
@@ -338,6 +356,63 @@ class TestBuildThemeSeedPlanIntegration:
             "ReplicatedStorage.ThemeData_Day",
             "ReplicatedStorage.ThemeData_Night",
         ]
+
+    def test_seed_resolves_database_loaded_by_address(self, tmp_path):
+        """codex P1 (phase2): Unity ``LoadAssetsAsync<T>(key)`` accepts a LABEL
+        *or* an ADDRESS. A database whose load key is an ADDRESS (present in
+        ``by_address``, absent from ``by_label``) must still seed — resolved via
+        the by_address index.
+
+        Pre-fix (``so_addr.by_label.get(ownership.label)`` only) finds nothing
+        and silently emits no seed → empty registry; post-fix the union resolves
+        the guids via by_address."""
+        root = _make_project(
+            tmp_path, group_asset=_theme_group_asset_address_only())
+        pipe = _pipeline_with_state(root, tmp_path)
+        sr = _scene_runtime_with_so_map()
+        pipe._build_theme_seed_plan(sr)
+        seeds = sr["addressable_db_seeds"]
+        assert isinstance(seeds, list) and len(seeds) == 1
+        seed = seeds[0]
+        assert seed["db_module_path"] == "ReplicatedStorage.ThemeDatabase"
+        assert seed["so_module_paths"] == [
+            "ReplicatedStorage.ThemeData_Day",
+            "ReplicatedStorage.ThemeData_Night",
+        ]
+
+    def test_db_shaped_module_with_no_resolvable_guids_warns_loud(
+            self, tmp_path, caplog):
+        """codex P1 (phase2): a derived DB-shaped module (LoadAssetsAsync<T>
+        ownership + a recognizable drain surface) whose load key resolves to NO
+        emitted SO guids in EITHER index is a likely-dead registry — warn loud
+        rather than silently skip. The C# key (``otherKey``) matches no group
+        entry, so neither by_label nor by_address has it."""
+        cs = THEME_DB_CS.replace('"themeData"', '"otherKey"')
+        root = _make_project(tmp_path, cs=cs)
+        pipe = _pipeline_with_state(root, tmp_path)
+        sr = _scene_runtime_with_so_map()
+        with caplog.at_level("WARNING"):
+            pipe._build_theme_seed_plan(sr)
+        assert "addressable_db_seeds" not in sr
+        assert any("registry would be empty" in r.message
+                   for r in caplog.records)
+
+    def test_non_db_module_with_no_drain_does_not_warn(self, tmp_path, caplog):
+        """The fail-loud warning is scoped to DB-shaped modules: a module that
+        derives LoadAssetsAsync<T> ownership but has NO recognizable drain
+        surface (not a registry) and resolves to no guids must NOT emit the
+        empty-registry warning — no log noise for ordinary modules."""
+        cs = THEME_DB_CS.replace('"themeData"', '"otherKey"')
+        no_drain = THEME_DB_LUAU.replace(
+            "ipairs(ThemeDatabase._pendingThemeData)", "pairs(mystery())")
+        root = _make_project(tmp_path, cs=cs)
+        pipe = _pipeline_with_state(root, tmp_path, db_luau=no_drain)
+        sr = _scene_runtime_with_so_map()
+        with caplog.at_level("WARNING"):
+            pipe._build_theme_seed_plan(sr)
+        assert "addressable_db_seeds" not in sr
+        assert not any("registry would be empty" in r.message
+                       for r in caplog.records)
 
     def test_emitted_plan_carries_seed_via_allowlist(self, tmp_path):
         """AC-10-P1: the seed survives the _PLAN_KEYS_FOR_HOST filter into the
