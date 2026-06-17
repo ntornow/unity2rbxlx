@@ -34,42 +34,35 @@ from tests.test_scene_runtime_host_behavior import (  # noqa: F401
 
 # A3 runs WITHOUT luau (a pure source grep over the slice DIFF), so it is its
 # own module-level test, not gated by the luau ``pytestmark`` skip below.
-def test_no_simplefps_node_name_literals_in_slice_diff():
-    """A3 — the generic binding introduces NO SimpleFPS node-name literals.
+def test_no_simplefps_node_name_literals_in_production():
+    """A3 — the generic binding hardcodes NO SimpleFPS node-name literals.
 
-    Grep the ADDED lines of this slice's diff (the binding region only --
-    pre-existing unrelated uses of e.g. ``Background`` / ``SimpleFPS`` in the
-    same files are not this slice's concern). The binding is keyed on
-    ``_SceneRuntimeId`` values, never node names.
+    Hermetic: read the production source files and assert the SimpleFPS HUD
+    node names never appear. The binding is keyed on ``_SceneRuntimeId``
+    values, never node names. (Reads the files directly rather than a
+    ``git diff`` against a hardcoded base SHA, so it survives squashes,
+    shallow clones, and rebases.)
+
+    Banned = the SimpleFPS HUD item/checkmark node names the binding must
+    NEVER hardcode. Generic UI words (``Background``) and example mentions in
+    pre-existing comments (``SimpleFPS``/``HudControl``) are intentionally NOT
+    banned — they would false-positive on unrelated, pre-existing code.
     """
-    import subprocess
-
-    repo_root = Path(__file__).parent.parent.parent  # repo root (above converter/)
-    base = "b02b3e5"  # the slice 1.2 base (slice 1.1 tip)
-    banned = [
-        "Checkmark", "Battery", "Background", "ItemModule",
-        "HudControl", "SimpleFPS",
-    ]
+    converter_root = Path(__file__).parent.parent  # the converter/ dir
+    banned = ["Checkmark", "Battery", "ItemModule"]
     prod_paths = [
-        "converter/converter/ui_translator.py",
-        "converter/converter/scene_converter.py",
-        "converter/converter/autogen.py",
-        "converter/runtime/scene_runtime.luau",
+        "converter/ui_translator.py",
+        "converter/scene_converter.py",
+        "converter/autogen.py",
+        "runtime/scene_runtime.luau",
     ]
-    diff = subprocess.run(
-        ["git", "diff", base, "--", *prod_paths],
-        cwd=repo_root, capture_output=True, text=True, check=True,
-    ).stdout
-    added = [
-        ln[1:] for ln in diff.splitlines()
-        if ln.startswith("+") and not ln.startswith("+++")
-    ]
-    added_text = "\n".join(added)
-    for name in banned:
-        assert name not in added_text, (
-            f"slice diff introduces SimpleFPS node-name literal {name!r} -- "
-            f"the binding must be generic (keyed on SRIs, not names)"
-        )
+    for rel in prod_paths:
+        text = (converter_root / rel).read_text(encoding="utf-8")
+        for name in banned:
+            assert name not in text, (
+                f"{rel} contains SimpleFPS node-name literal {name!r} -- "
+                f"the binding must be generic (keyed on SRIs, not names)"
+            )
 
 
 # A reusable Lua preamble: a toggle/graphic instance factory + a
