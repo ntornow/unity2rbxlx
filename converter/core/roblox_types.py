@@ -163,6 +163,16 @@ class RbxScript:
     # are deterministic resolver-fact projections that anchor check D's dead-write
     # exemption (slice 1.2); they are stamped regardless of discharge.
     rig_binding: dict[str, object] | None = None
+    # Per-script roster-consumer binding carrier (mirrors rig_binding): a
+    # JSON-native dict ``{"label": str, "receiver": str, "lowered": True}`` that
+    # survives ``json.dumps`` in the corpus regen, rehydrates as a plain dict via
+    # ``RbxScript(**s)`` in the corpus replay, and is stamped identically live.
+    # ``None`` for every script except an Addressables-label-roster CONSUMER that
+    # ``roster_consumer_lowering`` re-lowered to read Phase 1's by_label tagged
+    # surface. The dead-module analysis EXEMPTS a carrier-bearing module from the
+    # Roblox-dead set: the canonical re-lowered body is deterministically inert
+    # (would otherwise classify dead) yet live by construction (NEW-FINDING-B).
+    roster_binding: dict[str, object] | None = None
 
 
 @dataclass

@@ -45,6 +45,7 @@ from converter.code_transpiler import (
     _is_visual_only_script,
     transpile_scripts,
 )
+from converter.roster_consumer_lowering import RosterConsumerFact
 from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.script_analyzer import ScriptInfo
 
@@ -72,6 +73,14 @@ class _SceneRuntimeModule(TypedDict, total=False):
     module_path: str  # PR3b -- present iff the storage classifier has run
 
 
+class _Addressables(TypedDict, total=False):
+    """The ``addressables`` block the planner stamps (Unit-4 surface). Phase 2
+    reads ``by_label`` (label -> [prefab_id]) to identify the roster consumer."""
+
+    by_label: dict[str, list[str]]
+    by_address: dict[str, str]
+
+
 class _SceneRuntimeArtifact(TypedDict, total=False):
     """Top-level ``scene_runtime`` shape PR3a reads."""
 
@@ -82,6 +91,9 @@ class _SceneRuntimeArtifact(TypedDict, total=False):
     scenes: dict[str, object]
     prefabs: dict[str, object]
     domain_overrides: dict[str, str]
+    # Unit-4 roster: the addressables label/address block the planner stamps.
+    # ``find_roster_consumers`` keys the roster re-lowering on ``by_label``.
+    addressables: _Addressables
 
 log = logging.getLogger(__name__)
 
@@ -617,12 +629,66 @@ def transpile_with_contract(
         log.info("[contract] rifle rig-retarget lowering rebound %d script(s) "
                  "to the _MainCameraRig slot", lowered_retarget)
 
+    # Roster-consumer re-lowering (allowlisted deterministic lowering pass,
+    # Unit 4 Phase 2): rewrite each Addressables-label-roster consumer's
+    # LoadDatabase/GetCharacter/dictionary/loaded to return the component object
+    # graph read from the by_label tagged surface (Phase 1's emitted roster).
+    # Keyed on the DETERMINISTIC upstream by_label fact (the module whose C# calls
+    # Addressables.LoadAssetsAsync<T>("<L>", ...) for L in by_label), NEVER on an
+    # AI-output fingerprint or a per-game string (D-P2-1/D-P2-2). Abstains on
+    # empty by_label / no literal label; fail-closes on ambiguity / stale artifact.
+    # COMPUTED here (the facts are local) but the rows are aggregated into
+    # ``fail_closed`` only AFTER its definition below (it does not exist yet).
+    from converter.roster_consumer_lowering import (
+        RosterUnresolved,
+        find_roster_consumers,
+        lower_roster_consumers,
+    )
+    from converter.roster_assembly import resolve_roster_container_name
+    addressables = scene_runtime.get("addressables") or {}
+    by_label_raw = addressables.get("by_label") or {}
+    by_label: dict[str, list[str]] = {
+        k: v for k, v in by_label_raw.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+    csharp_by_path = {s.source_path: s.csharp_source for s in transpilation.scripts}
+    roster_facts = find_roster_consumers(csharp_by_path, by_label)
+    roster_fail_closed = _roster_fail_closed(roster_facts, by_label, scene_runtime)
+    if not roster_fail_closed:
+        # Diagnostic only -- the discovery key is the CollectionService tag, not
+        # the container name; the emitted body does not embed it.
+        container_name = resolve_roster_container_name(set())
+        try:
+            lowered_roster = lower_roster_consumers(
+                transpilation.scripts, roster_facts, container_name,
+            )
+        except RosterUnresolved as exc:
+            # A located fact whose LoadDatabase/GetCharacter anchors could not be
+            # located -> fail closed (roster_unresolved), rather than shipping an
+            # empty-loadout DB (E-P2-2). Drained through the same path as the
+            # other roster rows at Site B below.
+            roster_fail_closed.append(FailClosed(
+                kind="roster_unresolved",
+                detail=str(exc),
+            ))
+        else:
+            if lowered_roster:
+                log.info(
+                    "[contract] roster re-lowering normalized %d label-roster "
+                    "consumer(s) to the by_label tagged surface", lowered_roster,
+                )
+
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
     # Player-binding rows (computed during the facet section above) lead so an
     # un-bound player is the first thing the operator sees.
     fail_closed: list[FailClosed] = list(player_fail_closed)
+    # Roster-consumer rows (computed at Site A above, where the facts are local):
+    # a roster ambiguity / stale-artifact / unresolved row REJECTS the conversion
+    # rather than shipping a silently-unlowered (empty-loadout) place -- symmetric
+    # with the player-binding fail-closeds (D-P2-7).
+    fail_closed.extend(roster_fail_closed)
     # Surface stem collisions FIRST -- a colliding stem was never added to
     # the path sets, so the per-script verifier loop below can't flag it.
     # Without this surface the module silently disappears (codex P1 finding
@@ -724,6 +790,57 @@ def transpile_with_contract(
         fail_closed=fail_closed,
         runtime_bearing_paths=runtime_bearing_paths,
     )
+
+
+def _roster_fail_closed(
+    roster_facts: dict[str, RosterConsumerFact],
+    by_label: dict[str, list[str]],
+    scene_runtime: _SceneRuntimeArtifact,
+) -> list[FailClosed]:
+    """Roster-consumer fail-closed rows (pure). Mirrors the player-binding
+    guards: surface ambiguity / a stale artifact rather than silently skipping
+    the re-lowering and shipping an empty-loadout DB.
+
+    ``roster_facts`` is already abstaining (empty when ``by_label`` is empty or
+    labels are non-literal); this adds the PROJECT-level guards
+    ``find_roster_consumers`` cannot see from a single module (D-P2-7)."""
+    rows: list[FailClosed] = []
+
+    # roster_ambiguous: >1 distinct module is the unique consumer of the SAME
+    # label (never first-match-wins). Group the located facts by label.
+    consumers_by_label: dict[str, list[str]] = {}
+    for src, fact in roster_facts.items():
+        consumers_by_label.setdefault(fact.label, []).append(src)
+    for label, srcs in sorted(consumers_by_label.items()):
+        if len(srcs) > 1:
+            rows.append(FailClosed(
+                kind="roster_ambiguous",
+                detail=(
+                    f"{len(srcs)} distinct modules load the same Addressables "
+                    f"label {label!r} ({', '.join(sorted(srcs))}); the roster "
+                    f"consumer is ambiguous and none was re-lowered. "
+                    f"Disambiguate the loaders or the by_label mapping."
+                ),
+            ))
+
+    # roster_signal_absent (STALE-ARTIFACT guard, analogous to
+    # player_signal_absent): a non-empty ``by_label`` is expected (a roster IS
+    # planned) but the artifact carries NO ``addressables`` block at all -- the
+    # planner predates the Unit-4 addressables surface. We cannot recompute the
+    # surface here (no scene access), so surface it instead of shipping an
+    # empty-loadout DB. ``find_roster_consumers`` would silently return {}.
+    addressables = scene_runtime.get("addressables")
+    if by_label and addressables is None:
+        rows.append(FailClosed(
+            kind="roster_signal_absent",
+            detail=(
+                "a by_label roster is expected but scene_runtime carries no "
+                "addressables block (artifact predates the Unit-4 addressables "
+                "surface); the roster consumer cannot be re-lowered. Re-run "
+                "plan_scene_runtime (re-convert) so the block is stamped."
+            ),
+        ))
+    return rows
 
 
 # ---------------------------------------------------------------------------
