@@ -346,6 +346,40 @@ class TestAC7IdempotencyAndFailClosed:
         with pytest.raises(RosterUnresolved):
             lower_roster_consumers([s], _FACTS, "RosterMembers")
 
+    def test_interleaved_require_helper_is_not_deleted(self) -> None:
+        # A roster consumer with an UNRELATED require/helper local between the
+        # receiver-table decl and the state decls must keep it: the backward
+        # region walk absorbs ONLY bare state-literal decls (= nil/false/{}/num),
+        # never a `local X = require(...)` / `= <call>`. Whole-region-replacing
+        # across such a line would silently DELETE a dependency the module needs.
+        body = (
+            "local CharacterDatabase = {}\n"
+            "local Signal = require(game.ReplicatedStorage.Signal)\n"
+            "local onLoaded = Signal.new()\n"
+            "local m_CharactersDict = nil\n"
+            "local m_Loaded = false\n"
+            "function CharacterDatabase.dictionary()\n\treturn m_CharactersDict\nend\n"
+            "function CharacterDatabase.loaded()\n\treturn m_Loaded\nend\n"
+            "function CharacterDatabase.GetCharacter(t)\n\treturn nil\nend\n"
+            "function CharacterDatabase.LoadDatabase()\nend\n"
+            "return CharacterDatabase\n"
+        )
+        s = _Script("CharacterDatabase.cs", body)
+        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        # The unrelated require + helper survive the whole-region replace.
+        assert "require(game.ReplicatedStorage.Signal)" in s.luau_source
+        assert "local onLoaded = Signal.new()" in s.luau_source
+        # The canonical body still replaced the four methods + state.
+        assert "_roster_dict" in s.luau_source
+        assert "function CharacterDatabase.LoadDatabase()" in s.luau_source
+        # The bare state locals ARE absorbed (re-owned), no leftover m_* dead code.
+        assert "m_CharactersDict" not in s.luau_source
+        assert "m_Loaded" not in s.luau_source
+        # Idempotent on this shape too.
+        first = s.luau_source
+        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        assert s.luau_source == first
+
     def test_module_not_in_facts_is_untouched(self) -> None:
         # Generality gate (E-P2-6): a non-consumer is never rewritten.
         original = _drift_folder_findfirstchild()

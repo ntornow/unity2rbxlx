@@ -288,13 +288,26 @@ def _locate_region(
     # ``local <ident> = ...`` lines and blank lines that are the state block.
     first_method_start = min(m.start() for m in matches)
     region_start = first_method_start
-    # Walk back over preceding state-declaration lines (``local m_... = ...``)
-    # and blank lines. Stop at the receiver-table decl ``local <N> = {}`` (KEEP
-    # it — the module epilogue ``return <N>`` needs it) or any non-state line.
+    # Walk back over preceding state-declaration lines (``local m_... = nil`` /
+    # ``= false``) and blank lines. Stop at the receiver-table decl
+    # ``local <N> = {}`` (KEEP it — the module epilogue ``return <N>`` needs it)
+    # or any non-state line.
     lines_before = source[:first_method_start].split("\n")
     # Reconstruct char offsets walking backwards.
     consumed = 0
-    state_decl_re = re.compile(r"^[ \t]*local\s+([A-Za-z_]\w*)\s*=")
+    # A receiver-private STATE declaration: a ``local`` whose initializer is a
+    # BARE LITERAL (``nil`` / ``false`` / ``true`` / ``{}`` / a number) — the
+    # shape of the dict/loaded state locals the canonical body re-owns. A
+    # ``local X = require(...)`` / ``= <call>`` / any other expression is NOT a
+    # state decl: absorbing it into the whole-region replace would SILENTLY
+    # DELETE an unrelated require/helper the rest of the module depends on. Such
+    # a line is a STOP boundary (KEPT in place); a leftover AI state local that
+    # is not absorbed merely lingers as a harmless unused local (nothing reads it
+    # once the four methods are replaced) — never a dangling reference.
+    state_decl_re = re.compile(
+        r"^[ \t]*local\s+[A-Za-z_]\w*\s*=\s*"
+        r"(?:nil|false|true|\{\s*\}|-?\d[\d.eExXaAbBcCdDfF]*)\s*$"
+    )
     receiver_decl_re = re.compile(
         r"^[ \t]*local\s+" + re.escape(receiver) + r"\s*="
     )

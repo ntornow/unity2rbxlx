@@ -25,6 +25,8 @@ from converter.code_transpiler import TranspilationResult, TranspiledScript  # n
 from converter.pipeline import Pipeline  # noqa: E402
 from core.roblox_types import RbxPlace, RbxScript  # noqa: E402
 
+_CONSUMER_FILENAME = "CharacterDatabase.luau"
+
 
 def _make_pipeline(tmp_path: Path) -> Pipeline:
     unity_project = tmp_path / "unity"
@@ -188,3 +190,74 @@ class TestCarrierRoundTrip:
     def test_loader_returns_empty_on_missing_plan(self, tmp_path: Path) -> None:
         pipeline = _make_pipeline(tmp_path)
         assert pipeline._load_roster_binding_for_rehydration() == {}
+
+
+class TestCarrierConversionCopy:
+    """The carrier must FLOW from ``TranspiledScript`` onto the produced
+    ``RbxScript`` at the fresh-transpile conversion site
+    (``_subphase_emit_scripts_to_disk``). The AC4/AC5 dead-set tests construct
+    ``RbxScript`` WITH the carrier directly, so they bypass this copy — if the
+    ``roster_binding=ts.roster_binding`` line were dropped, those tests still
+    pass while the real pipeline silently re-stubs the re-lowered module. This
+    test drives the real conversion and asserts the copy + that the dead-set
+    exemption honors the COPIED carrier end-to-end (no hand-built RbxScript)."""
+
+    def _transpilation_with_carrier(
+        self, roster_binding: object,
+    ) -> TranspilationResult:
+        return TranspilationResult(
+            scripts=[
+                TranspiledScript(
+                    source_path="Assets/CharacterDatabase.cs",
+                    output_filename=_CONSUMER_FILENAME,
+                    csharp_source=_DEAD_LEANING_CS,
+                    luau_source=_INERT_BODY,
+                    strategy="ai",
+                    confidence=1.0,
+                    script_type="ModuleScript",
+                    roster_binding=roster_binding,  # type: ignore[arg-type]
+                ),
+            ],
+            total_transpiled=1,
+            total_ai=1,
+        )
+
+    def test_carrier_copied_onto_rbxscript_then_exempts(
+        self, tmp_path: Path,
+    ) -> None:
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.transpilation_result = self._transpilation_with_carrier(
+            _CARRIER,
+        )
+        pipeline._subphase_emit_scripts_to_disk()
+        produced = next(
+            s for s in pipeline.state.rbx_place.scripts
+            if s.name == "CharacterDatabase"
+        )
+        assert produced.roster_binding == _CARRIER, (
+            "the carrier must be COPIED from TranspiledScript onto the produced "
+            "RbxScript at the conversion site (pipeline.py ~:3139)"
+        )
+        # End-to-end: the COPIED carrier (not a hand-built one) keeps the module
+        # out of the dead set.
+        pipeline._subphase_analyze_dead_modules()
+        assert "CharacterDatabase" not in pipeline.state.dead_modules
+
+    def test_RED_no_carrier_on_transpiled_script_lands_dead(
+        self, tmp_path: Path,
+    ) -> None:
+        # Control: a TranspiledScript WITHOUT a carrier produces an RbxScript
+        # without one, and the inert body lands in the dead set — proving the
+        # copied carrier (not an incidental veto) is the load-bearing lever.
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.transpilation_result = self._transpilation_with_carrier(None)
+        pipeline._subphase_emit_scripts_to_disk()
+        produced = next(
+            s for s in pipeline.state.rbx_place.scripts
+            if s.name == "CharacterDatabase"
+        )
+        assert produced.roster_binding is None
+        pipeline._subphase_analyze_dead_modules()
+        assert "CharacterDatabase" in pipeline.state.dead_modules
