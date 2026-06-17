@@ -2848,3 +2848,33 @@ principles. Design: `design.md` (re-anchored against worktree `1acd1bb`).
   OPERATING.md (net-negative fix → revert to last-good + log residual; right-size: gate hardening on evidence the
   failure occurs), reverted to `1abead9` and carried the gap as a documented followup. Overruled-with-evidence, not
   silently dropped; surfaced at Gate B.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 (e2e-found addendum) ==== -->
+## 2026-06-17 — verify-stage decision (dispatch root cause; e2e-found)
+  silently dropped; surfaced at Gate B.
+
+## 2026-06-17 — verify-stage decision (dispatch root cause; e2e-found)
+- **D-10 — Detect Toggle as `MonoBehaviour + m_IsOn`, not `ct == "Toggle"`.** A live SimpleFPS conversion (the e2e the
+  feature is for) emitted 0 binding rows for 4 real HUD toggles: real Unity UI Toggles serialize as `MonoBehaviour`
+  (m_Script GUID), never a literal `"Toggle"` component_type, so the dispatch was dead on real scenes (and the
+  pre-existing `ToggleIsOn` never fired either). Fix mirrors the Button `m_OnClick` heuristic. Re-verified live:
+  4 rows incl Battery `toggle_sri=264237063 graphic_sri=250410364`. The whole 5-round design + slice reviews missed
+  this by anchoring on the assumed canonical "Toggle" type — the real input space (MonoBehaviour+GUID) was never
+  exercised until a live conversion. Lesson: enumerate the REAL serialization before locking a dispatch.
+
+<!-- /drive checkmark-toggle-binding-20260617T075020 — verify-stage (faithful Mode-2 e2e) -->
+## 2026-06-17 — verify-stage decision (premise correction; faithful Mode-2 e2e)
+- **D-11 — Premise refined against the FAITHFUL conversion; feature confirmed live.** A faithful `/convert-unity`
+  Mode-2 conversion (NOT u2r — `convert_interactive`, client/server split, AI transpile) revealed the AI `HudControl`
+  ALREADY reveals the checkmark on pickup by node-NAME (`FindFirstChild("Checkmark")`). So the original premise
+  ("UpdatePlayerItems only SetAttribute('isOn') with NO reader") is conversion-dependent/incomplete. The bug the
+  binding UNIQUELY + DETERMINISTICALLY fixes: (1) **initial-state hide** — uncollected items show checkmarks at spawn
+  (template `Visible=true`, m_IsOn=0); the AI reveal-on-pickup never hides them; and (2) the **generic, deterministic
+  guarantee** — the AI's reveal is non-deterministic (it reasoned its way to adding it this run) + non-generic
+  (hardcodes the name "Checkmark"); the binding keys on SRIs and always runs. **LIVE A9 (faithful build, Studio Play
+  client) PASS:** all 4 checkmarks `Visible=false` at spawn; Battery `isOn=true`→`Visible=true`, `isOn=false`→`false`,
+  driven by the binding's attr-change listener (set the attribute directly, isolating the binding from HudControl).
+  smoke=pass, validator=pass, scriptErrorCount=0.
+- **D-12 — e2e MUST use /convert-unity (or /e2e-test), NEVER u2r** (recorded as a durable lesson): u2r mandates
+  `--skip-architecture-step` (no client/server split) → can't faithfully run the client-only binding. u2r is OK only
+  for deterministic converter-unit checks (A6 plan emission).

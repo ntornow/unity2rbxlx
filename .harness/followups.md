@@ -801,3 +801,14 @@ converter/runtime/scene_runtime.luau (queue site ~:1300) — self-contradictory/
   (>10s PlayerGui). Fix belongs in the host's PlayerGui acquisition, not this feature.
 - **Slider→fill (health) visual binding** — DEFERRED; build as `ui_slider_bindings` reusing this mechanism.
 - **Particle/transparency-based hide** (vs `.Visible`) — revisit only if e2e shows a graphic that must dim.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 (e2e-found addendum) ==== -->
+## 2026-06-17 — e2e-found (dispatch)
+- **Broader UI-widget dead-dispatch audit.** `_convert_ui_element` dispatches `Slider`/`InputField`/`Dropdown`/`ScrollRect`
+  on LITERAL component_type names, but real Unity serializes these as `MonoBehaviour` (m_Script GUID) — so their property
+  extraction is likely dead on real scenes too (same class as the Toggle bug fixed here). `Button` and now `Toggle` have
+  MonoBehaviour heuristics; the rest need the same audit. (Slider is already deferred as `ui_slider_bindings`.)
+- **`m_IsOn` Toggle discriminator precision.** Detection is `MonoBehaviour + m_IsOn` (mirrors Button `m_OnClick`). A
+  non-Toggle MonoBehaviour with an `m_IsOn` field could false-positive, but harm is bounded (a spurious binding row needs
+  ALSO a resolvable `graphic`; otherwise just a benign stray `ToggleIsOn` attribute). If a definitive m_Script-GUID→type
+  resolution is added later, key the dispatch off it instead of the field heuristic.
