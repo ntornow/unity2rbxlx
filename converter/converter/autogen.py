@@ -648,6 +648,12 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # it off the embedded plan; without it here the filter would silently elide
     # the field and the client would fall back to a frozen 9.81.
     "gravityDesiredBaseStuds",
+    # Toggle ``isOn`` -> checkmark-graphic visual bindings (list of
+    # ``ToggleBinding`` rows), stashed onto ``scene_runtime`` by
+    # ``convert_scene``. The client runtime binds each row's graphic ``.Visible``
+    # to the Toggle's ``isOn`` attribute; without it here the field is elided and
+    # the runtime never binds.
+    "ui_toggle_bindings",
     # Unit-3 theme registration: per-DB seed records the entrypoint shim replays
     # at boot. LOAD-BEARING — without the allowlist entry the recomputed key is
     # elided from the emitted plan and the shim sees ``{}`` (dead registry).
@@ -929,6 +935,19 @@ local services = {
     findOrCreateChannel = findOrCreateChannel,
     workspaceFind = workspaceFind,
     awaitUiHost = awaitUiHost,
+    -- Standing late-clone watch for Toggle->checkmark bindings -- CLIENT ONLY
+    -- (the server table OMITS it, so the server never binds UI). UNLIKE the
+    -- one-shot ``awaitUiHost`` (disconnects after the first match + 10s
+    -- timeout), this returns a never-disconnected, no-timeout
+    -- ``PlayerGui.DescendantAdded`` connection so every late / ResetOnSpawn
+    -- re-clone fires for the whole session. The runtime installs it once in
+    -- ``start()`` (connect-then-scan) and dispatches each fire via an O(1)
+    -- ``_unboundToggleIndex`` lookup. A nil PlayerGui yields no watch (the
+    -- host then never scans/binds -- fail-closed).
+    installUiDescendantWatch = function(handler)
+        if not PlayerGui then return nil end
+        return PlayerGui.DescendantAdded:Connect(handler)
+    end,
     findFirstChildWhichIsA = function(inst, class)
         -- ``GetComponent("Rigidbody")`` etc. should hit a built-in
         -- attached directly to the GameObject AS WELL as nested

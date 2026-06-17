@@ -329,6 +329,21 @@ function SceneRuntime.new(services, plan)
 	-- the full engine-union key (``<placement>:<prefab>:<src_fid>``).
 	self._pendingPlacementRefs = nil
 
+	-- Toggle ``isOn`` -> checkmark ``.Visible`` bindings (client-only). Built
+	-- lazily at watch install; nil/empty for non-UI or no-toggle runs.
+	--   ``_boundRows[row] = toggle instance`` -- PER-ROW exactly-once marker
+	--     (NOT per-instance: two rows sharing one toggle each bind their own
+	--     graphic). The instance VALUE re-binds on a respawn re-clone (same
+	--     SRI, NEW instance -> ``_boundRows[row] ~= newToggle``).
+	--   ``_unboundToggleIndex[sri] = LIST of rows`` -- O(1) dispatch per
+	--     ``DescendantAdded`` fire, seeded with BOTH ``toggle_sri`` and
+	--     ``graphic_sri`` (either may be shared across rows -> a list, not a
+	--     single row). Rows stay indexed for the session so respawn re-clones
+	--     re-match; per-bind idempotency is the per-row marker, not eviction.
+	self._boundRows = setmetatable({}, {__mode = "v"})
+	self._unboundToggleIndex = nil
+	self._toggleWatchConn = nil
+
 	return self
 end
 
@@ -3119,6 +3134,109 @@ function SceneRuntime:_lifecycleOrderFor(entry)
 end
 
 -- ---------------------------------------------------------------------
+-- Toggle ``isOn`` -> checkmark-graphic visual binding (generic, CLIENT-only).
+-- Anchored on the Unity Toggle component + its serialized ``graphic`` fileID,
+-- resolved (at conversion time) to the checkmark's ``_SceneRuntimeId``. The
+-- runtime drives the graphic's ``.Visible`` off the Toggle's ``isOn``
+-- attribute. NO node names; NO server binding (the watch service is
+-- client-only). Initial visibility is order-independent because every bind
+-- reads the LIVE attribute (fallback ``initial_on``), so no pre-Awake hook is
+-- needed (``start()`` never yields -> a present clone binds before any frame).
+-- ---------------------------------------------------------------------
+
+function SceneRuntime:_setGraphicVisible(inst, on)
+	-- ``.Visible`` is the faithful Roblox show/hide for a GuiObject (the
+	-- checkmark is an ImageLabel). Guard so a non-GuiObject endpoint can't
+	-- error (fail-closed).
+	if inst == nil then return end
+	local ok = pcall(function() inst.Visible = on end)
+	if not ok then
+		self._warn("[toggle-binding] could not set .Visible on graphic")
+	end
+end
+
+function SceneRuntime:_buildUnboundToggleIndex()
+	-- ``sri -> LIST of rows``, seeded with BOTH endpoints of every row so a
+	-- ``DescendantAdded`` for either the toggle OR the graphic looks up the
+	-- row in O(1). A list because either SRI may be shared across rows.
+	local index = {}
+	local function add(sri, row)
+		if type(sri) ~= "string" or sri == "" then return end
+		local list = index[sri]
+		if not list then list = {}; index[sri] = list end
+		table.insert(list, row)
+	end
+	for _, b in ipairs(self._plan.ui_toggle_bindings or {}) do
+		add(b.toggle_sri, b)
+		add(b.graphic_sri, b)
+	end
+	self._unboundToggleIndex = index
+end
+
+function SceneRuntime:_bindOneToggle(b, hint)
+	-- Bind ONE row's toggle->graphic, idempotently. SRI service, never a raw
+	-- walk. ``hint`` is an already-resolved endpoint (the ``DescendantAdded``
+	-- ``desc``) to skip one linear scan.
+	local toggle = (hint and hint:GetAttribute("_SceneRuntimeId") == b.toggle_sri and hint)
+		or self._services.workspaceFind(b.toggle_sri)
+	if toggle == nil then return end
+	if self._boundRows[b] == toggle then return end   -- this ROW already bound to THIS live instance
+	local graphic = (hint and hint:GetAttribute("_SceneRuntimeId") == b.graphic_sri and hint)
+		or self._services.workspaceFind(b.graphic_sri)
+	if graphic == nil then return end                  -- re-attempt when the sibling lands
+	-- Initial visibility from the LIVE attribute if ANYTHING already set it,
+	-- else the static planner ``initial_on``. ``live == nil`` is the NORMAL
+	-- not-yet-flipped case (the writer sets ``isOn`` only on a runtime event),
+	-- so it is the silent ``initial_on`` fallback -- NOT a warn.
+	local live = toggle:GetAttribute(b.attr_name)
+	local on = (live ~= nil and live == true) or (live == nil and b.initial_on == true)
+	self:_setGraphicVisible(graphic, on)
+	-- A destroyed clone (respawn) auto-disconnects its signals, so the old
+	-- connection need not be tracked for teardown; re-bind records the new one.
+	toggle:GetAttributeChangedSignal(b.attr_name):Connect(function()
+		self:_setGraphicVisible(graphic, toggle:GetAttribute(b.attr_name) == true)
+	end)
+	self._boundRows[b] = toggle                        -- per-row exactly-once marker
+end
+
+function SceneRuntime:_applyToggleGraphicBindings()
+	-- One-time scan over all rows (used ONLY at watch install). Rows whose
+	-- clones haven't landed no-op and are bound later by the standing watch.
+	for _, b in ipairs(self._plan.ui_toggle_bindings or {}) do
+		self:_bindOneToggle(b, nil)
+	end
+end
+
+function SceneRuntime:_installToggleGraphicWatch()
+	-- The SOLE binder. Client-only: gated on the client-only
+	-- ``installUiDescendantWatch`` service, so the server NEVER binds (no
+	-- scan, no signal connect, no ``.Visible`` mutation of the StarterGui
+	-- template). Connect-then-scan once: install the standing watch FIRST so a
+	-- clone landing during the install scan still fires, then run the one-time
+	-- scan for clones already present.
+	local install = self._services.installUiDescendantWatch
+	if type(install) ~= "function" then return end       -- server / no UI watch -> never bind
+	local rows = self._plan.ui_toggle_bindings
+	if type(rows) ~= "table" or #rows == 0 then return end -- nothing to bind
+	self:_buildUnboundToggleIndex()
+	local engine = self
+	self._toggleWatchConn = install(function(desc)
+		local sri = desc:GetAttribute("_SceneRuntimeId")
+		if sri == nil then return end                    -- non-matching descendant short-circuit
+		local matched = engine._unboundToggleIndex[sri]
+		if matched == nil then return end                -- O(1) miss -> no rescan
+		for _, b in ipairs(matched) do
+			engine:_bindOneToggle(b, desc)               -- reuse desc as the resolved endpoint
+		end
+	end)
+	-- Fail-closed: a present service may still decline (e.g. client with no
+	-- PlayerGui yet returns ``nil``). No standing watch -> never scan/bind, so
+	-- we never fall back to mutating the StarterGui template's ``.Visible``.
+	if self._toggleWatchConn == nil then return end
+	-- Now bind everything already present (connect-then-scan race close).
+	self:_applyToggleGraphicBindings()
+end
+
 -- Static-event channel identity: pre-set module-table fields before Awake
 -- ---------------------------------------------------------------------
 
@@ -3470,6 +3588,14 @@ function SceneRuntime:start(domainFilter)
 	-- deferred components run their own complete late lifecycle batch once
 	-- their PlayerGui clone resolves event-driven.
 	self:_resolveDeferredUiInstances()
+
+	-- Install the standing client-only Toggle->checkmark watch AFTER deferred
+	-- UI resolution (connect-then-scan once). Client-gated on
+	-- the ``installUiDescendantWatch`` service, so the server never binds. The
+	-- live-attribute read at bind makes initial visibility order-independent --
+	-- no pre-Awake hook needed (``start()`` never yields, so a present clone
+	-- binds before the first rendered frame).
+	self:_installToggleGraphicWatch()
 
 	-- Build the host-owned per-player embodiment authority (paradigm C).
 	-- Client-only + keyed on the upstream has_character_controller MODULE

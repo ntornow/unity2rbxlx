@@ -836,6 +836,37 @@ converter/runtime/scene_runtime.luau (queue site ~:1300) — self-contradictory/
 ## From Unit 2 phase-3 harden (WARN-timing residual — reverted net-negative patch)
 - converter/runtime/scene_runtime.luau — the residual "stripped ref never resolved" WARN has imperfect timing across MULTIPLE async UI-deferred host groups: it can fire PREMATURELY (a ref that a later group will bind) — that's the last-good behavior we kept. A harden attempt to gate it on a _deferredGroupsPending counter + a final drain was REVERTED because it introduced the opposite bug (WARN SUPPRESSED forever when the last group completes as an empty batch — codex). The WARN is DIAGNOSTIC-ONLY; binding is correct either way (cross-domain refs never queued; same-domain incl. missionPopup bind via the original post-placement + per-batch drains). Getting the WARN's exact multi-group async timing right is deferred (no real game exercises it: Trash-Dash's 3 stripped refs are client→client and their targets register). Fix when a real case appears.
 
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 ==== -->
+# Followups — checkmark-toggle-binding-20260617T075020
+
+- **Structurally canonicalize the Toggle `isOn` writer attribute** (r2 attr-fingerprint residual). The binding reads
+  the `"isOn"` attribute the AI-transpiled writer emits; on a future game whose transpile emits a different
+  name/casing it would bind-but-never-update. Make the converter own the attribute on BOTH writer (lowering) and
+  reader (binding) sides so `attr_name` stops being an AI-output fingerprint. Interim guards: A4 convention pin
+  (RED at converter-build time) + the structural source. (D-4 keeps the AI writer untouched in this slice.)
+- **Graphic-only re-clone with a surviving toggle does not re-bind** (E11 residual, OVERRULED-as-unreachable). The
+  per-row `_boundRows` marker keys re-bind off the toggle instance; a checkmark graphic re-created while its toggle
+  survives would keep the stale binding. UNREACHABLE in converter output (a converted checkmark is a child of the
+  toggle's ScreenGui → re-clones with it). The `(toggle,graphic)`-pair marker was tried + reverted (it leaked the
+  listener on the surviving toggle — net-negative). If a future binding kind decouples the endpoints, the proper
+  fix is a pair marker that ALSO tracks+disconnects the per-row connection on re-bind.
+- **PlayerGui one-time capture never recovers after a 10s WaitForChild timeout** (phase MINOR). The client host
+  captures `PlayerGui` once; if that times out, the toggle watch (like every UI service that closes over the same
+  `PlayerGui`) never installs for the session. Pre-existing shared host infra, not toggle-specific; pathological
+  (>10s PlayerGui). Fix belongs in the host's PlayerGui acquisition, not this feature.
+- **Slider→fill (health) visual binding** — DEFERRED; build as `ui_slider_bindings` reusing this mechanism.
+- **Particle/transparency-based hide** (vs `.Visible`) — revisit only if e2e shows a graphic that must dim.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 (e2e-found addendum) ==== -->
+## 2026-06-17 — e2e-found (dispatch)
+- **Broader UI-widget dead-dispatch audit.** `_convert_ui_element` dispatches `Slider`/`InputField`/`Dropdown`/`ScrollRect`
+  on LITERAL component_type names, but real Unity serializes these as `MonoBehaviour` (m_Script GUID) — so their property
+  extraction is likely dead on real scenes too (same class as the Toggle bug fixed here). `Button` and now `Toggle` have
+  MonoBehaviour heuristics; the rest need the same audit. (Slider is already deferred as `ui_slider_bindings`.)
+- **`m_IsOn` Toggle discriminator precision.** Detection is `MonoBehaviour + m_IsOn` (mirrors Button `m_OnClick`). A
+  non-Toggle MonoBehaviour with an `m_IsOn` field could false-positive, but harm is bounded (a spurious binding row needs
+  ALSO a resolvable `graphic`; otherwise just a benign stray `ToggleIsOn` attribute). If a definitive m_Script-GUID→type
+  resolution is added later, key the dispatch off it instead of the field heuristic.
 
 ## ── /drive run addressables-unit3-themes-20260617T080323 — Addressables Unit 3 (Themes) — 2026-06-17T04:00:11Z ──
 

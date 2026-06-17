@@ -300,6 +300,46 @@ class TestEntrypointGenerators:
                 f"plan source"
             )
 
+    def test_plan_module_embeds_ui_toggle_bindings(self):
+        """``ui_toggle_bindings`` must survive the ``_PLAN_KEYS_FOR_HOST``
+        allowlist filter and land in the embedded plan ModuleScript; without
+        it the runtime never binds."""
+        rows = [
+            {
+                "toggle_sri": "Assets/Scenes/main.unity:264237063",
+                "graphic_sri": "Assets/Scenes/main.unity:250410364",
+                "initial_on": False,
+                "attr_name": "isOn",
+            },
+        ]
+        script = generate_scene_runtime_plan_module({
+            "modules": {}, "scenes": {}, "prefabs": {},
+            "ui_toggle_bindings": rows,
+        })
+        src = script.source
+        assert "ui_toggle_bindings" in src, (
+            "embedded plan must carry ui_toggle_bindings; if missing the "
+            "_PLAN_KEYS_FOR_HOST allowlist dropped it"
+        )
+        assert "Assets/Scenes/main.unity:264237063" in src
+        assert "Assets/Scenes/main.unity:250410364" in src
+
+    def test_install_ui_descendant_watch_is_client_only(self):
+        """The standing late-clone watch service ``installUiDescendantWatch``
+        is present on the CLIENT entrypoint's services table and OMITTED from
+        the server (so the server never binds UI); fail-closed-on-server is
+        enforced by this asymmetry."""
+        client = generate_scene_runtime_client_entrypoint().source
+        server = generate_scene_runtime_server_entrypoint().source
+        assert "installUiDescendantWatch" in client, (
+            "client must inject the standing DescendantAdded watch"
+        )
+        assert "installUiDescendantWatch" not in server, (
+            "server table must OMIT the watch -- server never binds UI"
+        )
+        # It returns a standing DescendantAdded connection (no timeout).
+        assert "DescendantAdded:Connect" in client
+
     def test_entrypoints_split_module_path_on_dot_not_slash(self):
         """R2-P1.1: ``module_path`` is the dotted DataModel path. Both
         client and server entrypoints must split on ``"."`` so they can
