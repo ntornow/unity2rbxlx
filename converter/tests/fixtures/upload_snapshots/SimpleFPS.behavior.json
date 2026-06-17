@@ -175,9 +175,9 @@
     },
     {
       "id": "mine_damages_player",
-      "feature": "8. Walking to a mine triggers damage. Mine is a MeshPart at workspace.DynamicObjects.Level.Beach.BeachTurrets.Mine (no enclosing Model — _findVisible handles BasePart directly). The Humanoid auto-regen erases damage within ~10s, so we track Health via GetPropertyChangedSignal and assert min() < h0 rather than end-state.",
+      "feature": "8. Walking to a mine triggers damage. Mine is an Anchored, CanCollide=false trigger MeshPart (~2.88x0.87x3.12) at workspace.DynamicObjects.Level.Beach.BeachTurrets.Mine (no enclosing Model — _findVisible handles BasePart directly). A static teleport-into-overlap does NOT reliably fire Touched and a hover above the 0.87-tall body misses it entirely; the setup SWEEPS the HRP through the mine at its own vertical level (c.Y+0.5, so the 2.02-tall HRP straddles the body) over 30 frames, overriding physics each frame, which crosses the non-touching->touching boundary and fires the client Touched->Explode->Humanoid:TakeDamage. The Humanoid auto-regen erases damage within ~10s, so we track Health via GetPropertyChangedSignal and assert min() < h0 rather than end-state. Live-verified 2026-06-17 (100->90).",
       "play_mode": true,
-      "setup_luau": "_reset(); _trackHealth(); local p = _findHazard('Mine'); hrp.CFrame = CFrame.new(p.Position + Vector3.new(0, 3, 0))",
+      "setup_luau": "_reset(); _trackHealth(); local p = _findHazard('Mine'); local c = p.Position; local SPAN, N = 10, 30; for i = 0, N do local x = c.X - SPAN / 2 + SPAN * (i / N); char:PivotTo(CFrame.new(x, c.Y + 0.5, c.Z)); task.wait() end",
       "wait_seconds": 3.0,
       "assert_luau": "return (char.Parent == nil) or _minHealth() < _G._state.h0",
       "expect": true

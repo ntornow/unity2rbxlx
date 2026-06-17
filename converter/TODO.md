@@ -51,7 +51,12 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   **Order:** stage 3 is the first blocker but stage 4 is independent — fixing the projectile alone won't
   turn F16 green. Schema cross-refs: §3 row 8 (projectile), §8 T-bullet row (corrected 2026-06-15).
 
-- [ ] **P0 (generic) — F10 door never opens: animation driver-domain unresolved → server fallback (pattern #9). Empirically reproduced 2026-06-14.**
+- [x] **P0 (generic) — F10 door never opens: animation driver-domain unresolved → server fallback (pattern #9). Empirically reproduced 2026-06-14.**
+  FIXED 2026-06-16 (`fix/door-animator-source-narrowing`, PR #195 / `a10b60f`): dynamic-getter
+  Animator drivers are resolved via C# source narrowing (scan the scope for the param-write to the
+  clip's `observed_attribute`, inherit that writer's domain). NOTE: the F10 *e2e fixture* still
+  contact-misses (the player teleport doesn't walk into the trigger) — that harness-only half is
+  tracked in the F15/F10-fixture P1 below, NOT here.
   Implements the **CANDIDATE** in `docs/design/generic-converter-architecture.md` §3 row 9
   ("dynamic-component-ref → driver-domain"). Status was analysis-only (PR #188, 2026-06-11);
   this entry adds the live repro + the precise fix site + nuances.
@@ -94,19 +99,24 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   trigger (camera-aligned W-drive — `Player:Move` is camera-`_yaw`-relative, not character-facing).
   F10 won't pass until pattern #9 lands AND the fixture walks in. See the next item for F15.
 
-- [ ] **P1 (e2e fixture) — F15 mine + F10 door fixtures contact-miss; mine is independently fixable. Verified 2026-06-14.**
+- [ ] **P1 (e2e fixture) — F10 door fixture contact-miss. (F15 mine FIXED 2026-06-17.)**
   Harness-only (`tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`), no converter change.
-  Original setups single-teleport the player to a point that doesn't overlap the trigger (F15:
-  `mine.Position+3` hovers above the 0.87-tall mine; F10: above the door TriggerZone — see above).
-  **F15 fix (verified live):** Mine runs `domain:client` and client `Humanoid:TakeDamage` STICKS
-  in single-player (proved 100→75 held). A client-side swept `PivotTo` *through* the mine at
-  ground level fires the client `Touched` → `Explode` → `TakeDamage` (proved 100→90). Replace the
-  hover-teleport with a ground-level swept entry. F15 needs NO converter change and can land now.
-  Codex's earlier W-drive edit to these two fixtures is on the working tree (uncommitted) but has a
-  flaw — it refaces the character via `PivotTo(CFrame.lookAt)`, which is dead (movement is
-  camera-`_yaw`-relative, `scene_camera_input.luau:184,226`); revert/replace before using it.
+  Original setups single-teleport the player to a point that doesn't overlap the trigger.
+  **F15 mine — FIXED 2026-06-17 (live-verified, this commit):** the `mine.Position+3` hover floated
+  the whole character above the 0.87-tall mine body and a static teleport-into-overlap doesn't fire
+  `Touched`. Replaced with a translation-only swept `PivotTo` through the mine at its own vertical
+  level (`c.Y+0.5`, 30 frames), overriding physics each frame → crosses the non-touching→touching
+  boundary → client `Touched → Explode → Humanoid:TakeDamage`. Driven live in Studio against the
+  `2026-06-05` SimpleFPS conversion: 100→90, char alive. NO facing reliance (the dead
+  `PivotTo(CFrame.lookAt)` reface was avoided — movement is camera-`_yaw`-relative).
+  **F10 door — STILL OPEN.** The door converter fix (#9) landed (PR #195), but the fixture still
+  teleports `door_mesh.Position - LookVector*6 + (0,2,0)` which doesn't enter the door TriggerZone
+  volume; it needs a swept walk-in like the mine, AND it `depends_on` `walk_to_cardkey_picks_it_up`
+  (hasKey first). Apply the same swept-entry pattern through the TriggerZone, then live-verify the
+  visual tween (`dPos>1 or dRot>0.2`).
 
-- [ ] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering from a stronger signal than AI-output text (turret won't spin/fire); **T-bullet** nil-parent→workspace default in the `instantiatePrefab` clone service (bullets never enter the DataModel); **R** generic `weaponSlot` rebind (rifle not held); **D** door dynamic-Animator-driver narrowing (`pr148-followups`); **H** HudControl client-domain rule. Highest leverage: Slice T (+ T-bullet) clears the turret. File:line evidence in the Step-1b run ledger.
+- [x] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering, **T-bullet** nil-parent→workspace default, **R** generic `weaponSlot` rebind, **D** door dynamic-Animator-driver narrowing, **H** HudControl client-domain rule.
+  STATUS (verified 2026-06-17): **T** ✅ Phase-1 canary merged #193; **R** ✅ merged #191 (`drive/rifle-dropped-ref`); **D** ✅ merged #195; **H** ✅ done (HudControl classifies `domain:client`/`LocalScript` — `simplefps_minimal.json`). The remaining turret **projectile-physics + damage** half (#8 stages 3–4) is ACTIVELY OWNED by `drive/turret-bullet-damage-real` (tip `58651d7` "bind damage Touched to the colliding body") — tracked under the F16 turret P0 above, not here. Nothing in this entry is outstanding-and-unowned.
 
 - [x] **P1 — Shared-flag name sanitization is unowned (pre-existing; surfaced by Phase 2b reframe, 2026-06-01).** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`, PR #165): canonical ASCII sanitizer applied at the runtime `"has" .. name` concat (emitted Luau `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine dynamic reader; `itemName`/`ItemType` kept RAW (gameplay payloads); scan made ASCII-explicit. See `docs/design/shared-flag-name-sanitization-brief.md`.
   The generator builds the shared-flag attribute name as `"has" .. itemName`
