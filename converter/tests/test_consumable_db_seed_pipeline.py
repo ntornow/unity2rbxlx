@@ -39,14 +39,36 @@ def _pipeline_with_state(root: Path, tmp_path: Path) -> Pipeline:
             name="Consumables", source="return {}",
             script_type="ModuleScript", parent_path="ServerStorage",
         ),
+        RbxScript(
+            name="CoinMagnet", source="return {}",
+            script_type="ModuleScript", parent_path="ServerStorage",
+        ),
+        RbxScript(
+            name="ExtraLife", source="return {}",
+            script_type="ModuleScript", parent_path="ServerStorage",
+        ),
     ]
     return pipe
 
 
 def _scene_runtime_with_so_map() -> dict[str, object]:
     # The SO guid->module map (built by an essential phase) keyed on the asset's
-    # own guid; the value is the emitted module path (named by m_Name).
-    return {"scriptable_objects": {G_ASSET: "ServerStorage.Consumables"}}
+    # own guid; the value is the emitted module path (named by m_Name). The
+    # ``modules`` registry is what the build-time subclass module-path resolver
+    # (P2 fix) joins through — each subclass stem -> its emitted module_path.
+    return {
+        "scriptable_objects": {G_ASSET: "ServerStorage.Consumables"},
+        "modules": {
+            "guidCoinMagnet": {
+                "stem": "CoinMagnet", "class_name": "CoinMagnet",
+                "module_path": "ServerStorage.CoinMagnet",
+            },
+            "guidExtraLife": {
+                "stem": "ExtraLife", "class_name": "ExtraLife",
+                "module_path": "ServerStorage.ExtraLife",
+            },
+        },
+    }
 
 
 def test_pipeline_seed_built_with_asset_name_class_name_skew(tmp_path):
@@ -73,6 +95,11 @@ def test_pipeline_seed_built_with_asset_name_class_name_skew(tmp_path):
     assert seed["db_module_path"] == "ServerStorage.Consumables"
     assert seed["array_field"] == "consumbales"
     assert [e["class_stem"] for e in seed["elements"]] == ["CoinMagnet", "ExtraLife"]
+    # P2: module_path resolved at BUILD time via the modules registry (no runtime
+    # stem scan). Each element carries its full collision-free module path.
+    assert [e["module_path"] for e in seed["elements"]] == [
+        "ServerStorage.CoinMagnet", "ServerStorage.ExtraLife",
+    ]
 
 
 def test_pipeline_recompute_is_pop_first_idempotent(tmp_path):

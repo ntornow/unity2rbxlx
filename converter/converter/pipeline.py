@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING
 from typing import Any, NamedTuple, TypedDict, cast
 
@@ -7425,6 +7425,16 @@ script.Disabled = true
         # reused across every DB candidate).
         base_by_class = build_base_by_class(guid_index)
 
+        # Build-time subclass module-path resolver, replacing the shim's
+        # non-deterministic runtime stem scan (finding P2). Joins a subclass stem
+        # to its emitted ``module_path`` through ``scene_runtime["modules"]``
+        # (primary: ``class_name``; fallback: ``stem``) under the SAME collision-
+        # exclusion contract the planner enforces — a colliding stem/class_name
+        # returns None (the element is DROPPED, fail-closed).
+        module_path_for_stem = self._build_subclass_module_path_resolver(
+            scene_runtime,
+        )
+
         seeds: list[ConsumableSeed] = []
         seeded_db_paths: set[str] = set()
         for guid in sorted(g for g in so_map_obj if isinstance(g, str)):
@@ -7467,6 +7477,7 @@ script.Disabled = true
                 asset_body=asset_body,
                 guid_index=guid_index,
                 base_by_class=base_by_class,
+                module_path_for_stem=module_path_for_stem,
             )
             if seed is None:
                 continue
@@ -7485,6 +7496,65 @@ script.Disabled = true
                 "seed(s) (%d element(s) total)",
                 len(seeds), sum(len(s["elements"]) for s in seeds),
             )
+
+    def _build_subclass_module_path_resolver(
+        self, scene_runtime: dict[str, object],
+    ) -> "Callable[[str], str | None]":
+        """Return a callable ``class_stem -> module_path | None`` that resolves a
+        subclass stem to its emitted module's dotted DataModel path AT BUILD TIME,
+        replacing the shim's non-deterministic runtime ``pairs()`` scan (P2).
+
+        Joins through ``scene_runtime["modules"]`` (each row carries ``stem`` /
+        ``class_name`` / ``module_path``) with the planner's collision-exclusion
+        contract: a stem that is a colliding ``class_name`` OR a colliding ``stem``
+        is EXCLUDED (returns ``None``), so a fail-closed element DROP mirrors
+        ``build_script_id_by_name``. Primary join on ``class_name`` (the C# class
+        name == the stem for the consumable family), fallback on ``stem``.
+        """
+        from converter.scene_runtime_planner import (
+            _compute_stem_collisions,
+            compute_class_name_collisions,
+        )
+
+        modules_obj = scene_runtime.get("modules")
+        modules: dict[str, object] = (
+            modules_obj if isinstance(modules_obj, dict) else {}
+        )
+        class_name_collisions = compute_class_name_collisions(
+            cast("dict", modules),
+        )
+        stem_collisions = _compute_stem_collisions(cast("dict", modules))
+
+        # Build collision-free name -> module_path indexes (primary class_name,
+        # fallback stem), excluding colliding keys exactly like the planner.
+        by_class_name: dict[str, str] = {}
+        by_stem: dict[str, str] = {}
+        for module in modules.values():
+            if not isinstance(module, dict):
+                continue
+            mp_obj = module.get("module_path")
+            if not isinstance(mp_obj, str) or not mp_obj:
+                continue
+            cn_obj = module.get("class_name", "")
+            cn = cn_obj if isinstance(cn_obj, str) else ""
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            if cn and cn not in class_name_collisions:
+                by_class_name.setdefault(cn, mp_obj)
+            if stem and stem != cn and stem not in stem_collisions:
+                by_stem.setdefault(stem, mp_obj)
+
+        def resolve(class_stem: str) -> str | None:
+            if not class_stem:
+                return None
+            if class_stem in class_name_collisions or class_stem in stem_collisions:
+                return None  # fail-closed on a colliding key
+            mp = by_class_name.get(class_stem)
+            if mp is not None:
+                return mp
+            return by_stem.get(class_stem)
+
+        return resolve
 
     def _asset_monobehaviour_body(
         self, asset_path: Path,

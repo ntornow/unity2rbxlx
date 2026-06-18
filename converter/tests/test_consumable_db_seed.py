@@ -19,11 +19,20 @@ from converter.consumable_db_seed import (
     build_base_by_class,
     common_monobehaviour_base,
     db_drains_field_as_objects,
+    field_types_for_class,
     find_component_ref_arrays,
     read_prefab_component,
     resolve_db_seed,
+    split_component_fields,
 )
 from converter.scriptable_object_converter import convert_asset_file
+
+
+def _module_path_for_stem(stem: str) -> str | None:
+    """A trivial collision-free build-time module-path resolver for tests:
+    every subclass stem maps to ``ServerStorage.<stem>``. Production builds this
+    from ``scene_runtime["modules"]`` with the planner's collision exclusion."""
+    return f"ServerStorage.{stem}" if stem else None
 
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +145,9 @@ _BASE_CS = """\
     public abstract class Consumable : MonoBehaviour
     {
         public float duration;
+        public Sprite icon;
+        public AssetReference ActivatedParticleReference;
+        public bool canBeSpawned = true;
         public abstract int GetConsumableType();
     }
 """
@@ -170,6 +182,9 @@ def _build_trash_dash_like(tmp_path: Path) -> Path:
         f"""\
         duration: 15
         icon: {{fileID: 21300028, guid: {G_ICON}, type: 3}}
+        ActivatedParticleReference:
+          m_AssetGUID: {G_EXTRALIFE_PREFAB}
+          m_CachedAsset: {{fileID: 0}}
         canBeSpawned: 1
         """,
     )
@@ -233,6 +248,7 @@ def test_positive_resolves_seed_with_elements(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     assert seed is not None
     assert seed["array_field"] == "consumbales"
@@ -240,12 +256,26 @@ def test_positive_resolves_seed_with_elements(tmp_path):
     stems = [e["class_stem"] for e in seed["elements"]]
     assert stems == ["CoinMagnet", "ExtraLife"]
     # prefab ids are "<guid>:<relpath>"
-    assert seed["elements"][0]["prefab_id"].startswith(G_COINMAGNET_PREFAB + ":")
-    # ExtraLife serialized fields, read VERBATIM from the prefab MonoBehaviour
-    # (Unity serializes bool as 0/1; the boot shim coerces when calling .new).
-    el = seed["elements"][1]["fields_literal"]
-    assert "canBeSpawned = 0" in el
-    assert "duration = 0.01" in el
+    cm, xl = seed["elements"]
+    assert cm["prefab_id"].startswith(G_COINMAGNET_PREFAB + ":")
+    # module_path resolved at BUILD time (carried on the element; no runtime scan).
+    assert cm["module_path"] == "ServerStorage.CoinMagnet"
+    assert xl["module_path"] == "ServerStorage.ExtraLife"
+    # CoinMagnet: scalars in ctor_config (canBeSpawned: 1 -> True, declared bool);
+    # the ActivatedParticleReference (AssetReference -> a .prefab) RESOLVED into
+    # post_fields, never ctor_config. (icon is a Sprite, not a .prefab, so it does
+    # not resolve to a prefab id and is dropped — same as the legacy _value_to_lua.)
+    assert cm["ctor_config"]["duration"] == 15
+    assert cm["ctor_config"]["canBeSpawned"] is True
+    assert "ActivatedParticleReference" not in cm["ctor_config"]
+    assert "icon" not in cm["ctor_config"]
+    apr = cm["post_fields"]["ActivatedParticleReference"]
+    assert isinstance(apr, str) and apr.startswith(G_EXTRALIFE_PREFAB + ":")
+    # ExtraLife: bool-coerced ``canBeSpawned: 0`` -> Python ``False`` (NOT 0, which
+    # is truthy in Luau — the load-bearing P1-2 coercion).
+    assert xl["ctor_config"]["canBeSpawned"] is False
+    assert xl["ctor_config"]["duration"] == 0.01
+    assert xl["post_fields"] == {}
 
 
 def test_positive_field_literal_is_deterministic(tmp_path):
@@ -259,6 +289,7 @@ def test_positive_field_literal_is_deterministic(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     a = resolve_db_seed(**args)
     b = resolve_db_seed(**args)
@@ -300,6 +331,7 @@ def test_common_base_abstain_mixed_family(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     assert seed is None
 
@@ -338,6 +370,7 @@ def test_common_base_abstain_unrelated_component_families(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     assert seed is None
 
@@ -424,6 +457,7 @@ def test_intermediate_base_full_resolve(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     assert seed is not None
     assert [e["class_stem"] for e in seed["elements"]] == ["CoinMagnet", "GoldMagnet"]
@@ -457,6 +491,7 @@ def test_consumer_usage_abstain_instantiation_path(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     assert seed is None
 
@@ -588,6 +623,7 @@ def test_multiple_passing_arrays_warns_and_seeds_first(tmp_path, caplog):
             asset_body=body,
             guid_index=guid_index,
             base_by_class=base_by_class,
+            module_path_for_stem=_module_path_for_stem,
         )
     assert seed is not None
     # Seeds only the FIRST passing array (dict order = source order).
@@ -625,6 +661,7 @@ def test_unresolvable_element_dropped(tmp_path):
         asset_body=body,
         guid_index=guid_index,
         base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
     )
     assert seed is not None
     # 3 refs in, 1 unresolvable -> 2 elements out (dropped, not stringified).
@@ -657,6 +694,130 @@ def test_find_component_ref_arrays_ignores_scalar_and_mixed():
     }
     arrays = find_component_ref_arrays(body)
     assert set(arrays.keys()) == {"refs"}
+
+
+# --------------------------------------------------------------------------- #
+# P1-2 — bool coercion keyed on the C# DECLARED type (never a field name)
+# --------------------------------------------------------------------------- #
+
+def test_field_types_for_class_walks_base_chain(tmp_path):
+    """``canBeSpawned`` is declared on the BASE ``Consumable``, not the subclass;
+    the type map must walk the class+base chain to find it as ``bool``."""
+    root = _build_trash_dash_like(tmp_path)
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    types = field_types_for_class("CoinMagnet", base_by_class, guid_index)
+    assert types["canBeSpawned"] == "bool"     # found on the base, declared bool
+    assert types["duration"] == "float"
+    assert types["icon"] == "Sprite"
+
+
+def test_split_component_fields_coerces_bool_and_resolves_refs(tmp_path):
+    """A ``bool``-declared ``0`` becomes Python ``False`` (NOT 0); an asset-ref
+    field is RESOLVED into post_fields, never left in ctor_config."""
+    root = _build_trash_dash_like(tmp_path)
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    # ExtraLife's component body has duration: 0.01, canBeSpawned: 0.
+    prefab = root / "Assets" / "Prefabs" / "ExtraLife.prefab"
+    comp = read_prefab_component(prefab, FID_EXTRALIFE)
+    assert comp is not None
+    types = field_types_for_class("ExtraLife", base_by_class, guid_index)
+    ctor, post = split_component_fields(comp, types, guid_index)
+    assert ctor["canBeSpawned"] is False        # 0 -> False, not numeric 0
+    assert ctor["duration"] == 0.01
+    assert post == {}
+
+    # CoinMagnet has an AssetReference field -> resolved into post_fields.
+    cm_prefab = root / "Assets" / "Prefabs" / "CoinMagnet.prefab"
+    cm = read_prefab_component(cm_prefab, FID_COINMAGNET)
+    assert cm is not None
+    cm_types = field_types_for_class("CoinMagnet", base_by_class, guid_index)
+    cm_ctor, cm_post = split_component_fields(cm, cm_types, guid_index)
+    assert cm_ctor["canBeSpawned"] is True       # 1 -> True
+    assert "ActivatedParticleReference" not in cm_ctor
+    assert isinstance(
+        cm_post["ActivatedParticleReference"], str,
+    ) and cm_post["ActivatedParticleReference"]
+
+
+def test_bool_field_not_coerced_without_declared_type(tmp_path):
+    """A field with NO resolvable declared type is left VERBATIM (no guess) — the
+    coercion is keyed on the C# type, not the value shape."""
+    root = _build_trash_dash_like(tmp_path)
+    guid_index = build_guid_index(root)
+    # An empty type map: nothing is known to be bool, so 0/1 stay numeric.
+    comp = {"someFlag": 0, "duration": 2.0}
+    ctor, post = split_component_fields(comp, {}, guid_index)
+    assert ctor["someFlag"] == 0                 # left verbatim, not coerced
+    assert ctor["duration"] == 2.0
+
+
+# --------------------------------------------------------------------------- #
+# P2 — colliding subclass stem fails closed (element dropped)
+# --------------------------------------------------------------------------- #
+
+def test_colliding_module_path_drops_element(tmp_path):
+    """A ``module_path_for_stem`` that returns None (collision / pruned) DROPS the
+    element + warns — never leaves a string. Here CoinMagnet collides (None) and
+    ExtraLife resolves, so only ExtraLife survives."""
+    root = _build_trash_dash_like(tmp_path)
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    body = _asset_body(root, "Prefabs/Consumables.asset")
+
+    def resolver(stem: str) -> str | None:
+        return None if stem == "CoinMagnet" else f"ServerStorage.{stem}"
+
+    seed = resolve_db_seed(
+        db_module_path="ServerStorage.ConsumableDatabase",
+        db_cs_source=_DB_CS_DRAINS_OBJECTS,
+        asset_body=body,
+        guid_index=guid_index,
+        base_by_class=base_by_class,
+        module_path_for_stem=resolver,
+    )
+    assert seed is not None
+    assert [e["class_stem"] for e in seed["elements"]] == ["ExtraLife"]
+
+
+# --------------------------------------------------------------------------- #
+# Plan encoder renders the structured fields as TABLES, not quoted strings
+# --------------------------------------------------------------------------- #
+
+def test_emitted_plan_renders_fields_as_tables_not_strings(tmp_path):
+    """The plan encoder (``_plan_to_luau``) renders ``ctor_config``/``post_fields``
+    as nested Luau TABLES and a ``bool``-typed 0 as the literal ``false`` (not the
+    quoted string ``"0"`` and not numeric ``0``). No ``loadstring`` is needed."""
+    from converter.autogen import generate_scene_runtime_plan_module
+
+    root = _build_trash_dash_like(tmp_path)
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    body = _asset_body(root, "Prefabs/Consumables.asset")
+    seed = resolve_db_seed(
+        db_module_path="ServerStorage.ConsumableDatabase",
+        db_cs_source=_DB_CS_DRAINS_OBJECTS,
+        asset_body=body,
+        guid_index=guid_index,
+        base_by_class=base_by_class,
+        module_path_for_stem=_module_path_for_stem,
+    )
+    assert seed is not None
+    source = generate_scene_runtime_plan_module(
+        {"consumable_db_seeds": [seed]},
+    ).source
+    # ctor_config is a TABLE literal (``ctor_config = {``), not a quoted string
+    # (``ctor_config = "``).
+    assert "ctor_config = {" in source
+    assert 'ctor_config = "' not in source
+    assert "post_fields = {" in source
+    # The bool-typed 0 (ExtraLife.canBeSpawned) renders as the literal ``false``.
+    assert "canBeSpawned = false" in source
+    # And the truthy one renders as ``true`` (CoinMagnet).
+    assert "canBeSpawned = true" in source
+    # No pre-rendered fields_literal string survives.
+    assert "fields_literal" not in source
 
 
 # --------------------------------------------------------------------------- #

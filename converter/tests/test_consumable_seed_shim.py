@@ -154,11 +154,11 @@ def _run(scenario: str) -> str:
 
 
 # A plan with two materializable elements (CoinMagnet + ExtraLife shapes). The
-# ``modules`` registry maps each subclass stem -> its module_path (the shim
-# joins class_stem -> module_path through this exact registry, as production
-# does). The element ``fields_literal`` is a STRING holding a Luau table literal
-# — exactly what ``_plan_to_luau`` emits (it quotes the Python str the resolver
-# produced) — so the shim must realize it via loadstring.
+# subclass module path is resolved at BUILD time and carried on each element
+# (``module_path``) — no runtime ``modules`` stem scan. ``ctor_config`` and
+# ``post_fields`` are REAL Luau TABLES (exactly what ``_plan_to_luau`` emits — no
+# loadstring), with bools already coerced by the resolver (``canBeSpawned =
+# false`` for ExtraLife, NOT numeric 0).
 _TWO_ELEMENT_PLAN = """\
 local db = makeConsumableDatabase()
 local CoinMagnet = makeSubclass("COIN_MAG", 750)
@@ -169,15 +169,6 @@ local modules = {
     ["ServerStorage.ExtraLife"] = ExtraLife,
 }
 local plan = {
-    -- the stem -> module_path registry the shim joins through
-    modules = {
-        guidA = { stem = "CoinMagnet", class_name = "CoinMagnet",
-                  module_path = "ServerStorage.CoinMagnet" },
-        guidB = { stem = "ExtraLife", class_name = "ExtraLife",
-                  module_path = "ServerStorage.ExtraLife" },
-        guidDb = { stem = "ConsumableDatabase", class_name = "ConsumableDatabase",
-                  module_path = "ServerStorage.ConsumableDatabase" },
-    },
     consumable_db_seeds = {
         {
             db_module_path = "ServerStorage.ConsumableDatabase",
@@ -186,12 +177,16 @@ local plan = {
                 {
                     class_stem = "CoinMagnet",
                     prefab_id = "g1:Assets/CoinMagnet.prefab",
-                    fields_literal = "{ duration = 10, canBeSpawned = 1, icon = \\"rbxassetid://111\\" }",
+                    module_path = "ServerStorage.CoinMagnet",
+                    ctor_config = { duration = 10, canBeSpawned = true },
+                    post_fields = { icon = "rbxassetid://111" },
                 },
                 {
                     class_stem = "ExtraLife",
                     prefab_id = "g2:Assets/ExtraLife.prefab",
-                    fields_literal = "{ duration = 0.01, canBeSpawned = 0, ActivatedParticleReference = \\"g3:Assets/FX.prefab\\" }",
+                    module_path = "ServerStorage.ExtraLife",
+                    ctor_config = { duration = 0.01, canBeSpawned = false },
+                    post_fields = { ActivatedParticleReference = "g3:Assets/FX.prefab" },
                 },
             },
         },
@@ -227,15 +222,15 @@ print("CM_PRICE=" .. tostring(db.GetConsumableType("COIN_MAG"):GetPrice()))
 @_luau_marker
 def test_constructor_field_contract_scalars_via_new_assetrefs_post_construction():
     """Constructor contract: scalars (duration / canBeSpawned) arrive via
-    ``.new(config)``; asset-ref fields (icon / ActivatedParticleReference) — NOT
-    read by ``.new`` — are assigned POST-construction onto the instance; and
+    ``.new(ctor_config)``; asset-ref fields (icon / ActivatedParticleReference) —
+    NOT read by ``.new`` — are assigned POST-construction onto the instance; and
     ``.gameObject`` is the element's prefab id."""
     out = _run(_TWO_ELEMENT_PLAN + """
 SceneRuntime.seedConsumableDatabases(plan, servicesFor(modules))
 local cm = db.consumbales[1]
 local xl = db.consumbales[2]
 -- scalars flowed THROUGH .new (ctor recorded what it received):
-print("CM_CTOR_DURATION=" .. tostring(cm.ctorSawCanBeSpawned ~= nil and cm.duration))
+print("CM_CTOR_DURATION=" .. tostring(cm.duration))
 print("CM_CTOR_SAW_SPAWN=" .. tostring(cm.ctorSawCanBeSpawned))
 -- asset-ref injected POST-construction (.new set it nil; shim assigned it):
 print("CM_ICON=" .. tostring(cm.icon))
@@ -246,13 +241,71 @@ print("XL_GO=" .. tostring(xl.gameObject))
 """)
     # scalars reached the constructor
     assert "CM_CTOR_DURATION=10" in out
-    assert "CM_CTOR_SAW_SPAWN=1" in out
+    assert "CM_CTOR_SAW_SPAWN=true" in out
     # asset-refs present on the instance (the only path that carries them)
     assert "CM_ICON=rbxassetid://111" in out
     assert "XL_FX=g3:Assets/FX.prefab" in out
     # gameObject = prefab id
     assert "CM_GO=g1:Assets/CoinMagnet.prefab" in out
     assert "XL_GO=g2:Assets/ExtraLife.prefab" in out
+
+
+@_luau_marker
+def test_canbespawned_realizes_as_lua_boolean_not_truthy_zero():
+    """P1-2: the resolver coerced ``canBeSpawned: 0`` to ``false`` in the plan;
+    the shim passes the real Luau boolean through ``.new``, so the realized field
+    is a BOOLEAN ``false`` — not numeric ``0`` (which is TRUTHY in Luau and would
+    wrongly read spawnable). Asserts the TYPE, not just the value."""
+    out = _run(_TWO_ELEMENT_PLAN + """
+SceneRuntime.seedConsumableDatabases(plan, servicesFor(modules))
+local cm = db.consumbales[1]   -- canBeSpawned = true
+local xl = db.consumbales[2]   -- canBeSpawned = false
+print("CM_SPAWN_TYPE=" .. type(cm.ctorSawCanBeSpawned))
+print("CM_SPAWN_VAL=" .. tostring(cm.ctorSawCanBeSpawned))
+print("XL_SPAWN_TYPE=" .. type(xl.ctorSawCanBeSpawned))
+print("XL_SPAWN_VAL=" .. tostring(xl.ctorSawCanBeSpawned))
+-- the load-bearing gate: ``if canBeSpawned then`` must be FALSE for ExtraLife.
+print("XL_GATE=" .. tostring(xl.ctorSawCanBeSpawned and true or false))
+""")
+    assert "CM_SPAWN_TYPE=boolean" in out
+    assert "CM_SPAWN_VAL=true" in out
+    assert "XL_SPAWN_TYPE=boolean" in out      # NOT "number"
+    assert "XL_SPAWN_VAL=false" in out
+    assert "XL_GATE=false" in out              # the inverted-gate bug is gone
+
+
+@_luau_marker
+def test_no_blanket_copyback_only_post_fields_assigned():
+    """P1-2b: the shim assigns ONLY ``post_fields`` post-construction, never a
+    blanket copy of ``ctor_config`` (which would clobber the ctor's coercion). A
+    scalar that ``.new`` deliberately transforms must keep the ctor's value, not be
+    overwritten by the raw config."""
+    # A subclass whose .new NEGATES the scalar — if the shim blanket-copied
+    # ctor_config back, the instance would show the RAW (un-negated) value.
+    scenario = _TWO_ELEMENT_PLAN.replace(
+        'local CoinMagnet = makeSubclass("COIN_MAG", 750)',
+        'local CoinMagnet = (function()\n'
+        '  local Cls = {}; Cls.__index = Cls\n'
+        '  function Cls.new(config)\n'
+        '    local self = setmetatable({}, Cls)\n'
+        '    self.duration = config.duration * -1  -- ctor TRANSFORMS the scalar\n'
+        '    return self\n'
+        '  end\n'
+        '  function Cls:GetConsumableType() return "COIN_MAG" end\n'
+        '  function Cls:GetPrice() return 750 end\n'
+        '  return Cls\n'
+        'end)()',
+    ) + """
+SceneRuntime.seedConsumableDatabases(plan, servicesFor(modules))
+local cm = db.consumbales[1]
+-- ctor set duration = 10 * -1 = -10; a blanket copyback would reset it to 10.
+print("CM_DURATION=" .. tostring(cm.duration))
+-- the asset-ref post_field IS assigned (the only thing the shim copies):
+print("CM_ICON=" .. tostring(cm.icon))
+"""
+    out = _run(scenario)
+    assert "CM_DURATION=-10" in out            # ctor value preserved, NOT clobbered
+    assert "CM_ICON=rbxassetid://111" in out   # post_fields still assigned
 
 
 @_luau_marker
@@ -391,27 +444,25 @@ dumpLogs()
     ), out
 
 
-@_luau_marker
-def test_malformed_fields_literal_degrades_to_no_overrides_not_crash():
-    """A ``fields_literal`` that does not evaluate to a table degrades to "no
-    overrides" + WARN — the element is still materialized (``.new({})``), never a
-    boot crash."""
-    scenario = _TWO_ELEMENT_PLAN.replace(
-        'fields_literal = "{ duration = 10, canBeSpawned = 1, icon = \\"rbxassetid://111\\" }",',
-        'fields_literal = "this is not = a table",',
-    ) + """
-SceneRuntime.seedConsumableDatabases(plan, servicesFor(modules))
-print("LEN=" .. tostring(#db.consumbales))
-print("CM_TYPE=" .. tostring(db.consumbales[1]:GetConsumableType()))
-dumpLogs()
-"""
-    out = _run(scenario)
-    assert "LEN=2" in out                       # element NOT dropped
-    assert "CM_TYPE=COIN_MAG" in out            # still constructed
-    assert any(
-        "[consumable-seed] fields literal did not" in line
-        for line in out.splitlines()
-    ), out
+def test_shim_contains_no_loadstring():
+    """P1-1: ``loadstring`` is DISABLED on the Roblox client; the consumable shim
+    must NOT use it. The plan now carries ``ctor_config``/``post_fields`` as real
+    tables, so there is no string-literal-realize path. Guard the SHIM region of
+    the source (a bounded scan around ``seedConsumableDatabases``) so this reds if
+    loadstring reappears in the materialization path."""
+    src = HOST_RUNTIME_PATH.read_text(encoding="utf-8")
+    start = src.index("function SceneRuntime.seedConsumableDatabases")
+    rest = src[start + 1:]
+    nxt = rest.find("\nfunction SceneRuntime.")
+    region = rest[:nxt] if nxt != -1 else rest
+    # Match the CALL form ``loadstring(`` so the comments documenting "no
+    # loadstring" do not false-positive.
+    assert "loadstring(" not in region, (
+        "the consumable shim must not call loadstring (client-disabled); "
+        "fields are real tables in the plan"
+    )
+    assert "realizeFields" not in region
+    assert "modulePathForStem" not in region   # P2: no runtime stem scan either
 
 
 # ---------------------------------------------------------------------------
@@ -467,12 +518,13 @@ def test_consumable_db_seeds_in_plan_key_allowlist():
 @_luau_marker
 def test_real_emitted_plan_round_trips_through_shim():
     """Producer→consumer seam: render the seed through the REAL plan encoder
-    (``generate_scene_runtime_plan_module`` → ``_plan_to_luau``, which QUOTES
-    ``fields_literal`` as a string), then ``require`` that emitted plan inside the
-    luau harness and drive the REAL shim against it. Reds if the encoder stops
-    quoting the literal the way the shim's ``loadstring`` expects, or if the shim
-    stops realizing it — locking the cross-slice contract, not a hand-built
-    fixture."""
+    (``generate_scene_runtime_plan_module`` → ``_plan_to_luau``, which renders
+    ``ctor_config``/``post_fields`` as nested Luau TABLES — NO loadstring), then
+    ``require`` that emitted plan inside the luau harness and drive the REAL shim
+    against it. Reds if the encoder stops emitting tables or coercing bools, or if
+    the shim stops consuming them — locking the cross-slice contract, not a
+    hand-built fixture. Critically asserts the bool-typed ``canBeSpawned`` arrives
+    as a Lua BOOLEAN (P1-2), not numeric 0."""
     from converter.autogen import generate_scene_runtime_plan_module
 
     sr = {
@@ -484,21 +536,19 @@ def test_real_emitted_plan_round_trips_through_shim():
                     {
                         "class_stem": "CoinMagnet",
                         "prefab_id": "g1:Assets/CoinMagnet.prefab",
-                        "fields_literal":
-                            '{ duration = 10, canBeSpawned = 1, '
-                            'icon = "rbxassetid://111" }',
+                        "module_path": "ServerStorage.CoinMagnet",
+                        "ctor_config": {"duration": 10, "canBeSpawned": False},
+                        "post_fields": {"icon": "rbxassetid://111"},
                     },
                 ],
             },
         ],
-        "modules": {
-            "guidA": {
-                "stem": "CoinMagnet", "class_name": "CoinMagnet",
-                "module_path": "ServerStorage.CoinMagnet",
-            },
-        },
     }
     plan_source = generate_scene_runtime_plan_module(sr).source
+    # Sanity: the encoder rendered a TABLE, not a quoted string, and coerced the
+    # bool to the Luau literal ``false`` (not numeric 0, not "0").
+    assert "ctor_config = {" in plan_source
+    assert "canBeSpawned = false" in plan_source
     # Embed the REAL emitted plan ModuleScript and require it in the harness.
     # Lua long-string delimiters only allow ``=`` between the brackets.
     delim = "===="
@@ -521,12 +571,16 @@ db.Load()
 local cm = db.GetConsumableType("COIN_MAG")
 print("CM_PRESENT=" .. tostring(cm ~= nil))
 print("CM_DURATION=" .. tostring(cm and cm.duration))
+print("CM_SPAWN_TYPE=" .. type(cm.ctorSawCanBeSpawned))
+print("CM_SPAWN_VAL=" .. tostring(cm.ctorSawCanBeSpawned))
 print("CM_ICON=" .. tostring(cm and cm.icon))
 print("CM_GO=" .. tostring(cm and cm.gameObject))
 """
     out = _run(scenario)
     assert "LEN=1" in out
     assert "CM_PRESENT=true" in out
-    assert "CM_DURATION=10" in out          # scalar realized from the quoted literal
-    assert "CM_ICON=rbxassetid://111" in out  # asset-ref post-injected
+    assert "CM_DURATION=10" in out             # scalar realized from the table
+    assert "CM_SPAWN_TYPE=boolean" in out      # bool stayed a Lua boolean
+    assert "CM_SPAWN_VAL=false" in out
+    assert "CM_ICON=rbxassetid://111" in out   # asset-ref post-injected
     assert "CM_GO=g1:Assets/CoinMagnet.prefab" in out

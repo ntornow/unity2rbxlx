@@ -219,22 +219,20 @@ end
 -- instances and ASSIGNS them onto the DB's declared array field, BEFORE the
 -- consumer's once-only ``Load()`` drain runs. Each seed is:
 --   ``{ db_module_path, array_field, elements = { {class_stem, prefab_id,
---      fields_literal}, ... } }``
--- where ``fields_literal`` is the per-element serialized-field table rendered
--- by the build-time resolver. (The plan encoder quotes it as a STRING, so the
--- shim realizes it to a live table via ``loadstring`` — a trusted build-time
--- literal; we fail-soft + WARN if it does not evaluate to a table, never
--- injecting a bad slot.)
+--      module_path, ctor_config = {...}, post_fields = {...}}, ... } }``
+-- where ``ctor_config`` and ``post_fields`` are REAL Luau TABLES rendered by the
+-- plan encoder (no ``loadstring`` — disabled on the Roblox client). The build-
+-- time resolver already coerced serialized bools (``canBeSpawned: 0`` -> ``false``)
+-- and resolved asset refs to ids, so the shim consumes the tables verbatim.
 --
--- Per element: require the subclass module (``class_stem`` -> module path),
--- construct ``<Subclass>.new(config)`` (scalars like ``duration`` /
--- ``canBeSpawned`` are read by the typed ``.new``; 0/1->bool coercion belongs
--- there, NOT here — a generic shim has no field schema, so it passes literals
--- verbatim), then assign the serialized fields onto the instance
--- POST-construction (asset-ref fields such as ``icon`` /
--- ``ActivatedParticleReference`` are NOT read by ``.new`` so this is the only
--- path that carries them) and set ``.gameObject`` to the element's prefab id
--- (the host resolves prefab ids on instantiate).
+-- Per element: require the subclass module (``module_path`` resolved at BUILD
+-- time with the planner's collision-exclusion contract — no runtime stem scan),
+-- construct ``<Subclass>.new(ctor_config)`` (the typed ``.new`` reads the scalar
+-- fields, e.g. ``duration`` / ``canBeSpawned``), then assign ONLY the asset-ref
+-- ``post_fields`` (``icon`` / ``ActivatedParticleReference``) onto the instance
+-- POST-construction (``Consumable.new`` drops them, so this is the only path that
+-- carries them) and set ``.gameObject`` to the element's prefab id (the host
+-- resolves prefab ids on instantiate). NOTHING else is copied onto the instance.
 --
 -- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
 -- and BEFORE ``engine:start`` — the array MUST hold materialized objects before
@@ -253,61 +251,6 @@ function SceneRuntime.seedConsumableDatabases(plan, services)
 	local resolveModule = services.resolveModule
 	if type(resolveModule) ~= "function" then
 		return
-	end
-
-	-- Realize a build-time-rendered Luau table literal (a STRING in the plan)
-	-- into a live table. Trusted boundary: the literal is produced by the
-	-- converter's own ``_value_to_lua``. Returns ``{}`` on any miss + WARNs so a
-	-- malformed literal degrades to "no overrides" rather than crashing boot.
-	local function realizeFields(literal, classStem)
-		if literal == nil or literal == "" then
-			return {}
-		end
-		if type(literal) == "table" then
-			-- Tolerate a pre-realized table (test harness / future encoder).
-			return literal
-		end
-		if type(literal) ~= "string" then
-			warn("[consumable-seed] fields literal not a string for "
-				.. tostring(classStem) .. "; ignoring overrides")
-			return {}
-		end
-		local chunk = loadstring("return " .. literal)
-		if chunk == nil then
-			warn("[consumable-seed] fields literal did not compile for "
-				.. tostring(classStem) .. "; ignoring overrides")
-			return {}
-		end
-		local ok, result = pcall(chunk)
-		if not ok or type(result) ~= "table" then
-			warn("[consumable-seed] fields literal did not evaluate to a table for "
-				.. tostring(classStem) .. "; ignoring overrides")
-			return {}
-		end
-		return result
-	end
-
-	-- Resolve a subclass ``.cs`` stem to its emitted module's dotted DataModel
-	-- path via the plan's existing ``modules`` registry (``{stem, class_name,
-	-- module_path}`` per script). The seed elements carry only the ``class_stem``
-	-- (the resolver §1.A keys off the in-prefab component's ``.cs`` stem, which
-	-- equals ``modules[*].stem``); the host requires modules by full path, so the
-	-- shim joins them here — generic, no per-game literal. Returns nil on a miss
-	-- (e.g. a dead-module-pruned subclass), which DROPs the element + WARNs.
-	local modulesByEntry = plan.modules or {}
-	local function modulePathForStem(stem)
-		if stem == nil or stem == "" then
-			return nil
-		end
-		for _, entry in pairs(modulesByEntry) do
-			if type(entry) == "table"
-				and (entry.stem == stem or entry.class_name == stem)
-				and type(entry.module_path) == "string"
-				and entry.module_path ~= "" then
-				return entry.module_path
-			end
-		end
-		return nil
 	end
 
 	local seeds = plan.consumable_db_seeds or {}
@@ -331,8 +274,11 @@ function SceneRuntime.seedConsumableDatabases(plan, services)
 				-- the field holds ONLY instances, or is empty — never strings).
 				local materialized = {}
 				for _, element in ipairs(seed.elements or {}) do
-					local modulePath = modulePathForStem(element.class_stem)
-					local Cls = (modulePath ~= nil)
+					-- The subclass module path is resolved at BUILD time (with the
+					-- planner's collision-exclusion contract) and carried on the
+					-- element — no runtime stem scan.
+					local modulePath = element.module_path
+					local Cls = (type(modulePath) == "string" and modulePath ~= "")
 						and resolveModule(nil, modulePath) or nil
 					if type(Cls) ~= "table" or type(Cls.new) ~= "function" then
 						warn("[consumable-seed] subclass module did not resolve "
@@ -340,20 +286,25 @@ function SceneRuntime.seedConsumableDatabases(plan, services)
 							.. tostring(modulePath or element.class_stem)
 							.. "; dropping element")
 					else
-						local config = realizeFields(
-							element.fields_literal, element.class_stem)
-						local c = Cls.new(config)
+						-- ``ctor_config`` / ``post_fields`` are REAL Luau tables in
+						-- the plan (no loadstring). Pass scalars THROUGH ``.new``;
+						-- assign ONLY the asset-ref ``post_fields`` afterwards.
+						local ctorConfig = element.ctor_config or {}
+						local c = Cls.new(ctorConfig)
 						if type(c) ~= "table" then
 							warn("[consumable-seed] " .. tostring(element.class_stem)
 								.. ".new did not return an instance; dropping element")
 						else
-							-- Assign serialized fields POST-construction. Asset-ref
-							-- fields (icon / ActivatedParticleReference) are dropped
-							-- by ``Consumable.new`` (host-injected), so this is the
-							-- only path that carries them onto the instance; scalars
-							-- re-assign to the value ``.new`` already read (no-op).
-							for k, v in pairs(config) do
-								c[k] = v
+							-- Asset-ref fields (icon / ActivatedParticleReference)
+							-- are dropped by ``Consumable.new`` (host-injected), so
+							-- this is the ONLY path that carries them onto the
+							-- instance. NO blanket copyback of ctor_config — that
+							-- would clobber the ctor's bool/normalization work.
+							local postFields = element.post_fields
+							if type(postFields) == "table" then
+								for k, v in pairs(postFields) do
+									c[k] = v
+								end
 							end
 							-- The host resolves the prefab id on instantiate.
 							c.gameObject = element.prefab_id

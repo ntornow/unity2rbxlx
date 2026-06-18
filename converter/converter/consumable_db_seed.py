@@ -7,8 +7,10 @@ resolves each such ref to a prefab-id STRING, so the emitted database iterates a
 array of strings and `c:GetConsumableType()` throws at boot.
 
 This module resolves each element to the materialization facts the boot shim
-needs — the subclass `.cs` stem, the prefab id, and a Luau field literal of the
-component's serialized overrides — gated on TWO hard preconditions:
+needs — the subclass `.cs` stem, the prefab id, the resolved subclass module
+path, and the component's serialized overrides SPLIT into structured tables
+(`ctor_config` scalars passed to `<Subclass>.new(...)` and `post_fields`
+asset-ref ids assigned post-construction) — gated on TWO hard preconditions:
 
   (4) COMMON-BASE: every resolved in-prefab component class shares ONE common
       project-local base that derives from MonoBehaviour (so the array IS a
@@ -32,16 +34,21 @@ state and stamps the result onto `scene_runtime`.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TypedDict
 
-from unity.prefab_ref import GuidIndexLike, prefab_id_for_guid
-from unity.script_analyzer import analyze_script
+from unity.prefab_ref import (
+    GuidIndexLike,
+    prefab_id_for_guid,
+    prefab_id_for_ref,
+)
+from unity.script_analyzer import _strip_comments_and_strings, analyze_script
 from unity.yaml_parser import doc_body, parse_documents
 from converter.scriptable_object_converter import (
     _SKIP_FIELDS,
-    _value_to_lua,
+    _is_asset_reference,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,11 +68,28 @@ _MONOBEHAVIOUR_CLASS_ID = 114
 _COMPONENT_BASE_CLASSES = frozenset({"MonoBehaviour", "NetworkBehaviour"})
 
 
+# A serialized scalar field value, AFTER bool coercion (a ``bool``-declared 0/1
+# becomes a Python ``bool``). The plan encoder (``_plan_to_luau``) renders each as
+# a Luau literal: ``bool`` -> ``true``/``false``, ``int``/``float`` -> a numeric
+# literal, ``str`` -> a quoted string. Asset-ref ids (in ``post_fields``) are
+# always ``str``.
+ScalarFieldValue = str | int | float | bool
+
+
 class ConsumableSeedElement(TypedDict):
-    """One materialized element of a consumable-style DB array."""
-    class_stem: str       # the in-prefab component's subclass .cs stem (e.g. "CoinMagnet")
-    prefab_id: str        # the canonical "<guid>:<path>" prefab id
-    fields_literal: str   # a Luau table literal of the serialized field overrides
+    """One materialized element of a consumable-style DB array.
+
+    The serialized overrides are SPLIT (no pre-rendered Luau string): ``ctor_config``
+    carries the SCALAR fields the typed ``<Subclass>.new(config)`` reads (bool
+    coercion already applied); ``post_fields`` carries the ASSET-REF fields
+    ``Consumable.new`` drops and the shim must assign POST-construction. The plan
+    encoder renders both as nested Luau TABLES (no ``loadstring`` on the client).
+    """
+    class_stem: str                        # the in-prefab component's subclass .cs stem
+    prefab_id: str                         # the canonical "<guid>:<path>" prefab id
+    module_path: str                       # the resolved full module path of the subclass
+    ctor_config: dict[str, ScalarFieldValue]  # scalars passed to <Subclass>.new(config)
+    post_fields: dict[str, str]            # asset-ref ids assigned post-construction
 
 
 class ConsumableSeed(TypedDict):
@@ -375,6 +399,7 @@ def resolve_db_seed(
     asset_body: Mapping[str, object],
     guid_index: GuidIndexLike,
     base_by_class: dict[str, str],
+    module_path_for_stem: Callable[[str], str | None],
 ) -> ConsumableSeed | None:
     """Resolve ONE database SO ``.asset`` into a ``ConsumableSeed``, or ``None``.
 
@@ -382,7 +407,12 @@ def resolve_db_seed(
       1. Find the component-ref array field structurally (the NAME is never
          hardcoded). The FIRST candidate field that passes both gates wins.
       2. For each element resolve prefab id + in-prefab component class +
-         serialized field literal; DROP an unresolvable element (never stringify).
+         resolved subclass ``module_path`` + serialized fields SPLIT into
+         ``ctor_config``/``post_fields``; DROP an unresolvable element (never
+         stringify). ``module_path_for_stem`` resolves a subclass stem to its
+         full module path with the planner's collision-exclusion contract (it
+         returns ``None`` on a stem/class collision or an absent module → the
+         element is DROPPED, matching the planner's fail-closed).
       3. Gate (4) common-base: all resolved classes share one MonoBehaviour base.
       4. Gate (5) consumer-usage: the DB C# drains the field as objects.
     Returns the seed (possibly with an EMPTY ``elements`` list when every element
@@ -449,11 +479,29 @@ def resolve_db_seed(
                     db_module_path, array_field,
                 )
                 continue
-            fields_literal = _component_fields_literal(component, guid_index)
+            # Resolve the subclass's full module path at BUILD time, with the
+            # planner's collision-exclusion contract (a colliding stem/class ->
+            # None). DROP the element on a miss — the shim no longer scans for it.
+            module_path = module_path_for_stem(class_stem)
+            if module_path is None:
+                logger.warning(
+                    "[consumable_seed] %s.%s: subclass %s has no collision-free "
+                    "module path; dropping element",
+                    db_module_path, array_field, class_stem,
+                )
+                continue
+            field_types = field_types_for_class(
+                class_stem, base_by_class, guid_index,
+            )
+            ctor_config, post_fields = split_component_fields(
+                component, field_types, guid_index,
+            )
             resolved_elements.append(ConsumableSeedElement(
                 class_stem=class_stem,
                 prefab_id=prefab_id,
-                fields_literal=fields_literal,
+                module_path=module_path,
+                ctor_config=ctor_config,
+                post_fields=post_fields,
             ))
             resolved_classes.append(class_stem)
 
@@ -493,19 +541,166 @@ def resolve_db_seed(
     return passing[0]
 
 
-def _component_fields_literal(
-    component: Mapping[str, object], guid_index: GuidIndexLike,
-) -> str:
-    """Render the component's serialized USER fields to a Luau table literal,
-    reusing the SO converter's ``_value_to_lua`` (asset/prefab refs resolve to
-    ids; ``_SKIP_FIELDS``/``m_*`` internals dropped). Deterministic field order:
-    the keys are emitted sorted so the recompute is byte-identical run to run.
+# A C# instance field declaration: ``[modifiers] <Type> <name> [= ...];``. We
+# capture the declared TYPE token (group "type") and the field NAME (group
+# "name"). Matched over de-commented source so prose never matches. Generic over
+# the type — the resolver keys on the DECLARED TYPE (``bool`` -> coerce 0/1),
+# never a field-name literal. ``static``/``const`` fields are not Unity-serialized
+# instance fields, so they are excluded.
+_RE_CS_FIELD = re.compile(
+    r"\b(?:public|private|protected|internal)\b"
+    r"(?P<mods>(?:\s+(?:readonly|new|volatile))*)"
+    r"\s+(?P<type>[\w.<>\[\]?]+)"
+    r"\s+(?P<name>[A-Za-z_]\w*)"
+    r"\s*(?:=|;)",
+)
+_RE_CS_STATIC_OR_CONST = re.compile(r"\b(?:static|const)\b")
+
+
+def field_types_for_class(
+    class_stem: str, base_by_class: dict[str, str], guid_index: GuidIndexLike,
+) -> dict[str, str]:
+    """Map ``field_name -> declared C# type`` for ``class_stem``, walking the
+    class+base chain so a field declared on a BASE (``canBeSpawned`` on
+    ``Consumable``, not the subclass) is included.
+
+    Reads each class's ``.cs`` (located via the GuidIndex) and extracts plain
+    instance field declarations (``public bool canBeSpawned;``). A subclass
+    declaration SHADOWS a base of the same name (nearest wins) — the chain is
+    walked subclass-first and a name already seen is not overwritten. Cycle-safe.
+    Returns ``{}`` when no source is readable (the caller then leaves values
+    verbatim — never guesses a type).
     """
-    user_fields: dict[str, object] = {}
+    types: dict[str, str] = {}
+    seen: set[str] = set()
+    current = class_stem
+    while current and current not in seen:
+        seen.add(current)
+        src = _cs_source_for_stem(current, guid_index)
+        if src is not None:
+            decommented = _strip_comments_and_strings(src)
+            for m in _RE_CS_FIELD.finditer(decommented):
+                # Skip static/const — not Unity-serialized instance fields. Check
+                # the modifier span BEFORE the captured access modifier too.
+                line_start = decommented.rfind("\n", 0, m.start()) + 1
+                head = decommented[line_start:m.start()]
+                if _RE_CS_STATIC_OR_CONST.search(head + m.group("mods")):
+                    continue
+                name = m.group("name")
+                if name not in types:
+                    types[name] = m.group("type")
+        current = base_by_class.get(current, "")
+    return types
+
+
+def _cs_source_for_stem(
+    class_stem: str, guid_index: GuidIndexLike,
+) -> str | None:
+    """Read the ``.cs`` source whose file stem == ``class_stem`` from the
+    GuidIndex, or ``None``. (The project class-name == file stem for the
+    consumable family; mirrors ``_resolve_class_stem``'s stem keying.)"""
+    guid_to_entry = getattr(guid_index, "guid_to_entry", {})
+    for entry in guid_to_entry.values():
+        path = getattr(entry, "asset_path", None)
+        if path is None or path.suffix != ".cs":
+            continue
+        if path.stem == class_stem:
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return None
+    return None
+
+
+def _coerce_scalar(
+    value: object, declared_type: str | None,
+) -> ScalarFieldValue | None:
+    """Coerce one serialized SCALAR per its declared C# type.
+
+    Bool coercion is the load-bearing rule (finding P1-2): Unity serializes a
+    ``bool`` field as ``0``/``1`` (an int), and Luau treats ``0`` as TRUTHY, so a
+    ``canBeSpawned: 0`` passed verbatim wrongly reads spawnable. A ``bool``-typed
+    0/1 (or ``true``/``false``) becomes a Python ``bool`` here, which the plan
+    encoder renders as Luau ``false``/``true``. Other scalars pass through as
+    their native ``str``/``int``/``float``. Returns ``None`` for a value that is
+    not a renderable scalar (a dict/list — handled as an asset-ref or skipped by
+    the caller), so it is NOT placed in ``ctor_config``.
+    """
+    if isinstance(value, bool):
+        return value
+    if declared_type == "bool":
+        # Unity serializes bool as 0/1; coerce per the DECLARED type, never a
+        # field-name literal. Strings "true"/"false" tolerated for robustness.
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low in ("1", "true"):
+                return True
+            if low in ("0", "false"):
+                return False
+        # An unexpected shape for a bool field: leave verbatim if scalar.
+    if isinstance(value, (int, float, str)):
+        return value
+    return None
+
+
+def split_component_fields(
+    component: Mapping[str, object],
+    field_types: dict[str, str],
+    guid_index: GuidIndexLike,
+) -> tuple[dict[str, ScalarFieldValue], dict[str, str]]:
+    """Split a component's serialized USER fields into ``(ctor_config,
+    post_fields)``.
+
+    - ``post_fields``: ASSET-REF fields — a serialized value that is an object-ref
+      (``{fileID,guid,type}``) or an AssetReference struct — RESOLVED to a prefab/
+      asset id string. ``Consumable.new`` drops these, so the shim assigns them
+      post-construction. An UNRESOLVABLE ref is dropped (never a nil/string slot).
+    - ``ctor_config``: every other serialized SCALAR (number / bool / string),
+      with bool coercion applied per the field's declared C# type (``field_types``).
+
+    ``_SKIP_FIELDS``/``m_Name`` internals are dropped. Keys are processed sorted
+    so the recompute is byte-identical run to run.
+    """
+    ctor_config: dict[str, ScalarFieldValue] = {}
+    post_fields: dict[str, str] = {}
     for key, value in sorted(component.items(), key=lambda kv: str(kv[0])):
         if key in _SKIP_FIELDS or key == "m_Name":
             continue
-        user_fields[str(key)] = value
-    if not user_fields:
-        return "{}"
-    return _value_to_lua(user_fields, guid_index=guid_index)
+        name = str(key)
+        if isinstance(value, dict):
+            # An asset-ref field (AssetReference struct or {fileID,guid,type}
+            # object-ref). Resolve to an id; drop if unresolvable.
+            resolved = _resolve_asset_ref(value, guid_index)
+            if resolved is not None:
+                post_fields[name] = resolved
+            continue
+        coerced = _coerce_scalar(value, field_types.get(name))
+        if coerced is not None:
+            ctor_config[name] = coerced
+        # A non-scalar non-ref (e.g. a list) is omitted: the typed ``.new`` only
+        # reads scalars, and a list field is not an asset-ref carrier here.
+    return ctor_config, post_fields
+
+
+def _resolve_asset_ref(
+    value: Mapping[str, object], guid_index: GuidIndexLike,
+) -> str | None:
+    """Resolve an asset-ref dict to its id string, or ``None`` if it is not a ref
+    / cannot be resolved. Mirrors ``_value_to_lua``'s ref arms (AssetReference
+    first, then the bare ``{fileID,guid,type}`` object-ref)."""
+    d = dict(value)
+    if _is_asset_reference(d):
+        guid = d.get("m_AssetGUID")
+        if isinstance(guid, str):
+            pid = prefab_id_for_guid(guid, guid_index)
+            if pid is not None:
+                return pid
+        cached = d.get("m_CachedAsset")
+        if isinstance(cached, dict):
+            return prefab_id_for_ref(cached, guid_index)
+        return None
+    if set(d.keys()) <= {"fileID", "guid", "type"}:
+        return prefab_id_for_ref(d, guid_index)
+    return None
