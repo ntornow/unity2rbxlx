@@ -153,6 +153,40 @@ class TestRepairHelper:
             f"repair must be bounded to 2 tries (got {len(calls)})"
         )
 
+    def test_degraded_repair_keeps_best_and_surfaces_survivor(self):
+        # Criterion 6 (slice 1.1): a repair response that is a structural
+        # regression (a ``...`` fragment that lost the top-level return and
+        # collapsed in length) is REJECTED -> the guard breaks, keeping the
+        # prior ``best`` (the original broken bullet) and surfacing its survivor
+        # warning. The closure fires ONCE (break on the degraded response, no
+        # second try).
+        calls: list[str] = []
+
+        # A degraded fragment: no top-level return, ~1/8 the original length.
+        degraded = (
+            "function Class:OnTouch(plr)\n"
+            "    -- ...\n"
+            "end\n"
+        )
+
+        def reprompt(msg: str) -> str:
+            calls.append(msg)
+            return degraded
+
+        out, warnings = _repair_invalid_roblox_calls(BROKEN_BULLET, reprompt)
+        assert out == BROKEN_BULLET, (
+            "a degraded repair response must leave the prior best untouched"
+        )
+        assert _proven(out), "the original proven invalid must still be present"
+        assert any("roblox-call-survivor" in w for w in warnings), (
+            f"the surviving proven invalid must be tagged: {warnings}"
+        )
+        assert any("FindFirstChildOfType" in w for w in warnings)
+        assert len(calls) == 1, (
+            f"the guard must break on the degraded response, not retry "
+            f"(got {len(calls)} calls)"
+        )
+
     def test_unproven_invalid_not_repaired(self):
         # A hallucinated method on a host-component receiver is UNPROVEN ->
         # no reprompt, returned unchanged.

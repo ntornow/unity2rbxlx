@@ -3353,6 +3353,75 @@ The re-lowering changes the return from a raw tagged Instance to a `Character.ne
   - ShopCharacterList.luau:39/:46-49 (dictionary()-value :GetAttribute) — POST-boot → DIVERGENT (table has no :GetAttribute → error on shop open).
 Per the tier-problems rule: root (boot) fixed in Phase 2; downstream-conditional (post-boot character-object consumers) scoped as a follow-on (followups.md). Phase 2 does NOT re-lower TrackManager/Shop and does NOT expand the mechanism, trigger, dead-module carrier, or .gameObject binding. SHAPE-SPECIFIC: unit2-proper affected; unit1 TrackManager.luau:152 passes the name string → unaffected. AC10 makes the boundary explicit so the divergence is disclosed, not a latent regression.
 
+<!-- promoted from /drive run trash-dash-playable-20260617T192649 (2026-06-18) -->
+# Decisions — trash-dash-playable-20260617T192649
+
+- Structural validator fix over a regex/name denylist: key the proven-vs-not decision on
+  whether the receiver resolves to a require()'d local module (deterministic upstream signal),
+  not on a method-name list. A denylist abstains silently the moment the AI emits a valid-but-
+  different shape.
+  Classification: Mechanical
+
+- Single-point fix in `roblox_call_validator.py`: it is the one source feeding both the
+  contract verifier and the `_repair_invalid_roblox_calls` reprompt path; fixing it there
+  corrects both without touching the reprompt loops.
+  Classification: Mechanical
+
+- Phase the downstream gameplay-spawn work behind a live Phase-1 verify: don't pre-scope
+  Addressables fixes against a masked, unobservable state — re-convert first, then scope from
+  the playtest.
+  Classification: Mechanical
+
+- Verify end-to-end via fresh `/convert-unity` conversion + Studio playtest, not unit tests
+  alone: the bug only surfaces on the integrated transpile→reprompt→runtime path.
+  Classification: Mechanical
+
+- Hold the secondary reprompt-degradation guard (reject a degraded/truncated reprompt
+  response, keep the original) as a design alternative, not a commitment; decide at Phase-1
+  detailed design.
+  Classification: Taste
+
+## Plan-stage decisions (trash-dash-playable) — 2026-06-17
+- Root cause anchored on a FRESH current-main conversion + live Studio playtest, NOT the stale unit2 build (which misled toward an already-merged storage fix). Classification: Mechanical.
+- Primary fix = structural change in roblox_call_validator.py (key on require()-binding-RHS provenance, not a method-name denylist). Classification: Mechanical.
+- Signal methods (:Connect/:Once/:Wait) recognized via a corpus addition, not a global validator special-case (avoids nonSignal:Connect bypass). Classification: Taste.
+- Two phases, staged-risk: Phase 2 (downstream Addressables gameplay) scoped ONLY after the Phase-1 re-convert + playtest reveals what the revived state machine exposes. Classification: Mechanical.
+- Phase-1 verification = cold-cache fresh conversion + Studio playtest; exit criterion is STRUCTURAL (4 state modules return valid class tables) + a run starts, not a lucky boot. Classification: Mechanical.
+- Reprompt-degradation guard held as a lean-include hardening candidate; decided at Phase-1 detailed design. Classification: Taste.
+- Verify END-TO-END (fresh /convert-unity-style conversion + Studio), not unit tests alone. Classification: Mechanical.
+- NOT re-fixing ServerStorage misrouting (already fixed on main by #199/#200 reachability closure). Classification: Mechanical.
+
+## Gate-A refinement (user challenge: "more elegant/general? prior work?") — 2026-06-17
+- PRIOR WORK identified: PR #197 (c85fb6f) built the whole roblox_call_validator — a provenance-gated validator + vendored corpus + bounded repair-reprompt, with a zero-FP fixture proof (6c66a2f). The bug is a FALSE-POSITIVE HOLE in that system.
+- MORE ELEGANT/GENERAL fix (replaces the original "new module track-state"): EXTEND #197's two existing mechanisms, don't add parallel machinery.
+  (1) Provenance: bind a `require(...)` RHS to the EXISTING `component` non-Roblox-table state in `_rhs_provenance` (roblox_call_validator.py:384) — the `.Instance` promotion-suppression for `component` bases (`:292`) already exists. DRY reuse, ~1 branch. Classification: Mechanical (clearer, reuses existing).
+  (2) Corpus: add RBXScriptSignal members (Connect/Once/Wait/ConnectParallel) via the EXISTING tools/refresh_roblox_corpus.py — data-driven, not a validator special-case. Classification: Mechanical.
+  (3) Extend #197's zero-FP fixture set with the Module.Instance:Method() + event:Connect cases. Classification: Mechanical.
+- Size dropped (~15-50 SLOC) vs the original framing because the fix reuses existing state rather than adding one. The user's challenge improved the plan.
+
+## Gate-A evidence revision (user challenge: "what does Phase 1 actually solve? prove it") — 2026-06-17
+- Cache forensics (.cache/llm, evidence-phase1-sufficiency.md) PARTIALLY REFUTED "validator FP fix alone -> full modules":
+  the broken state modules are reprompt-acceptance DEGRADATIONS (kept a `...` fragment), and the full
+  versions carry INDEPENDENT rule-a/b contract violations that fire the contract reprompt on their own.
+- DECISION: promote the reprompt-degradation guard from optional-secondary to Phase-1 PRIMARY/load-bearing
+  (keep the better of {original, reprompt}; never accept a structurally-worse/fragment output). The validator
+  FP fix stays as a quality lever (fewer spurious reprompts). Classification: Mechanical (evidence-forced).
+- DECISION: Phase-1 exit criterion is STRUCTURAL + empirical (4 modules return valid class tables + load on a
+  COLD re-convert), explicitly NOT "a run starts." rule-a/b runtime correctness + gameplay spawning are
+  surfaced by the playtest and (gameplay) deferred to Phase 2. Classification: Mechanical.
+- What Phase 1 solves, bounded: state modules load -> state machine boots (the current hard blocker). It does
+  NOT by itself guarantee rule-a/b runtime correctness or gameplay spawning. Classification: Mechanical.
+
+## Phase-1 detailed-design decisions — 2026-06-17
+- Reprompt-degradation guard lives in a SHARED pure helper (`_reprompt_is_structurally_safe`) that BOTH `_verify_and_reprompt` AND `_repair_invalid_roblox_calls` call — the repair path has the identical unconditional-accept shape/risk; one predicate closes both (DRY). Classification: Mechanical.
+- "Structurally worse" defined CONSERVATIVELY: reject only on parse-loss (candidate fails parse while original parsed), top-level-return-loss, or size-collapse <50%; function-count-drop is a contributing signal only, never standalone. Biases to ACCEPT a smaller-but-correct reprompt (false-reject re-ships the original broken module = the costly error). Classification: Taste.
+- Length floor 0.5 (stricter than the existing 0.3 at `_reprompt_fix:2656`): a contract/repair reprompt should return a corrected FULL module; 0.5 clears every legitimate smaller-correct case and catches the 0.07-ratio fragment. Classification: Taste.
+- On guard rejection, re-surface the ORIGINAL violations as survivors reusing the existing failed/empty-reprompt branch shape; NO new warning tag (keeps the compliance-spike taxonomy stable; fails-closed at project level exactly as today). Classification: Mechanical.
+- KEEP the `component` state name and broaden its docstring (do NOT rename to `non_roblox_table`): a require'd module is the same class as a host-component result; the existing `.Instance` promotion-suppression already handles any `component` base. Rename = pure churn (TrackLit + 5+ sites + literal-asserting tests) for zero behavior change. Classification: Taste.
+- `_rhs_provenance` binds a `require(...)` RHS to `component` via a new `_is_require_call(rhs)` keyed on the BINDING RHS, not the variable name (a real Roblox var bound from `workspace:FindFirstChild` stays proven and is still checked; a require'd-local reassigned to a Roblox instance upgrades via the plain-reassign rule). Classification: Mechanical.
+- RBXScriptSignal members (Connect/Once/Wait/ConnectParallel) added via a curated constant unioned into `tools/refresh_roblox_corpus.py` then regenerate — they live in the API dump's data-type section the tool's `Classes`/`MemberType==Function` filter cannot reach, so the tool MUST supply them; routing through the corpus keeps `Connect` under the provenance gate (no `nonSignal:Connect` blanket bypass). Classification: Mechanical.
+- `nonSignal:Connect()` on a wrong-typed receiver is accepted-with-rationale / out of scope: the validator catches "nonexistent Roblox method NAME", not "method on wrong-typed receiver"; `Connect` is a real name. Classification: Taste.
+- Phase 1 = two slices FAN-OUT/parallel (1.1 guard in code_transpiler.py; 1.2 validator FP + corpus) — disjoint files, no shared NEW contract (the `find_invalid_roblox_calls` signature is unchanged), so fan-out allowed. The COLD-cache `/convert-unity` re-convert + playtest is a phase-integration step (criteria 15/16), not a slice dep. Classification: Mechanical.
 ## Run door-binding-race (2026-06-17) — placement-order-robust Anim_* binding
 
 # Decisions — door-binding-race run

@@ -170,7 +170,9 @@
     "ComputeRawPathAsync",
     "ComputeSmoothPathAsync",
     "ConformToAvatarRules",
+    "Connect",
     "ConnectLocal",
+    "ConnectParallel",
     "ConnectRemote",
     "ConvertToPackageUpload",
     "ConvertToSmooth",
@@ -977,6 +979,7 @@
     "OnInvoke",
     "OnSetItem",
     "OnUpdate",
+    "Once",
     "OpenBrowserWindow",
     "OpenExceptionMessagePopup",
     "OpenInBrowser_DONOTUSE",
@@ -1571,6 +1574,7 @@
     "ValidateUniqueUVCount",
     "ViewPackageOnWebsite",
     "ViewportPointToRay",
+    "Wait",
     "WaitForChild",
     "WaitForDataReady",
     "WaitForInputEventsProcessed",
@@ -3283,6 +3287,10 @@
     "stop": "stop(): void",
     "takeDamage": "takeDamage(amount: float): void",
     "usesCustomRestPoseLua": "usesCustomRestPoseLua(): bool",
-    "waitForDataReady": "waitForDataReady(): bool"
+    "waitForDataReady": "waitForDataReady(): bool",
+    "Connect": "Connect(handler: function): RBXScriptConnection",
+    "Once": "Once(handler: function): RBXScriptConnection",
+    "Wait": "Wait(): Tuple",
+    "ConnectParallel": "ConnectParallel(handler: function): RBXScriptConnection"
   }
 }

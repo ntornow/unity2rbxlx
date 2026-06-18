@@ -1891,6 +1891,16 @@ def _verify_and_reprompt(
             _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
+    if not _reprompt_is_structurally_safe(luau_source, new_luau):
+        # The reprompt response is a structural regression (fragment / lost
+        # return / dropped handlers / collapsed length). Keep the ORIGINAL and
+        # re-surface the original violations as survivors -- operationally
+        # "reprompt didn't fix anything", identical to the empty/None branches
+        # above, so the module still fails-closed downstream.
+        return luau_source, pre_warnings + [
+            _format_contract_survivor_warning(v) for v in initial.violations
+        ]
+
     second = verify_module(
         new_luau, is_player_controller=is_player_controller,
     )
@@ -1992,6 +2002,12 @@ def _repair_invalid_roblox_calls(
             break
         new_luau = _strip_code_fences(new_text)
         if not new_luau:
+            break
+        if not _reprompt_is_structurally_safe(best, new_luau):
+            # A degraded repair response (fragment / lost return / gutted /
+            # collapsed). Keep the current ``best``; the bounded loop's purpose
+            # is exhausted once a response degrades (retrying the same prompt
+            # yields the same shape), so break rather than continue.
             break
         best = new_luau
         proven = _proven_invalid_roblox_calls(best)
@@ -2240,6 +2256,109 @@ def _strip_code_fences(text: str) -> str:
     text = re.sub(r"^```(?:luau|lua)?\s*\n?", "", text, count=1)
     text = re.sub(r"\n?```\s*$", "", text, count=1)
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Reprompt-degradation guard (slice 1.1)
+#
+# Both reprompt-acceptance paths (``_verify_and_reprompt`` and
+# ``_repair_invalid_roblox_calls``) currently keep an AI reprompt response
+# UNCONDITIONALLY. The cache forensics show a contract reprompt degrading a
+# 108-line module returning a class table into an 8-line ``...`` fragment.
+# This pure guard rejects a structurally-WORSE candidate so the emitted output
+# is never worse than what the reprompt replaced. It is deliberately
+# conservative: false-REJECT (re-ship the original) is the costly error, so a
+# smaller-but-correct reprompt clears every floor.
+# ---------------------------------------------------------------------------
+
+_LEN_COLLAPSE_FRACTION = 0.5
+_FUNCTION_COLLAPSE_FRACTION = 0.5
+
+
+def _has_top_level_return(luau_source: str) -> bool:
+    """True iff ``luau_source`` has a column-0 (top-level) ``return`` statement.
+
+    A module's contract is to ``return`` a table; dropping the top-level
+    ``return`` is the exact ``...``-fragment degradation. Comments and string
+    literals are stripped first (via the contract verifier's shared stripper)
+    so a ``return`` inside a comment or string never counts; then any line whose
+    first non-whitespace token at column 0 is ``return`` qualifies.
+    """
+    from converter.runtime_contract import _strip_strings_and_comments
+
+    stripped = _strip_strings_and_comments(luau_source)
+    for line in stripped.splitlines():
+        # Column-0 ``return`` (no leading whitespace) = a top-level statement.
+        if re.match(r"return\b", line):
+            return True
+    return False
+
+
+def _count_function_defs(luau_source: str) -> int:
+    """Count ``function`` definitions in ``luau_source``.
+
+    Matches both ``function Name(`` / ``function T:Method(`` / ``function T.f(``
+    and the assigned-anonymous form ``T.f = function`` / ``local f = function``.
+    Comments and string literals are stripped first so a ``function`` keyword
+    inside a comment or string never counts.
+    """
+    from converter.runtime_contract import _strip_strings_and_comments
+
+    stripped = _strip_strings_and_comments(luau_source)
+    # ``\bfunction\b`` covers every definition form: ``function Name(...)``,
+    # ``function T:Method(...)``, and ``x = function(...)``. After stripping
+    # strings/comments the only remaining ``function`` tokens are real keywords.
+    return len(re.findall(r"\bfunction\b", stripped))
+
+
+def _reprompt_is_structurally_safe(original_luau: str, candidate_luau: str) -> bool:
+    """True iff ``candidate_luau`` may REPLACE ``original_luau`` after a reprompt.
+
+    Conservative degradation guard: a reprompt response is REJECTED (return
+    ``False`` -> caller keeps ``original_luau``) iff ANY of four standalone,
+    generously-set floors breach; else it is ACCEPTED. Biased to ACCEPT — a
+    false-reject re-ships the original broken module, the costly error.
+
+    The four floors:
+      1. Parse-loss: the candidate fails the luau syntax check while the
+         original parsed. (If the original also failed to parse, this floor
+         does NOT fire — there is no good original to keep. The syntax check
+         returns ``[]`` without raising when luau-analyze is absent, so this
+         floor simply never fires in stripped environments.)
+      2. Return-loss: the original had a top-level ``return`` and the candidate
+         lost it.
+      3. Length collapse: the candidate's stripped length is < 50% of the
+         original's stripped length.
+      4. Function-count floor (only when the original had >= 2 function defs):
+         the candidate's function count is < 50% of the original's. A 1-2
+         function merge stays above the floor and is ACCEPTED; a gutted-but-
+         full-size candidate that dropped most handlers is REJECTED.
+
+    Pure: the only external dependency is the shared luau syntax checker.
+    """
+    # Floor 1 -- parse-loss (only when the original parsed).
+    original_parsed = _luau_syntax_check(original_luau) == []
+    if original_parsed and _luau_syntax_check(candidate_luau) != []:
+        return False
+
+    # Floor 2 -- return-loss.
+    if _has_top_level_return(original_luau) and not _has_top_level_return(candidate_luau):
+        return False
+
+    # Floor 3 -- length collapse.
+    original_len = len(original_luau.strip())
+    candidate_len = len(candidate_luau.strip())
+    if candidate_len < _LEN_COLLAPSE_FRACTION * original_len:
+        return False
+
+    # Floor 4 -- function-count floor (only for modules with >= 2 functions).
+    original_fns = _count_function_defs(original_luau)
+    if original_fns >= 2:
+        candidate_fns = _count_function_defs(candidate_luau)
+        if candidate_fns < _FUNCTION_COLLAPSE_FRACTION * original_fns:
+            return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------

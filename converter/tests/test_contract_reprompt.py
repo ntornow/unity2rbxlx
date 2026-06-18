@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.code_transpiler import (  # noqa: E402
     _format_contract_violations,
+    _reprompt_is_structurally_safe,
     _verify_and_reprompt,
 )
 from converter.runtime_contract import verify_module  # noqa: E402
@@ -234,3 +235,184 @@ class TestViolationFormatting:
         # ``[rule X]`` + ``line N`` per the contract reprompt format.
         assert "[rule" in text
         assert "line" in text
+
+
+# ---------------------------------------------------------------------------
+# Reprompt-degradation guard (slice 1.1) -- acceptance criteria 1-5.
+# ---------------------------------------------------------------------------
+
+# A full, correct module returning a class table -- the GOOD original.
+GOOD_MODULE = """\
+local GameState = {}
+GameState.__index = GameState
+
+function GameState.new(config)
+    local self = setmetatable({}, GameState)
+    self.score = 0
+    self.lives = 3
+    self.phase = "menu"
+    return self
+end
+
+function GameState:AddScore(points)
+    self.score = self.score + points
+    return self.score
+end
+
+function GameState:LoseLife()
+    self.lives = self.lives - 1
+    return self.lives
+end
+
+function GameState:SetPhase(phase)
+    self.phase = phase
+end
+
+function GameState:Reset()
+    self.score = 0
+    self.lives = 3
+    self.phase = "menu"
+end
+
+return GameState
+"""
+
+# The cache-forensics degradation shape: an 8-line ``...`` fragment with no
+# top-level return.
+FRAGMENT = """\
+function GameState:AddScore(points)
+    self.score = self.score + points
+    -- ...
+end
+"""
+
+# A correct, CONCISE module: still parses, still returns a table, >= 50%
+# length and function count of GOOD_MODULE -> must be ACCEPTED.
+SMALLER_CORRECT = """\
+local GameState = {}
+GameState.__index = GameState
+
+function GameState.new(config)
+    local self = setmetatable({}, GameState)
+    self.score = 0
+    self.lives = 3
+    self.phase = "menu"
+    return self
+end
+
+function GameState:AddScore(points)
+    self.score = self.score + points
+    return self.score
+end
+
+function GameState:Reset()
+    self.score = 0
+    self.lives = 3
+    self.phase = "menu"
+end
+
+return GameState
+"""
+
+# A weak original that NEVER had a top-level return (already a fragment).
+WEAK_NO_RETURN = """\
+function GameState:AddScore(points)
+    self.score = self.score + points
+end
+
+function GameState:Reset()
+    self.score = 0
+end
+"""
+
+# A candidate that also has no top-level return but is at least as good -> with
+# no good original to keep, the guard must ACCEPT (edge case 1).
+CANDIDATE_NO_RETURN = """\
+function GameState:AddScore(points)
+    self.score = self.score + points
+    return self.score
+end
+
+function GameState:Reset()
+    self.score = 0
+    self.lives = 3
+end
+"""
+
+# Unparseable prose (what survives _strip_code_fences when the AI returns no
+# fences but plain English).
+UNPARSEABLE_PROSE = (
+    "I cannot fix this module because the original code is incomplete and "
+    "missing several function definitions that would be required."
+)
+
+
+class TestRepromptStructuralGuard:
+
+    def test_fragment_rejected(self):
+        # Criterion 1: a good module degraded into a ``...`` fragment is
+        # REJECTED (return-loss + length collapse).
+        assert _reprompt_is_structurally_safe(GOOD_MODULE, FRAGMENT) is False
+
+    def test_smaller_correct_accepted(self):
+        # Criterion 2: a correct, concise module (parses, returns a table,
+        # >= 50% length and function count) is ACCEPTED -- no false-reject.
+        assert _reprompt_is_structurally_safe(GOOD_MODULE, SMALLER_CORRECT) is True
+
+    def test_weak_original_no_return_accepts_candidate(self):
+        # Criterion 3 (edge case 1): when the original itself had no top-level
+        # return, the return-loss floor does NOT fire, so a candidate without a
+        # return is ACCEPTED -- the guard only prevents good->bad, it does not
+        # synthesize a good module from two bad ones.
+        assert (
+            _reprompt_is_structurally_safe(WEAK_NO_RETURN, CANDIDATE_NO_RETURN)
+            is True
+        )
+
+    def test_unparseable_prose_rejected(self):
+        # Criterion 4: a candidate that fails to parse while the original
+        # parsed is REJECTED (parse-loss floor). Skipped when luau-analyze is
+        # absent (the floor cannot fire), but the length floor catches this
+        # candidate too, so it is rejected either way.
+        assert (
+            _reprompt_is_structurally_safe(GOOD_MODULE, UNPARSEABLE_PROSE) is False
+        )
+
+    def test_gutted_full_size_candidate_rejected(self):
+        # The function-count FLOOR seam: a candidate that keeps a token return,
+        # stays >= 50% length, but dropped most handlers is REJECTED.
+        gutted = (
+            "local GameState = {}\n"
+            "GameState.__index = GameState\n\n"
+            "function GameState.new(config)\n"
+            "    return setmetatable({}, GameState)\n"
+            "end\n\n"
+            "-- padding to stay above the length floor: "
+            + ("x " * 60)
+            + "\n\nreturn GameState\n"
+        )
+        # GOOD_MODULE has 5 functions; gutted has 1 (< 0.5 * 5 = 2.5).
+        assert _reprompt_is_structurally_safe(GOOD_MODULE, gutted) is False
+
+
+class TestRepromptGuardWiring:
+
+    def test_fragment_reprompt_keeps_original_and_surfaces_survivor(self):
+        # Criterion 5: ``_verify_and_reprompt`` with a reprompt closure that
+        # returns a fragment KEEPS the original ``luau_source`` and surfaces the
+        # original violations as survivor warnings (mirrors the None/empty
+        # branches).
+        def reprompt(msg: str):
+            return FRAGMENT
+
+        out, warnings = _verify_and_reprompt(
+            RULE_A_BROKEN, "csharp", "generic", reprompt,
+        )
+        assert out == RULE_A_BROKEN, (
+            "a structurally-degraded reprompt must leave the original source "
+            "untouched"
+        )
+        assert warnings, "the original violations must be surfaced as survivors"
+        assert any("rule a" in w for w in warnings), (
+            f"survivor warnings lost the rule label: {warnings}"
+        )
