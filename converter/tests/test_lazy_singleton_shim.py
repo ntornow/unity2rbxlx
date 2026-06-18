@@ -553,3 +553,153 @@ def test_lazy_singletons_in_plan_key_allowlist():
     from converter import autogen
 
     assert "lazy_singletons" in autogen._PLAN_KEYS_FOR_HOST
+
+
+# ---------------------------------------------------------------------------
+# End-to-end round-trip: detector -> resolver -> REAL plan encoder -> shim.
+# ---------------------------------------------------------------------------
+
+# A canonical CoroutineHandler-shaped lazy singleton (static self-typed field +
+# self-instantiating getter, no Awake/OnEnable/Start, benign DontDestroyOnLoad).
+_E2E_COROUTINE_CS = """\
+    using UnityEngine;
+    public class CoroutineHandler : MonoBehaviour
+    {
+        static protected CoroutineHandler m_Instance;
+        static public CoroutineHandler instance
+        {
+            get
+            {
+                if(m_Instance == null)
+                {
+                    GameObject o = new GameObject("CoroutineHandler");
+                    DontDestroyOnLoad(o);
+                    m_Instance = o.AddComponent<CoroutineHandler>();
+                }
+                return m_Instance;
+            }
+        }
+    }
+"""
+
+
+def _build_e2e_plan_source(tmp_path: Path) -> tuple[str, str, str]:
+    """Drive the FULL build half: a real ``.cs`` -> GuidIndex -> detector
+    (``analyze_script``) -> the REAL ``resolve_lazy_singletons`` -> the REAL
+    ``generate_scene_runtime_plan_module`` encoder. Returns
+    ``(encoded_plan_luau, script_guid, module_path)``.
+
+    This is the load-bearing join the two slice tests cover only in halves: the
+    seed test stops at the resolver records; the shim test hand-writes a plan
+    whose ``script_guid`` matches ``plan.modules`` by construction. Here the
+    ``script_guid`` is produced by the resolver off the GuidIndex and carried
+    THROUGH the real Luau-literal encoder, so the test proves the GUID join (the
+    BLOCKING #1 mismatch) survives a real encode + parse — including the
+    bare-vs-bracketed key encoding ``_plan_to_luau`` applies to a GUID key.
+    """
+    import hashlib
+
+    from unity.guid_resolver import build_guid_index
+    from converter.consumable_db_seed import build_base_by_class
+    from converter.lazy_singleton_seed import resolve_lazy_singletons
+    from converter.autogen import generate_scene_runtime_plan_module
+
+    guid = "a" + hashlib.sha256(b"coroutine-handler-e2e").hexdigest()[:31]
+    cs = tmp_path / "Assets" / "Scripts" / "CoroutineHandler.cs"
+    cs.parent.mkdir(parents=True, exist_ok=True)
+    cs.write_text(textwrap.dedent(_E2E_COROUTINE_CS), encoding="utf-8")
+    cs.with_suffix(".cs.meta").write_text(
+        f"fileFormatVersion: 2\nguid: {guid}\n", encoding="utf-8",
+    )
+
+    guid_index = build_guid_index(tmp_path)
+    base_by_class = build_base_by_class(guid_index)
+    module_path = "ReplicatedStorage.CoroutineHandler"
+    # The GUID-keyed modules registry the planner emits (mirrors the real shape).
+    modules: dict[str, object] = {
+        guid: {
+            "stem": "CoroutineHandler",
+            "class_name": "CoroutineHandler",
+            "module_path": module_path,
+            "domain": "client",
+            "runtime_bearing": False,
+            "is_component_class": True,
+        },
+    }
+    seeds = resolve_lazy_singletons(
+        modules=modules,
+        guid_index=guid_index,
+        base_by_class=base_by_class,
+        module_path_for_stem=lambda stem: (
+            f"ReplicatedStorage.{stem}" if stem else None
+        ),
+    )
+    assert len(seeds) == 1, seeds
+    assert seeds[0]["script_guid"] == guid
+    assert seeds[0]["backing_field"] == "m_Instance"
+
+    scene_runtime = {"modules": modules, "lazy_singletons": seeds}
+    plan_module = generate_scene_runtime_plan_module(scene_runtime)
+    # ``generate_*`` prepends ``return {...}``; the embed below ``loadstring``s the
+    # whole module body, so keep it verbatim (proves it parses as real Luau).
+    return plan_module.source, guid, module_path
+
+
+@_luau_marker
+def test_end_to_end_detector_resolver_encoder_shim_round_trip(tmp_path: Path) -> None:
+    """The full path joined ONCE: a real ``.cs`` -> detector -> resolver -> the
+    REAL plan encoder -> parse -> the REAL shim addComponent path. Proves the
+    resolver-produced ``script_guid`` survives the Luau-literal encode and IS a
+    key in the encoded ``Plan.modules`` at shim time (the BLOCKING #1 GUID join),
+    and that the seeded singleton then constructs + Awakes (getInstance() live).
+
+    The two slice tests cover only halves (seed test stops at records; shim test
+    hand-writes a guid-matched plan); this is the only test exercising the encoder
+    in the join, so a future encoder rekey or resolver guid-source change is caught.
+    """
+    plan_source, guid, module_path = _build_e2e_plan_source(tmp_path)
+
+    # Embed the encoded plan module verbatim and ``loadstring`` it -- this is a
+    # REAL Luau parse of the encoder output, so a malformed/elided key fails here.
+    # The CoroutineHandler-shaped Cls is registered under the seed's module_path
+    # (the resolveModule lookup key); the seed's script_guid keys plan.modules.
+    # Lua long-bracket levels use ``=`` signs only (``[==[ ... ]==]``); bump the
+    # level until the close sequence does not occur in the plan source.
+    delim = "=="
+    while f"]{delim}]" in plan_source or f"[{delim}[" in plan_source:
+        delim += "="
+    scenario = textwrap.dedent(f"""\
+        local PLAN_SOURCE = [{delim}[
+{plan_source}
+]{delim}]
+        local Plan
+        do
+            local chunk, err = loadstring(PLAN_SOURCE, "SceneRuntimePlan")
+            assert(chunk, "encoded plan did not parse as Luau: " .. tostring(err))
+            Plan = chunk()
+        end
+        local GUID = {guid!r}
+        -- The encoded GUID join: the resolver-produced script_guid must be a key
+        -- in the encoded plan.modules (bare or bracketed key, same string at
+        -- runtime). A rekey to module_path would make this nil -> the shim's
+        -- presence guard would warn + skip and the singleton would never awake.
+        print("GUID_IN_MODULES=" .. tostring(Plan.modules[GUID] ~= nil))
+        print("SEED_GUID_MATCHES=" .. tostring(Plan.lazy_singletons[1].script_guid == GUID))
+
+        local Cls = makeCoroutineHandler("m_Instance")
+        local modulesByPath = {{ [{module_path!r}] = Cls }}
+        local services = servicesFor(modulesByPath)
+        local engine = SceneRuntime.new(services, Plan)
+        print("BEFORE_NIL=" .. tostring(Cls.getInstance() == nil))
+        SceneRuntime.seedLazySingletons(Plan, services, engine, "client")
+        print("AFTER_NONNIL=" .. tostring(Cls.getInstance() ~= nil))
+        print("AWAKE_COUNT=" .. tostring(Cls.awakeCount))
+        dumpLogs()
+    """)
+    out = _run(scenario)
+    assert "GUID_IN_MODULES=true" in out, out
+    assert "SEED_GUID_MATCHES=true" in out, out
+    assert "BEFORE_NIL=true" in out      # the bug state before seeding
+    assert "AFTER_NONNIL=true" in out    # constructed through the real encoder+shim
+    assert "AWAKE_COUNT=1" in out        # exactly one instance
+    assert "WARN_COUNT=0" in out         # no fail-soft skip path taken
