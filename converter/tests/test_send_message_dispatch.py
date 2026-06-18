@@ -803,13 +803,24 @@ class TestPlayerAliasDispatch:
         # AC-4. With isClient=false (-> _player == nil), a Player-object
         # receiver makes _isPlayerAlias true (branch (a)), but _playerGoIds()
         # returns {} -> the branch warns "no player-embodiment GameObject
-        # bound" and dispatches NOTHING, without erroring.
+        # bound" and dispatches NOTHING, without erroring. AC-4 also requires
+        # the warn to be EMITTED -- the harness ``logs`` table captures every
+        # self._warn -> services.warn -> logWarn call, so we scan it for the
+        # design's warn substring and assert it fired (no dispatch alone does
+        # not prove the warn path ran).
         scenario = _PLAYER_SCENE_SETUP.replace(
             "services.isClient = true", "services.isClient = false"
         ) + textwrap.dedent("""\
             print("GOIDS=" .. #engine:_playerGoIds())
             host:sendMessage(plrObj, "GetItem", "Rifle")
             print("CALLS=" .. #calls)
+            local warned = false
+            for _, msg in ipairs(logs) do
+                if string.find(msg, "no player-embodiment GameObject bound", 1, true) then
+                    warned = true
+                end
+            end
+            print("WARNED=" .. tostring(warned))
             print("DONE")
         """)
         rc, out, err = _run_scenario(scenario)
@@ -817,16 +828,54 @@ class TestPlayerAliasDispatch:
         lines = out.strip().splitlines()
         assert "GOIDS=0" in lines, out
         assert "CALLS=0" in lines, out
-        assert "DONE" in lines, out
-        # The fail-closed warn is emitted (logs print to the proc via logWarn,
-        # captured in stderr only when the runtime warns; assert no dispatch is
-        # the load-bearing check). No throw: rc == 0 + DONE printed above.
+        # AC-4 warn clause: the fail-closed warn is actually emitted.
+        assert "WARNED=true" in lines, out
+        assert "DONE" in lines, out  # no throw: rc == 0 + DONE printed.
 
-    def test_multiple_rig_instances_each_dispatch(self):
-        # AC-5 / D-P2-9. The player MODULE placed on TWO GameObjects
-        # (gP1/gP2), each with a GetItem-implementing component, yields TWO
-        # distinct goIds after dedupe -> BOTH record GetItem(Rifle), and the
-        # dispatch count == #_playerGoIds() == 2.
+    def test_fail_closed_when_player_script_id_nil(self):
+        # AC-4 (second guard clause). Distinct from _player == nil: here
+        # self._player EXISTS but _player._playerScriptId is nil, exercising the
+        # SECOND clause of ``if not p or not p._playerScriptId`` in
+        # _playerGoIds. A Player-object receiver is still _isPlayerAlias=true,
+        # but _playerGoIds() returns {} -> warn + NO dispatch + NO throw.
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            -- Force the "_player set but _playerScriptId nil" state directly
+            -- (a CC module that left the rig-resolution key unbound). _player
+            -- is non-nil so we exercise the SECOND guard clause, not the first.
+            engine._player = {_yaw = 0, _pitch = 0, _playerScriptId = nil}
+            print("HASPLAYER=" .. tostring(engine._player ~= nil))
+            print("GOIDS=" .. #engine:_playerGoIds())
+            host:sendMessage(plrObj, "GetItem", "Rifle")
+            print("CALLS=" .. #calls)
+            local warned = false
+            for _, msg in ipairs(logs) do
+                if string.find(msg, "no player-embodiment GameObject bound", 1, true) then
+                    warned = true
+                end
+            end
+            print("WARNED=" .. tostring(warned))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # _player EXISTS (second clause is the one under test).
+        assert "HASPLAYER=true" in lines, out
+        assert "GOIDS=0" in lines, out
+        assert "CALLS=0" in lines, out
+        assert "WARNED=true" in lines, out
+        assert "DONE" in lines, out  # no throw.
+
+    def test_per_goid_dedupe_no_double_dispatch(self):
+        # D-P2-9 (per-goId dedupe). TWO matching _meta rows (two components)
+        # share ONE gameObjectId, both keyed to _playerScriptId. _playerGoIds()
+        # must return EXACTLY ONE goId (the ``seen[goId]`` collapse), and
+        # sendMessage to a player alias dispatches to that goId exactly once --
+        # the active-gate + bucket already invokes BOTH components on the one
+        # GO, so the point is the goId LIST is deduped (no double dispatch over
+        # the same goId). A regression dropping ``seen`` would make goIds =
+        # {gPlayer, gPlayer} -> each component invoked twice -> this test FAILS
+        # (the duplicate-rifle multiplicity).
         scenario = textwrap.dedent("""\
             local calls = {}
             local function record(tag, ...)
@@ -834,19 +883,104 @@ class TestPlayerAliasDispatch:
                 for i, v in ipairs(args) do args[i] = tostring(v) end
                 table.insert(calls, tag .. "(" .. table.concat(args, ",") .. ")")
             end
-            local P1 = {} ; P1.__index = P1
-            function P1.new(_) return setmetatable({}, P1) end
-            function P1:GetItem(name) record("P1.GetItem", name) end
-            local P2 = {} ; P2.__index = P2
-            function P2.new(_) return setmetatable({}, P2) end
-            function P2:GetItem(name) record("P2.GetItem", name) end
+            -- TWO components on the SAME GameObject (gPlayer), both under the
+            -- SAME player script_id (one module row), so two _meta rows share
+            -- one goId. Dispatch keys on meta.classTable[name], so both
+            -- components share ONE class (PlayerMod.GetItem); each instance
+            -- carries a distinct config ``tag`` to prove BOTH components fire.
+            local PlayerMod = {} ; PlayerMod.__index = PlayerMod
+            function PlayerMod.new(config)
+                return setmetatable({_tag = (config or {}).tag or "?"}, PlayerMod)
+            end
+            function PlayerMod:GetItem(name) record(self._tag .. ".GetItem", name) end
+            local plan = {
+                modules = {
+                    player = {stem = "Player", runtime_bearing = true,
+                              module_path = "p", has_character_controller = true},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "player",
+                             game_object_id = "gPlayer", active = true,
+                             enabled = true, config = {tag = "Foo"}},
+                            {instance_id = "A:2", script_id = "player",
+                             game_object_id = "gPlayer", active = true,
+                             enabled = true, config = {tag = "Bar"}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local playerGo = {Name = "PlayerLogic", _sceneRuntimeId = "gPlayer",
+                              _children = {}}
+            local plrObj = {Name = "Plr"}
+            function plrObj:IsA(class) return class == "Player" end
+            local players = {}
+            function players:GetPlayerFromCharacter(model) return nil end
+            local services = servicesFor(plan, {player = PlayerMod},
+                                         {gPlayer = playerGo})
+            services.players = players
+            services.isClient = true
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local host
+            for comp, m in pairs(engine._meta) do host = comp.host end
+            print("GOIDS=" .. #engine:_playerGoIds())
+            host:sendMessage(plrObj, "GetItem", "Rifle")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # Two _meta rows share one goId -> deduped to exactly ONE goId.
+        assert "GOIDS=1" in lines, out
+        # Both components on that ONE goId fire (Unity multi-component) ...
+        assert "Foo.GetItem(Rifle)" in lines, out
+        assert "Bar.GetItem(Rifle)" in lines, out
+        # ... each EXACTLY once: the goId is not dispatched twice (dropping
+        # ``seen`` would double-dispatch the goId -> count == 2 each).
+        assert lines.count("Foo.GetItem(Rifle)") == 1, out
+        assert lines.count("Bar.GetItem(Rifle)") == 1, out
+
+    def test_multiple_rig_instances_each_dispatch(self):
+        # AC-5 / D-P2-9 (multi-goId fan-out). The player MODULE (ONE row
+        # carrying has_character_controller -> ONE _playerScriptId) placed on
+        # TWO distinct GameObjects (gP1/gP2) yields TWO distinct goIds after
+        # dedupe, and BOTH embodiment components receive the dispatch. To prove
+        # two DISTINCT embodiments each fire (not one component recorded twice),
+        # each instance's config carries a distinct ``tag`` and the single
+        # Player class records under that tag -> we assert BOTH "P1.GetItem" and
+        # "P2.GetItem" appear AND the dispatch count == #_playerGoIds() == 2.
+        # (Pre-fix: no _isPlayerAlias branch -> the Player object resolves to
+        # nil -> NEITHER tag is recorded; this assertion FAILS against a3451a4.)
+        scenario = textwrap.dedent("""\
+            local calls = {}
+            local function record(tag, ...)
+                local args = {...}
+                for i, v in ipairs(args) do args[i] = tostring(v) end
+                table.insert(calls, tag .. "(" .. table.concat(args, ",") .. ")")
+            end
+            -- ONE class table for the ONE player MODULE; each instance gets a
+            -- distinct ``tag`` via its config so the two embodiments record
+            -- under DISTINCT tags (proving two distinct components each fire,
+            -- not one component recorded twice).
+            local Player = {} ; Player.__index = Player
+            function Player.new(config)
+                return setmetatable({_tag = (config or {}).tag or "?"}, Player)
+            end
+            function Player:GetItem(name) record(self._tag .. ".GetItem", name) end
             local plan = {
                 modules = {
                     -- ONE module row carries has_character_controller; it is
-                    -- placed on TWO GameObjects (P2-F multi-instance). The
-                    -- second component uses a distinct class table but the
-                    -- SAME script_id so _playerGoIds collects both goIds.
-                    player = {stem = "P1", runtime_bearing = true,
+                    -- placed on TWO GameObjects (P2-F multi-instance). Both
+                    -- instances share the SAME script_id so _playerGoIds
+                    -- collects both (distinct) goIds.
+                    player = {stem = "Player", runtime_bearing = true,
                               module_path = "p", has_character_controller = true},
                 },
                 scenes = {
@@ -854,10 +988,10 @@ class TestPlayerAliasDispatch:
                         instances = {
                             {instance_id = "A:1", script_id = "player",
                              game_object_id = "gP1", active = true,
-                             enabled = true, config = {}},
+                             enabled = true, config = {tag = "P1"}},
                             {instance_id = "A:2", script_id = "player",
                              game_object_id = "gP2", active = true,
-                             enabled = true, config = {}},
+                             enabled = true, config = {tag = "P2"}},
                         },
                         references = {},
                         lifecycle_order = {"A:1", "A:2"},
@@ -871,7 +1005,7 @@ class TestPlayerAliasDispatch:
             function plrObj:IsA(class) return class == "Player" end
             local players = {}
             function players:GetPlayerFromCharacter(model) return nil end
-            local services = servicesFor(plan, {player = P1}, {gP1 = g1, gP2 = g2})
+            local services = servicesFor(plan, {player = Player}, {gP1 = g1, gP2 = g2})
             services.players = players
             services.isClient = true
             local engine = SceneRuntime.new(services, plan)
@@ -888,10 +1022,14 @@ class TestPlayerAliasDispatch:
         assert rc == 0, f"luau failed: {err}\n{out}"
         lines = out.strip().splitlines()
         assert "GOIDS=2" in lines, out
+        # TWO DISTINCT embodiments each receive the dispatch (genuine fan-out).
         assert "P1.GetItem(Rifle)" in lines, out
-        assert "P1.GetItem(Rifle)" in lines, out
-        # Both goIds dispatched; the module's component (P1) on each GO.
-        assert lines.count("P1.GetItem(Rifle)") == 2, out
+        assert "P2.GetItem(Rifle)" in lines, out
+        # Dispatch count == #_playerGoIds() == 2; neither component doubled.
+        assert lines.count("P1.GetItem(Rifle)") == 1, out
+        assert lines.count("P2.GetItem(Rifle)") == 1, out
+        get_item_total = sum(1 for ln in lines if ln.endswith(".GetItem(Rifle)"))
+        assert get_item_total == 2, out
 
     def test_broadcast_to_player_alias_flat_per_goid(self):
         # AC-6. broadcastMessage to a player alias dispatches FLAT to the same
