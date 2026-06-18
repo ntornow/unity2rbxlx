@@ -115,7 +115,20 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   it, Door reads it via `playerFromTouch` — char-only confirmed). The strict `dPos>1` assert correctly
   stays RED because the panel never tweens — the residual converter bug below, NOT a harness flaw.
 
-- [ ] **P1 (generic) — F10 door still doesn't visually open: Anim_Door LocalScript binds via a one-time startup scan that RACES runtime prefab placement. Found 2026-06-17 (e2e, post-#195).**
+- [x] **P1 (generic) — F10 door still doesn't visually open: Anim_Door LocalScript binds via a one-time startup scan that RACES runtime prefab placement. Found 2026-06-17 (e2e, post-#195).**
+  FIXED & MERGED 2026-06-17 (`drive/door-binding-race`, PR #208). The fix is GENERAL, not door-specific:
+  the bug lives in the SHARED boot-scan + `if not target then return end` in `generate_tween_script`,
+  inherited by all four trigger shapes — so it also broke the **HostilePlane** loop-autoplay (script in
+  ServerScriptService, runtime-placed prefab → flying loop never started). `_generate_parameter_driven_playback`
+  + `generate_tween_script` now emit a placement-order-robust scaffold: hoist `_ownerIsContainer` to the
+  prologue + `if not target and _ownerIsContainer then return end`; a shared `bindTarget(_t)` closure
+  (weak-keyed `_bound`, Model→BasePart normalize) with per-shape actions (bool/int `GetAttributeChangedSignal`
+  + apply-current-state-on-bind; loop `task.spawn` + `RunService.Heartbeat:Wait()` yield floor; once play);
+  eager `workspace:GetDescendants()` fanout + a `workspace.DescendantAdded` late-arrival listener, both
+  gated on runtime `not _ownerIsContainer` and keyed on a compile-time-name ∪ resolved-`target.Name`
+  superset. Live-verified in Studio (door opens). Residual follow-up (`.harness/followups.md`): a static
+  scene-baked prefab copy may coexist with the runtime placement (HostilePlane appears under both Workspace
+  and ReplicatedStorage) — placement-dedup, separate from this binding fix.
   #195 correctly routed `Anim_Door_door_open/close` to client `LocalScript`s in StarterPlayerScripts
   (domain fix). But the script (`Anim_Door_*.luau`, emitted by `animation_converter`) finds and
   connects its door panels with a SINGLE `workspace:FindFirstChild("door", true)` + one-pass
