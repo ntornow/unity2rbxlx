@@ -57,7 +57,7 @@ class LazySingletonSeed(TypedDict):
     it (Phase 2 §1.2)."""
     module_path: str    # dotted DataModel path of the singleton ModuleScript
     class_stem: str     # the .cs/RbxScript stem — identity for the dead-module exemption
-    domain: str         # "client" | "server" — the module's final classified domain
+    domain: str         # "client" | "server" | "helper" — the module's final classified domain
     script_guid: str    # the GUID key into plan.modules — the shim hands this to engine:addComponent
     backing_field: str  # the captured static backing-field name (m_Instance / _instance / ...)
 
@@ -468,7 +468,11 @@ def resolve_lazy_singletons(
          singleton (``ScriptInfo.lazy_singleton_field`` non-empty);
       4. the boot-safety gate passes (``passes_boot_safety_gate``);
       5. ``module_path`` resolves under the collision-exclusion contract;
-      6. the row carries a ``"client"``/``"server"`` ``domain``.
+      6. the row carries a ``"client"``/``"server"``/``"helper"`` ``domain``. A
+         ``"helper"`` module loads in BOTH VMs, so its per-VM singleton is
+         boot-seeded on whichever entrypoint uses it (the shim constructs a
+         helper seed on both sides; the per-VM idempotency guard prevents a
+         double-construct within a VM).
     """
     seeds: list[LazySingletonSeed] = []
     for script_guid, row in modules.items():
@@ -522,11 +526,14 @@ def resolve_lazy_singletons(
             )
             continue
 
-        # (6) The classified domain (client/server) of the singleton's module.
+        # (6) The classified domain (client/server/helper) of the singleton's
+        # module. A "helper" module loads in both VMs, so its seed is replayed
+        # on both entrypoints (the shim's per-VM idempotency guard prevents a
+        # double-construct within a VM).
         domain = _str(row.get("domain"))
-        if domain not in ("client", "server"):
+        if domain not in ("client", "server", "helper"):
             logger.info(
-                "[lazy_singleton] %s: module has no client/server domain "
+                "[lazy_singleton] %s: module has no client/server/helper domain "
                 "(%r); abstaining", class_stem, domain,
             )
             continue

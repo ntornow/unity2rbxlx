@@ -403,17 +403,39 @@ def test_abstain_awake_does_more_than_cache(tmp_path: Path) -> None:
     assert seeds == []
 
 
-def test_abstain_no_client_server_domain(tmp_path: Path) -> None:
-    """A lazy singleton whose module has no client/server domain — abstain (no
-    side to seed it on)."""
-    seeds, _ = _resolve(
+def test_abstain_no_client_server_helper_domain(tmp_path: Path) -> None:
+    """A lazy singleton whose module has no client/server/helper domain — abstain
+    (no VM to seed it on). Covers both an empty domain and a non-VM domain."""
+    for bad_domain in ("", "shared-state"):
+        seeds, _ = _resolve(
+            tmp_path,
+            {"CoroutineHandler": (_g("ch7"), _COROUTINE_LIKE)},
+            {"CoroutineHandler": dict(
+                stem="CoroutineHandler", class_name="CoroutineHandler",
+                domain=bad_domain,
+            )},
+        )
+        assert seeds == [], f"expected abstain for domain={bad_domain!r}"
+
+
+def test_helper_domain_qualifies(tmp_path: Path) -> None:
+    """A helper-domain lazy singleton (the REAL CoroutineHandler shape — a shared
+    ReplicatedStorage utility loaded by BOTH VMs) IS seeded, carrying
+    ``domain="helper"`` so the shim can construct it on both entrypoints."""
+    seeds, guid_by_name = _resolve(
         tmp_path,
-        {"CoroutineHandler": (_g("ch7"), _COROUTINE_LIKE)},
+        {"CoroutineHandler": (_g("chh"), _COROUTINE_LIKE)},
         {"CoroutineHandler": dict(
-            stem="CoroutineHandler", class_name="CoroutineHandler", domain="",
+            stem="CoroutineHandler", class_name="CoroutineHandler",
+            domain="helper",
         )},
     )
-    assert seeds == []
+    assert len(seeds) == 1
+    seed = seeds[0]
+    assert seed["class_stem"] == "CoroutineHandler"
+    assert seed["backing_field"] == "m_Instance"
+    assert seed["domain"] == "helper"
+    assert seed["script_guid"] == guid_by_name["CoroutineHandler"]
 
 
 def test_empty_body_onenable_qualifies(tmp_path: Path) -> None:

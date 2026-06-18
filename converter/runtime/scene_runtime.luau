@@ -353,7 +353,10 @@ end
 -- + Awake the instance, so the entrypoint passes the constructed ``engine`` in.
 -- ``domainFilter`` (``"client"``/``"server"``) restricts seeding to the
 -- entrypoint's side; ``nil`` (harness) seeds every seed — mirroring
--- ``engine:start``'s filter.
+-- ``engine:start``'s filter. A ``"helper"`` seed loads in BOTH VMs (a shared
+-- ReplicatedStorage utility), so it is constructed on EITHER side regardless of
+-- ``domainFilter``; the per-VM idempotency guard (2) prevents a double-construct
+-- within a single VM.
 --
 -- Per seed:
 --   1. Resolve the module by ``script_guid`` (the GUID-keyed ``plan.modules``
@@ -388,8 +391,13 @@ function SceneRuntime.seedLazySingletons(plan, services, engine, domainFilter)
 	local seeds = plan.lazy_singletons or {}
 	for _, seed in ipairs(seeds) do
 		-- Side filter: skip a seed whose classified domain is not this
-		-- entrypoint's side. ``nil`` filter (harness) seeds everything.
-		if domainFilter ~= nil and seed.domain ~= domainFilter then
+		-- entrypoint's side. ``nil`` filter (harness) seeds everything. A
+		-- ``"helper"`` seed loads in BOTH VMs, so it is constructed on either
+		-- side regardless of the filter (the per-VM idempotency guard prevents
+		-- a double-construct within a VM).
+		if domainFilter ~= nil
+		   and seed.domain ~= "helper"
+		   and seed.domain ~= domainFilter then
 			-- not this side
 		else
 			-- (1) Resolve the singleton module by its GUID-keyed module path.

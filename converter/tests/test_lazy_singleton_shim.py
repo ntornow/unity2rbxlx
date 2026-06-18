@@ -454,6 +454,44 @@ dumpLogs()
 
 
 @_luau_marker
+def test_helper_domain_seed_constructed_on_both_entrypoints():
+    """A ``helper``-domain seed (a shared ReplicatedStorage utility loaded by BOTH
+    VMs — the REAL CoroutineHandler) is constructed on the ``"server"`` entrypoint
+    AND the ``"client"`` entrypoint, regardless of ``domainFilter``. The per-VM
+    idempotency guard prevents a double-construct within a single VM.
+
+    FAILS against the pre-fix shim (which skipped any seed whose ``domain`` did not
+    EQUAL the filter, so a helper seed was constructed on NEITHER side)."""
+    helper_plan = _ONE_SEED_PLAN.replace('domain = "client"', 'domain = "helper"')
+    # Two fresh engines simulate the two separate VMs (each VM has its own class
+    # table -> its own backing field). The helper seed must construct on BOTH.
+    out = _run(helper_plan + """
+-- VM A: the server entrypoint side.
+local ClsServer = makeCoroutineHandler("m_Instance")
+local servicesServer = servicesFor({ ["ReplicatedStorage.CoroutineHandler"] = ClsServer })
+local engineServer = SceneRuntime.new(servicesServer, plan)
+SceneRuntime.seedLazySingletons(plan, servicesServer, engineServer, "server")
+print("SERVER_SEEDED=" .. tostring(ClsServer.getInstance() ~= nil))
+
+-- VM B: the client entrypoint side (a distinct class table = a distinct VM).
+local ClsClient = makeCoroutineHandler("m_Instance")
+local servicesClient = servicesFor({ ["ReplicatedStorage.CoroutineHandler"] = ClsClient })
+local engineClient = SceneRuntime.new(servicesClient, plan)
+SceneRuntime.seedLazySingletons(plan, servicesClient, engineClient, "client")
+print("CLIENT_SEEDED=" .. tostring(ClsClient.getInstance() ~= nil))
+
+-- Per-VM idempotency: a second seed on the SAME VM does not re-construct.
+SceneRuntime.seedLazySingletons(plan, servicesServer, engineServer, "server")
+print("SERVER_AWAKE_COUNT=" .. tostring(ClsServer.awakeCount))
+dumpLogs()
+""")
+    assert "SERVER_SEEDED=true" in out     # helper constructed on the server side
+    assert "CLIENT_SEEDED=true" in out     # AND on the client side
+    assert "SERVER_AWAKE_COUNT=1" in out   # per-VM idempotency holds (no double-construct)
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
 def test_reads_carried_backing_field_not_hardcoded():
     """The shim reads the CARRIED ``backing_field`` (the name varies across
     projects), never a hardcoded ``m_Instance``. A seed using ``_instance``
