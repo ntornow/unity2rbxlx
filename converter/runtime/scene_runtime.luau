@@ -1648,11 +1648,10 @@ end
 --     not ``recv.Parent``) for the first Humanoid-bearing ``Model``, then
 --     ``GetPlayerFromCharacter``.
 -- Inclusive so the character Model matches as the FIRST node -- the touch-only
--- ``playerFromTouch`` starts at ``recv.Parent`` (correct for a touch part, but
--- structurally misses the Model itself, the live rifle-mount bug). Returns nil
--- for non-player receivers (no Humanoid-bearing Model ancestor) AND for NPCs (a
--- Humanoid Model that ``GetPlayerFromCharacter`` does not resolve to a Player),
--- so both correctly fall through to the non-player ``_resolveReceiverGoId`` path.
+-- ``playerFromTouch`` starts at ``recv.Parent``, which misses the Model itself.
+-- Returns nil for non-player receivers (no Humanoid-bearing Model ancestor) and
+-- for NPCs (a Humanoid Model ``GetPlayerFromCharacter`` does not resolve), so
+-- both fall through to the non-player ``_resolveReceiverGoId`` path.
 function SceneRuntime:_playerFromAlias(recv)
 	if recv == nil then return nil end
 	local players = self._services.players
@@ -1668,8 +1667,8 @@ function SceneRuntime:_playerFromAlias(recv)
 	local guard = 0
 	while node ~= nil and guard < 16 do
 		guard += 1
-		-- pcall the ``IsA`` probe (mirrors branch (a)) so a component table with an
-		-- erroring ``IsA`` can't throw mid-dispatch.
+		-- pcall the ``IsA`` probe so a component table with an erroring ``IsA``
+		-- can't throw mid-dispatch.
 		local okModel, isModel = false, false
 		if type(node.IsA) == "function" then
 			okModel, isModel = pcall(function() return node:IsA("Model") end)
@@ -1678,12 +1677,9 @@ function SceneRuntime:_playerFromAlias(recv)
 			and type(node.FindFirstChildWhichIsA) == "function"
 			and node:FindFirstChildWhichIsA("Humanoid")
 		then
+			-- Keep climbing past an inner Humanoid Model that maps to no player
+			-- (a nested rig); the player's character may be an OUTER ancestor.
 			local p = players:GetPlayerFromCharacter(node)
-			-- A Humanoid Model that is NOT a registered player character (a
-			-- standalone NPC, or a nested Humanoid rig INSIDE the real character)
-			-- resolves nil: keep climbing rather than returning early, so the
-			-- player's character as an OUTER ancestor is still found. A standalone
-			-- NPC simply exhausts the walk -> nil (falls through to non-player).
 			if p ~= nil then return p end
 		end
 		node = node.Parent
