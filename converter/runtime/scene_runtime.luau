@@ -210,6 +210,165 @@ function SceneRuntime.seedAddressableDatabases(plan, services)
 end
 
 -- ---------------------------------------------------------------------
+-- Consumable database seeding (Phase 1 prototype materialization)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim, sibling to ``seedAddressableDatabases``. For
+-- each database in ``plan.consumable_db_seeds`` it MATERIALIZES the database's
+-- design-time array of in-prefab component prototypes into live component
+-- instances and ASSIGNS them onto the DB's declared array field, BEFORE the
+-- consumer's once-only ``Load()`` drain runs. Each seed is:
+--   ``{ db_module_path, array_field, elements = { {class_stem, prefab_id,
+--      fields_literal}, ... } }``
+-- where ``fields_literal`` is the per-element serialized-field table rendered
+-- by the build-time resolver. (The plan encoder quotes it as a STRING, so the
+-- shim realizes it to a live table via ``loadstring`` — a trusted build-time
+-- literal; we fail-soft + WARN if it does not evaluate to a table, never
+-- injecting a bad slot.)
+--
+-- Per element: require the subclass module (``class_stem`` -> module path),
+-- construct ``<Subclass>.new(config)`` (scalars like ``duration`` /
+-- ``canBeSpawned`` are read by the typed ``.new``; 0/1->bool coercion belongs
+-- there, NOT here — a generic shim has no field schema, so it passes literals
+-- verbatim), then assign the serialized fields onto the instance
+-- POST-construction (asset-ref fields such as ``icon`` /
+-- ``ActivatedParticleReference`` are NOT read by ``.new`` so this is the only
+-- path that carries them) and set ``.gameObject`` to the element's prefab id
+-- (the host resolves prefab ids on instantiate).
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- and BEFORE ``engine:start`` — the array MUST hold materialized objects before
+-- the consumer's once-only ``Load()`` builds its dict (else ``Load()`` iterates
+-- prefab-id strings and crashes calling a method on a string).
+--
+-- Per-DB-instance once-guard: ``db._consumablesSeeded`` short-circuits a second
+-- invocation (both entrypoints / a resume / a retry) so post-``Load()`` state is
+-- never re-materialized or clobbered. Unlike ``seedAddressableDatabases`` (which
+-- APPENDS and relies on the consumer drain), this shim ASSIGNS a FRESH array, so
+-- it carries its OWN explicit guard. Generic no-op on an empty plan.
+function SceneRuntime.seedConsumableDatabases(plan, services)
+	assert(type(plan) == "table", "seedConsumableDatabases: plan required")
+	assert(type(services) == "table", "seedConsumableDatabases: services required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	-- Realize a build-time-rendered Luau table literal (a STRING in the plan)
+	-- into a live table. Trusted boundary: the literal is produced by the
+	-- converter's own ``_value_to_lua``. Returns ``{}`` on any miss + WARNs so a
+	-- malformed literal degrades to "no overrides" rather than crashing boot.
+	local function realizeFields(literal, classStem)
+		if literal == nil or literal == "" then
+			return {}
+		end
+		if type(literal) == "table" then
+			-- Tolerate a pre-realized table (test harness / future encoder).
+			return literal
+		end
+		if type(literal) ~= "string" then
+			warn("[consumable-seed] fields literal not a string for "
+				.. tostring(classStem) .. "; ignoring overrides")
+			return {}
+		end
+		local chunk = loadstring("return " .. literal)
+		if chunk == nil then
+			warn("[consumable-seed] fields literal did not compile for "
+				.. tostring(classStem) .. "; ignoring overrides")
+			return {}
+		end
+		local ok, result = pcall(chunk)
+		if not ok or type(result) ~= "table" then
+			warn("[consumable-seed] fields literal did not evaluate to a table for "
+				.. tostring(classStem) .. "; ignoring overrides")
+			return {}
+		end
+		return result
+	end
+
+	-- Resolve a subclass ``.cs`` stem to its emitted module's dotted DataModel
+	-- path via the plan's existing ``modules`` registry (``{stem, class_name,
+	-- module_path}`` per script). The seed elements carry only the ``class_stem``
+	-- (the resolver §1.A keys off the in-prefab component's ``.cs`` stem, which
+	-- equals ``modules[*].stem``); the host requires modules by full path, so the
+	-- shim joins them here — generic, no per-game literal. Returns nil on a miss
+	-- (e.g. a dead-module-pruned subclass), which DROPs the element + WARNs.
+	local modulesByEntry = plan.modules or {}
+	local function modulePathForStem(stem)
+		if stem == nil or stem == "" then
+			return nil
+		end
+		for _, entry in pairs(modulesByEntry) do
+			if type(entry) == "table"
+				and (entry.stem == stem or entry.class_name == stem)
+				and type(entry.module_path) == "string"
+				and entry.module_path ~= "" then
+				return entry.module_path
+			end
+		end
+		return nil
+	end
+
+	local seeds = plan.consumable_db_seeds or {}
+	for _, seed in ipairs(seeds) do
+		local db = resolveModule(nil, seed.db_module_path)
+		if type(db) ~= "table" then
+			warn("[consumable-seed] database module did not resolve to a table: "
+				.. tostring(seed.db_module_path))
+		elseif db._consumablesSeeded then
+			-- Once-guard: already materialized by an earlier entrypoint /
+			-- resume; never re-materialize or clobber post-``Load()`` state.
+		else
+			local arrayField = seed.array_field
+			if type(arrayField) ~= "string" or arrayField == "" then
+				warn("[consumable-seed] seed missing array_field on "
+					.. tostring(seed.db_module_path))
+			else
+				-- Build a FRESH array (assign, not append). Even a zero-element
+				-- seed assigns ``{}`` so ``Load()`` builds an empty dict rather
+				-- than iterating a stale string array (INVARIANT: after seeding,
+				-- the field holds ONLY instances, or is empty — never strings).
+				local materialized = {}
+				for _, element in ipairs(seed.elements or {}) do
+					local modulePath = modulePathForStem(element.class_stem)
+					local Cls = (modulePath ~= nil)
+						and resolveModule(nil, modulePath) or nil
+					if type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+						warn("[consumable-seed] subclass module did not resolve "
+							.. "to a constructable class: "
+							.. tostring(modulePath or element.class_stem)
+							.. "; dropping element")
+					else
+						local config = realizeFields(
+							element.fields_literal, element.class_stem)
+						local c = Cls.new(config)
+						if type(c) ~= "table" then
+							warn("[consumable-seed] " .. tostring(element.class_stem)
+								.. ".new did not return an instance; dropping element")
+						else
+							-- Assign serialized fields POST-construction. Asset-ref
+							-- fields (icon / ActivatedParticleReference) are dropped
+							-- by ``Consumable.new`` (host-injected), so this is the
+							-- only path that carries them onto the instance; scalars
+							-- re-assign to the value ``.new`` already read (no-op).
+							for k, v in pairs(config) do
+								c[k] = v
+							end
+							-- The host resolves the prefab id on instantiate.
+							c.gameObject = element.prefab_id
+							table.insert(materialized, c)
+						end
+					end
+				end
+				db[arrayField] = materialized
+				db._consumablesSeeded = true
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Constructor
 -- ---------------------------------------------------------------------
 

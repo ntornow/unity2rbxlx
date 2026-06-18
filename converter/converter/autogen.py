@@ -1043,6 +1043,7 @@ local services = {
 
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
+SceneRuntime.seedConsumableDatabases(Plan, services)
 engine:start("client")
 '''
 
@@ -1244,6 +1245,7 @@ local services = {
 
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
+SceneRuntime.seedConsumableDatabases(Plan, services)
 engine:start("server")
 '''
 
