@@ -418,6 +418,129 @@ def test_drain_pattern_unit():
     assert db_drains_field_as_objects(len_only, "consumbales") is False
 
 
+def test_drain_pattern_prefab_member_instantiate_abstains():
+    """Finding #2: ``Instantiate(c.gameObject)`` / ``Instantiate(field[i].member)``
+    is PREFAB usage (the element is a prefab carrier), not object usage. A member
+    ACCESS whose value is fed to Instantiate must NOT be treated as object usage."""
+    # foreach loop var whose .gameObject is instantiated -> prefab usage.
+    foreach_proto = (
+        "public void Spawn() { foreach (var c in consumbales) Instantiate(c.gameObject); }"
+    )
+    assert db_drains_field_as_objects(foreach_proto, "consumbales") is False
+    # indexed element member instantiated -> prefab usage.
+    indexed_proto = (
+        "public void Spawn() { for (int i=0;i<consumbales.Length;++i) "
+        "Instantiate(consumbales[i].gameObject); }"
+    )
+    assert db_drains_field_as_objects(indexed_proto, "consumbales") is False
+
+
+def test_drain_pattern_foreach_instantiate_element_abstains():
+    """Finding #6: ``foreach (var c in field) Instantiate(c)`` — the loop var bound
+    to an element is handed straight to Instantiate -> prefab usage, abstain."""
+    src = "public void Spawn() { foreach (var c in consumbales) Instantiate(c); }"
+    assert db_drains_field_as_objects(src, "consumbales") is False
+
+
+def test_drain_pattern_local_alias_method_call_is_object_usage():
+    """Finding #3: a local alias of an element drained as an object
+    (``var c = field[i]; c.Method();``) is object usage — the structural check
+    must follow the element binding, not only direct ``field[i].Member``."""
+    aliased = (
+        "public void Load() { for (int i=0;i<consumbales.Length;++i) "
+        "{ var c = consumbales[i]; _dict.Add(c.GetConsumableType(), c); } }"
+    )
+    assert db_drains_field_as_objects(aliased, "consumbales") is True
+    # foreach alias method call (the common shape) is object usage too.
+    foreach_alias = (
+        "public void Load() { foreach (var c in consumbales) { c.Activate(); } }"
+    )
+    assert db_drains_field_as_objects(foreach_alias, "consumbales") is True
+
+
+def test_drain_pattern_member_access_only_is_not_object_usage():
+    """A bare member ACCESS that is never CALLED is not positive object usage —
+    require a method call (finding #2's positive-signal requirement)."""
+    # field[i].member read (no call) and not drained as objects elsewhere.
+    read_only = (
+        "public int Sum() { int t = 0; for (int i=0;i<consumbales.Length;++i) "
+        "t += consumbales[i].weight; return t; }"
+    )
+    assert db_drains_field_as_objects(read_only, "consumbales") is False
+
+
+# --------------------------------------------------------------------------- #
+# Finding #5 — WARN when >1 candidate array passes both gates
+# --------------------------------------------------------------------------- #
+
+def test_multiple_passing_arrays_warns_and_seeds_first(tmp_path, caplog):
+    """When >1 candidate array on one DB passes both gates, the resolver seeds
+    only the first (the shim assigns one array_field per DB) and WARNS so a
+    multi-array DB is not silently half-seeded."""
+    import logging
+
+    root = tmp_path / "proj"
+    G_SECOND_PREFAB = _g("second_prefab")
+    # A DB C# that drains BOTH fields as objects.
+    db_cs_two = """\
+        public class ConsumableDatabase : ScriptableObject
+        {
+            public Consumable[] consumbales;
+            public Consumable[] secondary;
+            public void Load()
+            {
+                for (int i = 0; i < consumbales.Length; ++i)
+                    _dict.Add(consumbales[i].GetConsumableType(), consumbales[i]);
+                for (int j = 0; j < secondary.Length; ++j)
+                    secondary[j].Activate();
+            }
+        }
+    """
+    _cs(root, "Scripts/ConsumableDatabase.cs", G_DB_CS, db_cs_two)
+    _cs(root, "Scripts/Consumable.cs", G_BASE_CS, _BASE_CS)
+    _cs(root, "Scripts/Types/CoinMagnet.cs", G_COINMAGNET_CS, _COINMAGNET_CS)
+    _cs(root, "Scripts/Types/ExtraLife.cs", G_EXTRALIFE_CS, _EXTRALIFE_CS)
+    _prefab_with_component(
+        root, "Prefabs/CoinMagnet.prefab", G_COINMAGNET_PREFAB, FID_COINMAGNET,
+        G_COINMAGNET_CS, "duration: 15\n",
+    )
+    _prefab_with_component(
+        root, "Prefabs/ExtraLife.prefab", G_EXTRALIFE_PREFAB, FID_EXTRALIFE,
+        G_EXTRALIFE_CS, "duration: 1\n",
+    )
+    # Build an asset with TWO component-ref array fields.
+    p = root / "Assets" / "Prefabs" / "Consumables.asset"
+    body_yaml = (
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+        "--- !u!114 &11400000\nMonoBehaviour:\n"
+        "  m_ObjectHideFlags: 0\n"
+        f"  m_Script: {{fileID: 11500000, guid: {G_DB_CS}, type: 3}}\n"
+        "  m_Name: Consumables\n"
+        f"  consumbales:\n  - {{fileID: {FID_COINMAGNET}, guid: {G_COINMAGNET_PREFAB}, type: 2}}\n"
+        f"  secondary:\n  - {{fileID: {FID_EXTRALIFE}, guid: {G_EXTRALIFE_PREFAB}, type: 2}}\n"
+    )
+    _write(p, body_yaml)
+    _write_meta(p, G_ASSET)
+
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    body = _asset_body(root, "Prefabs/Consumables.asset")
+    with caplog.at_level(logging.WARNING, logger="converter.consumable_db_seed"):
+        seed = resolve_db_seed(
+            db_module_path="ServerStorage.ConsumableDatabase",
+            db_cs_source=db_cs_two,
+            asset_body=body,
+            guid_index=guid_index,
+            base_by_class=base_by_class,
+        )
+    assert seed is not None
+    # Seeds only the FIRST passing array (dict order = source order).
+    assert seed["array_field"] == "consumbales"
+    assert any(
+        "passed both gates" in r.getMessage() for r in caplog.records
+    ), "expected a >1-candidate WARN"
+
+
 # --------------------------------------------------------------------------- #
 # Unresolvable element is DROPPED, not stringified
 # --------------------------------------------------------------------------- #

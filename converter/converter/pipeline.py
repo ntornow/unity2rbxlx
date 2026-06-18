@@ -7407,6 +7407,7 @@ script.Disabled = true
         """
         from converter.consumable_db_seed import (
             ConsumableSeed,
+            _resolve_class_stem,
             build_base_by_class,
             resolve_db_seed,
         )
@@ -7436,13 +7437,28 @@ script.Disabled = true
             asset_body = self._asset_monobehaviour_body(asset_path)
             if asset_body is None:
                 continue
-            # The owning DB CLASS is the .asset's backing m_Script class; its
-            # module is the emitted SO module, named by the converted asset.
+            # The emitted SO MODULE is named by the asset's ``m_Name``
+            # (``asset_name``); the DB CLASS that DRAINS the array is the
+            # ``.asset``'s backing ``m_Script`` class — which can differ from
+            # ``m_Name`` (e.g. ``Consumables.asset`` backed by class
+            # ``ConsumableDatabase``). Look up the C# source by the CLASS stem,
+            # NOT the asset name, or the drain-pattern gate reads no source and
+            # the seed is silently dead. Fall back to the asset name only when
+            # the class stem is unresolvable (the legacy SO-with-no-script case).
             db_name = converted.asset_name
             db_module_path = self._module_plan_path(db_name)
             if db_module_path is None or db_module_path in seeded_db_paths:
                 continue
-            db_cs_source = self._find_cs_source_for_module(db_name)
+            m_script = asset_body.get("m_Script")
+            script_guid = (
+                m_script.get("guid") if isinstance(m_script, dict) else None
+            )
+            db_class_stem = (
+                _resolve_class_stem(script_guid, guid_index)
+                if isinstance(script_guid, str)
+                else None
+            ) or db_name
+            db_cs_source = self._find_cs_source_for_module(db_class_stem)
             if db_cs_source is None:
                 continue
             seed = resolve_db_seed(

@@ -183,6 +183,26 @@ def common_monobehaviour_base(
     chain that appears on every other element's chain — that is itself a
     component (derives from MonoBehaviour). A bare ``MonoBehaviour`` shared root
     is rejected: it proves "all components" but not "one coherent family".
+
+    KNOWN LIMITATION (finding #4 — deliberately conservative, project-local).
+    Ancestor chains contain ONLY project-local classes: an external/package base
+    (anything without a project ``.cs``, including the Unity ``MonoBehaviour``
+    base itself) is never in ``base_by_class`` and so never appears in a chain.
+    Consequence: a family whose ONLY shared ancestor is an EXTERNAL base (e.g.
+    every element derives from a package ``PackageConsumable : MonoBehaviour``
+    that ships compiled, with no project ``.cs``) shares no project-local node →
+    this returns ``None`` (ABSTAIN). We do NOT widen to "share an ancestor that
+    transitively derives from MonoBehaviour where the topmost shared node may be
+    the Unity base," because the topmost shared ancestor of ANY two unrelated
+    MonoBehaviour components is ``MonoBehaviour`` — widening to accept a
+    Unity-base shared root would accept arbitrary unrelated component arrays
+    (the sprite/unrelated-array hole this gate exists to close); the bare-
+    ``MonoBehaviour`` rejection is load-bearing. Abstaining on the external-base
+    family is SAFE: gate (5) plus the per-element DROP invariant mean an abstain
+    seeds nothing and stringifies nothing — it merely leaves that exotic family's
+    pre-existing behavior unchanged, never introducing a wrong rewrite. (Trash-
+    Dash's ``Consumable`` is a project-local ``.cs``, so this is not a live
+    blocker; it bounds generality to project-local families.)
     """
     if not element_classes:
         return None
@@ -211,22 +231,63 @@ def common_monobehaviour_base(
     return None
 
 
+def _element_exprs(src: str, array_field: str) -> list[str]:
+    """Collect the source EXPRESSIONS that name an element of ``array_field``.
+
+    An element is named directly (``field[i]``), via a foreach loop variable
+    (``foreach (var c in field)`` → ``c``), or via a local alias
+    (``var c = field[i]`` → ``c``). The returned list contains the literal
+    expressions to look for object-usage / prefab-usage on (the indexing
+    expression itself, plus every bound alias identifier).
+    """
+    import re
+
+    fld = re.escape(array_field)
+    exprs: list[str] = []
+
+    # Direct indexed element: keep the bracket-indexed form as a usable expr.
+    for m in re.finditer(rf"\b{fld}\s*\[[^\]]*\]", src):
+        exprs.append(m.group(0))
+
+    # foreach (<type> <ident> in <field>) -> the loop var binds an element.
+    for m in re.finditer(
+        rf"foreach\s*\(\s*[\w<>.\[\]?]+\s+(?P<var>[A-Za-z_]\w*)\s+in\s+{fld}\b",
+        src,
+    ):
+        exprs.append(m.group("var"))
+
+    # Local alias: ``<type> c = <field>[i];`` / ``var c = <field>[i];`` binds an
+    # element to a local. (``var c = field;`` aliases the WHOLE array, not an
+    # element, so require the index.)
+    for m in re.finditer(
+        rf"\b[\w<>.\[\]?]+\s+(?P<var>[A-Za-z_]\w*)\s*=\s*{fld}\s*\[",
+        src,
+    ):
+        exprs.append(m.group("var"))
+
+    return exprs
+
+
 def db_drains_field_as_objects(db_cs_source: str, array_field: str) -> bool:
     """The gate (5) check: does the DB's C# DRAIN ``array_field`` treating its
-    elements as component OBJECTS (a method/member invoked on an element), as
-    opposed to passing elements to a prefab/`Instantiate` path?
+    elements as component OBJECTS (a method CALLED on an element), as opposed to
+    passing elements (or an element member) to a prefab/`Instantiate` path?
 
     Structural, keyed on the USAGE SHAPE — never a per-game method name:
-      - POSITIVE: a member access on an indexed/iterated element of the field,
-        e.g. ``consumbales[i].GetConsumableType()`` / ``foreach(var c in
-        consumbales) c.Foo`` — the element is dereferenced as an object.
-      - NEGATIVE: the field's elements are handed to ``Instantiate(...)`` (a
-        prefab-id consumer), which means the array holds prefab references, not
-        component prototypes.
+      - POSITIVE evidence (required): a METHOD CALL on an element — ``elem.M(…)``
+        where ``elem`` is an indexed element (``field[i].M()``), a foreach loop
+        var (``foreach (var c in field) … c.M()``), or a local alias
+        (``var c = field[i]; c.M()``). A bare member ACCESS that is not called is
+        NOT object usage — a property/field read whose value is then handed to a
+        prefab path is prefab usage.
+      - NEGATIVE (abstain): an element — or an element MEMBER — is passed to
+        ``Instantiate(…)`` (``Instantiate(field[i])`` / ``Instantiate(c)`` /
+        ``Instantiate(c.gameObject)`` / ``Instantiate(field[i].prefab)``). The
+        array then holds prefab references, not component prototypes.
 
-    Comments/strings are stripped first so prose mentioning the field name does
-    not match. Returns ``True`` only on positive object-usage evidence with no
-    Instantiate consumption of the field.
+    Returns ``True`` only on positive method-call evidence AND no Instantiate
+    consumption of any element (or element member). Comments/strings are stripped
+    first so prose mentioning the field name does not match.
     """
     from unity.script_analyzer import _strip_comments_and_strings
 
@@ -236,28 +297,24 @@ def db_drains_field_as_objects(db_cs_source: str, array_field: str) -> bool:
 
     import re
 
-    fld = re.escape(array_field)
-
-    # NEGATIVE: an element of the field is passed to Instantiate(...) — a
-    # prefab-id consumer, not object usage. e.g. ``Instantiate(consumbales[i])``
-    # or ``Instantiate(c)`` is harder to bind to the field, so we conservatively
-    # reject only a DIRECT ``Instantiate(<field>...`` consumption.
-    if re.search(rf"\bInstantiate\s*\(\s*{fld}\b", src):
+    exprs = _element_exprs(src, array_field)
+    if not exprs:
         return False
 
-    # POSITIVE (indexed): ``<field>[<expr>].<Member>`` — an indexed element is
-    # dereferenced as an object.
-    if re.search(rf"\b{fld}\s*\[[^\]]*\]\s*\.\s*[A-Za-z_]\w*", src):
-        return True
+    # NEGATIVE first: any element (or an element MEMBER) passed to Instantiate(…)
+    # is prefab usage -> abstain. Matches ``Instantiate(<elem>`` and
+    # ``Instantiate(<elem>.<member>`` for every bound element expression.
+    for expr in exprs:
+        e = re.escape(expr)
+        if re.search(rf"\bInstantiate\s*\(\s*{e}\s*(?:\.\s*\w+\s*)*[,)]", src):
+            return False
 
-    # POSITIVE (foreach): ``foreach (<type> <ident> in <field>) ... <ident>.<Member>``
-    # — bind the loop variable, then look for a member access on it.
-    for m in re.finditer(
-        rf"foreach\s*\(\s*[\w<>.\[\]]+\s+(?P<var>[A-Za-z_]\w*)\s+in\s+{fld}\b",
-        src,
-    ):
-        var = re.escape(m.group("var"))
-        if re.search(rf"\b{var}\s*\.\s*[A-Za-z_]\w*", src[m.end():]):
+    # POSITIVE: a METHOD CALL on an element — ``<elem>.<Method>(`` (a member
+    # access immediately followed by a call). A bare ``<elem>.<member>`` that is
+    # never called is NOT counted (it may be a prefab-feeding member read).
+    for expr in exprs:
+        e = re.escape(expr)
+        if re.search(rf"{e}\s*\.\s*[A-Za-z_]\w*\s*\(", src):
             return True
 
     return False
@@ -318,6 +375,7 @@ def resolve_db_seed(
     if not candidates:
         return None
 
+    passing: list[ConsumableSeed] = []
     for array_field, refs in candidates.items():
         # Gate (5): the DB must DRAIN this field as component objects. Cheap
         # structural check first (no prefab IO) — abstain if it's a prefab-id
@@ -397,13 +455,25 @@ def resolve_db_seed(
             )
             continue
 
-        return ConsumableSeed(
+        passing.append(ConsumableSeed(
             db_module_path=db_module_path,
             array_field=array_field,
             elements=resolved_elements,
-        )
+        ))
 
-    return None
+    if not passing:
+        return None
+    if len(passing) > 1:
+        # >1 candidate array on ONE database passes both gates. We seed only the
+        # first (the shim assigns one array_field per DB); WARN so a multi-array
+        # DB is not silently half-seeded (finding #5).
+        logger.warning(
+            "[consumable_seed] %s: %d candidate arrays passed both gates %s; "
+            "seeding only the first (%s)",
+            db_module_path, len(passing),
+            [s["array_field"] for s in passing], passing[0]["array_field"],
+        )
+    return passing[0]
 
 
 def _component_fields_literal(
