@@ -38,6 +38,10 @@ from converter.child_ref_resolver import (
     ChildRefScript,
     prerewrite_child_index,
 )
+from converter.send_message_resolver import (
+    SendMessageDispatchFact,
+    SendMessageMap,
+)
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +159,7 @@ def transpile_scripts(
     component_class_paths: frozenset[Path] | None = None,
     player_controller_paths: frozenset[Path] | None = None,
     child_ref_map: ChildRefMap | None = None,
+    send_message_map: SendMessageMap | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -206,6 +211,16 @@ def transpile_scripts(
             tally is stamped onto each produced ``RbxScript.child_ref_resolution``.
             ``None`` (default) for legacy callers / direct unit tests — no
             pre-rewrite, no stamp.
+        send_message_map: Under ``runtime_mode="generic"`` the per-script
+            ``SendMessageDispatchFact`` map built by
+            ``send_message_resolver.build_send_message_map``. Each script's
+            DIRECT ``recv.SendMessage("M", ...)`` / ``BroadcastMessage`` facts
+            are threaded into the per-module reprompt loop's contract verifier
+            (rule ``sm``), which asserts the produced Luau emits a matching
+            ``self.host:sendMessage`` / ``broadcastMessage`` for each fact and
+            reprompts — then fails closed — on a dropped dispatch. Plumbed on
+            the SAME canonical-key route as ``child_ref_map``. ``None`` (default)
+            for legacy callers / direct unit tests — no ``sm`` check runs.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
@@ -257,6 +272,10 @@ def transpile_scripts(
     # Per-script child-ref resolution entry (generic-only), keyed on str(info.path),
     # carried to the TranspiledScript stamp below.
     child_ref_by_path: dict[str, ChildRefScript] = {}
+    # Per-script SendMessage/BroadcastMessage dispatch facts (generic-only), keyed
+    # on str(info.path), threaded into the per-module reprompt loop's verifier
+    # below on the SAME canonical-key route as ``child_ref_by_path``.
+    send_message_by_path: dict[str, tuple[SendMessageDispatchFact, ...]] = {}
     for info in script_infos:
         script_path = info.path
         try:
@@ -265,6 +284,22 @@ def transpile_scripts(
             log.warning("Could not read script %s: %s", script_path, exc)
             result.total_failed += 1
             continue
+
+        # Generic-mode SendMessage facts: associate this script's dispatch
+        # obligations (slice 1.2) by str(path), looked up canonical-first with a
+        # raw fallback (mirrors the child-ref key resolution). Reads the map only;
+        # no source mutation (SendMessage calls aren't pre-rewritten).
+        if runtime_mode == "generic" and send_message_map:
+            try:
+                _sm_canon_key = str(script_path.resolve())
+            except OSError:
+                _sm_canon_key = str(script_path)
+            _sm_entry = (
+                send_message_map.get(_sm_canon_key)
+                or send_message_map.get(str(script_path))
+            )
+            if _sm_entry:
+                send_message_by_path[str(script_path)] = _sm_entry
 
         # Generic-mode child-ref PRE-REWRITE: resolve transform-rooted
         # GetChild(n) sites to named lookups in the C# BEFORE it enters the cache
@@ -467,6 +502,14 @@ def transpile_scripts(
             player_directive = _PLAYER_CONTROLLER_DIRECTIVE if is_player else ""
             context_parts = [project_context, scoped, field_ctx, player_directive]
             context = "\n\n".join(p for p in context_parts if p)
+            # Per-script SendMessage dispatch facts (generic-only). Threaded into
+            # the reprompt loop's verifier (rule ``sm``) on the SAME route
+            # ``is_player`` takes. Empty tuple under legacy / when no facts.
+            sm_facts = (
+                send_message_by_path.get(str(info.path), ())
+                if effective_runtime_mode == "generic"
+                else ()
+            )
             try:
                 if backend == "claude_cli":
                     luau, confidence, warnings = _claude_cli_transpile(
@@ -476,6 +519,7 @@ def transpile_scripts(
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
                         is_player_controller=is_player,
+                        send_message_facts=sm_facts,
                     )
                 elif backend == "anthropic_api" and api_key:
                     luau, confidence, warnings = _ai_transpile(
@@ -485,6 +529,7 @@ def transpile_scripts(
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
                         is_player_controller=is_player,
+                        send_message_facts=sm_facts,
                     )
                 else:
                     return stem, None
@@ -1553,6 +1598,15 @@ ALWAYS put a `-- OnTrigger<Phase>(other)` / `-- OnCollision<Phase>(...)` origin 
 - `GameObject.Find("Name")` → `self.host.findGameObject("Name")`.
 - `GameObject.FindGameObjectsWithTag("Tag")` → `self.host.findGameObjectsWithTag("Tag")`.
 
+### SendMessage / BroadcastMessage (host dispatch — NEVER collapse to :SetAttribute)
+A Unity `recv.SendMessage("M", a)` invokes method `M` on the component(s) of `recv`'s GameObject — it is a real method CALL with real gameplay effect, NOT a flag write. Emit the host primitive that resolves `recv` at runtime and calls the method:
+- `recv.SendMessage("M", a)` → `self.host:sendMessage(recv, "M", a)` (preserve the receiver expression `recv` as the FIRST argument, the method name string SECOND, then the gameplay args).
+- `recv.BroadcastMessage("M", a)` → `self.host:broadcastMessage(recv, "M", a)` (also descends `recv`'s child GameObjects).
+- A bare implicit-this `SendMessage("M")` (no receiver) → `self.host:sendMessage(self.gameObject, "M")`.
+- STRIP any trailing `SendMessageOptions.*` token (e.g. `SendMessageOptions.DontRequireReceiver`) — it is NOT a gameplay argument; never forward it. So `recv.SendMessage("TakeDamage", SendMessageOptions.DontRequireReceiver)` → `self.host:sendMessage(recv, "TakeDamage")` (zero gameplay args).
+- NEVER lower a `SendMessage` to a `:SetAttribute(...)` flag write — that DROPS the dispatch and silently breaks gameplay (e.g. a pickup that flags `hasRifle=true` but never runs `GetItem`/`GetRifle`, so the weapon never mounts). The attribute mirror is an ADDITION made INSIDE the target method (the `Player:GetItem`-style mutator — see "Cross-script shared state" above), never a REPLACEMENT for the dispatch at the call site.
+- CARVE-OUT (do NOT use `sendMessage` here): the players-in-a-radius OverlapSphere loop (`foreach (col in Physics.OverlapSphere(p, r)) if (col.tag=="Player") col.SendMessage("TakeDamage", dmg)`) stays the `self.host.playersInRadius(...)` form from the "Players in a radius" rule above — that is authoritative for the radius/multi-player case. `self.host:sendMessage` is ONLY for a DIRECT single-receiver dispatch (`other.SendMessage(...)`, `doors[n].SendMessage(...)`, a `Find...().SendMessage(...)`, a bare `SendMessage(...)`).
+
 ### Transform
 - `transform.position` → `self.gameObject:GetPivot().Position` (read) / `self.gameObject:PivotTo(CFrame.new(p))` (write).
 - `transform.rotation` → `self.gameObject:GetPivot()` (CFrame holds rotation) / `self.gameObject:PivotTo(self.gameObject:GetPivot() * rot)` (compose).
@@ -1762,6 +1816,7 @@ def _format_contract_survivor_warning(violation) -> str:
 def _refresh_contract_warnings(
     luau_source: str, cached_warnings: list[str],
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> list[str]:
     """Replace cached contract-verifier warnings with a fresh re-verify.
 
@@ -1801,6 +1856,7 @@ def _refresh_contract_warnings(
     ]
     result = verify_module(
         luau_source, is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     if result.ok:
         return non_contract
@@ -1815,6 +1871,7 @@ def _verify_and_reprompt(
     runtime_mode: RuntimeMode,
     reprompt_call,
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> tuple[str, list[str]]:
     """Run the contract verifier; on violations call ``reprompt_call`` ONCE.
 
@@ -1855,6 +1912,7 @@ def _verify_and_reprompt(
 
     initial = verify_module(
         luau_source, is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     if initial.ok:
         return luau_source, []
@@ -1893,6 +1951,7 @@ def _verify_and_reprompt(
 
     second = verify_module(
         new_luau, is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     if second.ok:
         # Reprompt fixed everything. Pre-warnings are still surfaced so
@@ -2014,6 +2073,7 @@ def _ai_transpile(
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -2064,6 +2124,7 @@ def _ai_transpile(
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
                     is_player_controller=is_player_controller,
+                    send_message_facts=send_message_facts,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         elif cached_proven_invalids and not cached_errors:
@@ -2154,6 +2215,7 @@ def _ai_transpile(
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _api_reprompt,
         is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     warnings.extend(contract_warnings)
 
@@ -2179,6 +2241,7 @@ def _ai_transpile(
         warnings = _refresh_contract_warnings(
             luau_source, warnings,
             is_player_controller=is_player_controller,
+            send_message_facts=send_message_facts,
         )
 
     # AI transpilation gets a baseline confidence based on output quality.
@@ -2253,6 +2316,7 @@ def _claude_cli_transpile(
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
@@ -2292,6 +2356,7 @@ def _claude_cli_transpile(
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
                     is_player_controller=is_player_controller,
+                    send_message_facts=send_message_facts,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         elif cached_proven_invalids and not cached_errors:
@@ -2372,6 +2437,7 @@ def _claude_cli_transpile(
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _cli_reprompt,
         is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     warnings.extend(contract_warnings)
 
@@ -2393,6 +2459,7 @@ def _claude_cli_transpile(
         warnings = _refresh_contract_warnings(
             luau_source, warnings,
             is_player_controller=is_player_controller,
+            send_message_facts=send_message_facts,
         )
 
     # Score confidence.

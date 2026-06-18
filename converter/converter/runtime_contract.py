@@ -17,7 +17,14 @@ clean ``legacy`` per the design doc's ``auto`` semantics (wired in PR3b).
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
+
+from converter.send_message_resolver import (
+    BROADCAST,
+    SEND,
+    SendMessageDispatchFact,
+)
 
 __all__ = [
     "LIFECYCLE_METHODS",
@@ -83,7 +90,10 @@ class VerificationResult:
 # ---------------------------------------------------------------------------
 
 def verify_module(
-    source: str, *, is_player_controller: bool = False,
+    source: str,
+    *,
+    is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> VerificationResult:
     """Verify a Luau ModuleScript against the generic-runtime contract.
 
@@ -98,6 +108,18 @@ def verify_module(
             warns + fails OPEN (the caller tags it ``contract-verifier-player``),
             never fail-closed. Default ``False`` preserves every existing
             (non-player) call site -- only the 8 contract rules run.
+        send_message_facts: The per-module ``SendMessageDispatchFact`` tuple
+            this module's C# source produced (slice 1.2's
+            ``build_send_message_map`` value for this script). When non-empty,
+            rule ``sm`` runs: the emitted Luau must contain at least as many
+            ``self.host:sendMessage(...)`` / ``:broadcastMessage(...)`` calls
+            as the facts require, counted per ``(kind, method, gameplay_arity)``
+            multiset. A shortfall is a LOAD-BEARING contract violation (it
+            keeps the fail-closed ``contract-verifier `` tag, like rules
+            (a)-(h)), so a dropped dispatch drives a reprompt and -- if still
+            absent after the bound -- fails the build closed rather than
+            silently shipping a flag-only collapse. Default ``()`` preserves
+            every existing call site (no ``sm`` check runs).
 
     Returns:
         ``VerificationResult`` with ``ok=True`` and no violations when the
@@ -129,6 +151,14 @@ def verify_module(
     if is_player_controller:
         violations.extend(_check_player_camera_write(stripped, source))
         violations.extend(_check_player_humanoid_move(stripped, source))
+    # Phase 1 (SendMessage host primitive): the per-module dispatch facts must each
+    # have a matching ``host:sendMessage`` / ``broadcastMessage`` call in the Luau.
+    # LOAD-BEARING (fail-closed, like rules (a)-(h)): a dropped dispatch silently
+    # collapses gameplay. Only runs when facts were threaded in.
+    if send_message_facts:
+        violations.extend(
+            _check_send_message_dispatch(send_message_facts, stripped, source)
+        )
 
     # Source order for reprompt readability. Tie-break on rule letter so
     # output is deterministic across runs.
@@ -1242,6 +1272,212 @@ def _check_player_humanoid_move(stripped: str, source: str) -> list[Violation]:
                 "Direct ``Humanoid:Move(`` call -- the host owns locomotion "
                 "via ``self.host.player``; do not call ``Humanoid:Move`` in "
                 "the player controller."
+            ),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rule ``sm`` -- SendMessage / BroadcastMessage host-dispatch coverage.
+# LOAD-BEARING (fail-closed, like rules (a)-(h)).
+#
+# Slice 1.2 parses each C# script's DIRECT ``recv.SendMessage("M", ...)`` /
+# ``BroadcastMessage`` into ``SendMessageDispatchFact`` records (the OverlapSphere
+# players-in-radius shape is already excluded there -- ``playersInRadius`` owns
+# that, #201). This check asserts the emitted Luau actually dispatched each one:
+# the per-module multiset keyed by ``(kind, method, gameplay_arity)`` (arity =
+# ``len(fact.gameplay_args)``, slice 1.2's shared normalization -- never
+# re-derived here) must be COVERED by matching ``self.host:sendMessage(...)`` /
+# ``:broadcastMessage(...)`` calls in the output.
+#
+# The receiver operand is BEST-EFFORT (the design's "Match key" minor): there is
+# no C#->Luau symbol map, so the AI may alias the receiver. The check therefore
+# does NOT strict-compare the receiver token; it only rejects a bare ``self:...``
+# self-dispatch (``self:sendMessage`` with no host hop), which signals the AI
+# dropped the receiver argument entirely. Method + kind + gameplay arity ARE
+# strict-matched (a collapsed/wrong-arity dispatch must not satisfy a fact).
+# ---------------------------------------------------------------------------
+
+# Match a host dispatch call's METHOD-NAME token: ``:sendMessage`` /
+# ``:broadcastMessage`` followed by ``(``. Whitespace-tolerant around the ``:``
+# and before ``(``. Captures the call name so kind is derived from it.
+_RE_HOST_DISPATCH = re.compile(
+    r"(?P<recv>[\w.]*)\s*:\s*(?P<call>sendMessage|broadcastMessage)\s*\(",
+)
+
+_HOST_DISPATCH_KIND: dict[str, str] = {
+    "sendMessage": SEND,
+    "broadcastMessage": BROADCAST,
+}
+
+
+def _luau_string_literal_value(arg: str) -> str | None:
+    """If ``arg`` is EXACTLY a single Luau string literal (short ``"..."`` /
+    ``'...'``), return its unquoted value; else ``None``. Long-string ``[[...]]``
+    method names are not used in practice (and are blanked by the stripper), so
+    they are treated as non-literal here."""
+    arg = arg.strip()
+    if len(arg) < 2 or arg[0] not in ('"', "'") or arg[-1] != arg[0]:
+        return None
+    body = arg[1:-1]
+    quote = arg[0]
+    if quote in body and "\\" not in body:
+        return None  # an inner unescaped quote means this isn't one literal
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    simple = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
+    while i < n:
+        ch = body[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(simple.get(body[i + 1], body[i + 1]))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_luau_args(raw_args: str) -> list[str]:
+    """Split a Luau argument-list string on TOP-LEVEL commas, returning each
+    argument trimmed. Respects ``()``/``[]``/``{}`` nesting and skips commas
+    inside short string literals. An all-whitespace / empty input yields ``[]``."""
+    if raw_args.strip() == "":
+        return []
+    parts: list[str] = []
+    depth = 0
+    i = 0
+    n = len(raw_args)
+    start = 0
+    while i < n:
+        ch = raw_args[i]
+        if ch in ('"', "'"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                if raw_args[j] == "\\":
+                    j += 2
+                    continue
+                if raw_args[j] == quote:
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(raw_args[start:i].strip())
+            start = i + 1
+        i += 1
+    parts.append(raw_args[start:].strip())
+    return [p for p in parts if p != ""]
+
+
+def _luau_matching_paren(source: str, open_idx: int) -> int | None:
+    """Index of the ``)`` matching the ``(`` at ``open_idx``, skipping short
+    string literals and nested parens. ``None`` if unbalanced."""
+    depth = 0
+    i = open_idx
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in ('"', "'"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == quote:
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _check_send_message_dispatch(
+    facts: tuple[SendMessageDispatchFact, ...],
+    stripped: str,
+    source: str,
+) -> list[Violation]:
+    """Rule ``sm``: every dispatch fact must be covered by a matching emitted
+    ``host:sendMessage`` / ``broadcastMessage`` call.
+
+    ``facts`` is the module's slice-1.2 fact tuple; ``stripped`` is the
+    string/comment-blanked source (used to LOCATE call tokens without matching
+    inside a comment/string); ``source`` is the ORIGINAL (used to read the method
+    string literal + count line numbers). The emitted multiset is keyed
+    ``(kind, method, gameplay_arity)`` and must cover the required multiset.
+    """
+    required: Counter[tuple[str, str, int]] = Counter(
+        (f.kind, f.method, len(f.gameplay_args)) for f in facts
+    )
+
+    emitted: Counter[tuple[str, str, int]] = Counter()
+    # A bare self-dispatch (``self:sendMessage(...)`` with no host hop) is a
+    # dropped-receiver signal -- track separately so we can phrase the message.
+    bare_self_seen = False
+    for m in _RE_HOST_DISPATCH.finditer(stripped):
+        # Locate the same call in the ORIGINAL source (the stripper preserves
+        # offsets one-to-one, so the match span is valid in ``source`` too).
+        open_idx = m.end() - 1  # index of the ``(``
+        close_idx = _luau_matching_paren(source, open_idx)
+        if close_idx is None:
+            continue  # unbalanced -> malformed call, skip
+        recv = m.group("recv")
+        # Best-effort receiver guard: a bare ``self:sendMessage`` dropped the
+        # receiver argument. The canonical shape is ``self.host:sendMessage`` or
+        # an aliased ``host:`` -- both have a receiver as the FIRST arg.
+        if recv == "self":
+            bare_self_seen = True
+            continue
+        kind = _HOST_DISPATCH_KIND[m.group("call")]
+        args = _split_luau_args(source[open_idx + 1 : close_idx])
+        if len(args) < 2:
+            continue  # missing receiver and/or method name -> not a keyable call
+        method = _luau_string_literal_value(args[1])
+        if method is None:
+            continue  # dynamic method name -> cannot key it to a fact
+        gameplay_arity = len(args) - 2  # drop receiver + method-name args
+        emitted[(kind, method, gameplay_arity)] += 1
+
+    out: list[Violation] = []
+    line = source.count("\n") + 1  # whole-module obligation -> last line
+    for key, need in required.items():
+        kind, method, arity = key
+        have = emitted.get(key, 0)
+        if have >= need:
+            continue
+        call = "broadcastMessage" if kind == BROADCAST else "sendMessage"
+        cs_call = "BroadcastMessage" if kind == BROADCAST else "SendMessage"
+        hint = ""
+        if bare_self_seen:
+            hint = (
+                " (a bare ``self:sendMessage(...)`` does NOT count -- it dropped "
+                "the receiver argument; use ``self.host:sendMessage(recv, ...)``)"
+            )
+        out.append(Violation(
+            rule="sm",
+            line=line,
+            message=(
+                f"Unity dispatch of ``{method}`` (gameplay arity {arity}) is not "
+                f"emitted: the C# source dispatches it {need}x but the Luau has "
+                f"only {have} matching ``self.host:{call}(recv, \"{method}\", "
+                f"<{arity} args>)`` call(s){hint}. Emit "
+                f"``self.host:{call}(recv, \"{method}\", ...)`` for each Unity "
+                f"``recv.{cs_call}(\"{method}\", ...)``; never collapse it to a "
+                f"flag-only :SetAttribute write."
             ),
         ))
     return out

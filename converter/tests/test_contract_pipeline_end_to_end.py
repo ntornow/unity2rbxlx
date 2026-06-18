@@ -144,6 +144,7 @@ def _fake_ai_transpile_factory(
         project_context: str = "",
         runtime_mode: str = "legacy",
         is_player_controller: bool = False,
+        send_message_facts: tuple = (),
     ) -> tuple[str, float, list[str]]:
         luau = by_class.get(class_name, f"-- {class_name}: missing fixture\nreturn {{}}\n")
         return luau, 1.0, []

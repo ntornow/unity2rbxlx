@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from converter.child_ref_resolver import build_child_ref_map
+from converter.send_message_resolver import build_send_message_map
 from converter.code_transpiler import (
     TranspilationResult,
     TranspiledScript,
@@ -459,6 +460,14 @@ def transpile_with_contract(
         guid_index=guid_index,
     )
 
+    # Single producer of the SendMessage/BroadcastMessage dispatch facts: parse
+    # each C# script's DIRECT ``recv.SendMessage("M", ...)`` / ``BroadcastMessage``
+    # into per-module obligations (the OverlapSphere players-in-radius shape is
+    # excluded — ``playersInRadius`` owns it). Threaded into the per-module
+    # reprompt loop's verifier (rule ``sm``) so a dropped dispatch reprompts and,
+    # if still absent, fails the build closed. Empty when no script dispatches.
+    send_message_map = build_send_message_map(script_infos)
+
     transpilation = transpile_scripts(
         unity_project_path=unity_project_path,
         script_infos=script_infos,
@@ -471,6 +480,7 @@ def transpile_with_contract(
         component_class_paths=component_class_paths,
         player_controller_paths=player_controller_paths,
         child_ref_map=child_ref_map,
+        send_message_map=send_message_map,
     )
 
     # Build the stem-keyed require graph from the planner's modules table.

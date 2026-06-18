@@ -394,11 +394,13 @@ class TestPostRepairContractRecompute:
         seen_sources: list[str] = []
         real_refresh = code_transpiler._refresh_contract_warnings
 
-        def _spy(luau_source, cached_warnings, is_player_controller=False):
+        def _spy(luau_source, cached_warnings, is_player_controller=False,
+                 send_message_facts=()):
             seen_sources.append(luau_source)
             return real_refresh(
                 luau_source, cached_warnings,
                 is_player_controller=is_player_controller,
+                send_message_facts=send_message_facts,
             )
 
         monkeypatch.setattr(code_transpiler, "_refresh_contract_warnings", _spy)
@@ -430,7 +432,9 @@ class TestPostRepairContractRecompute:
         seen: list[str] = []
         monkeypatch.setattr(
             code_transpiler, "_refresh_contract_warnings",
-            lambda src, w, is_player_controller=False: (seen.append(src) or w),
+            lambda src, w, is_player_controller=False, send_message_facts=(): (
+                seen.append(src) or w
+            ),
         )
 
         _ai_transpile(
