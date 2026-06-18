@@ -38,7 +38,7 @@ shape, not one brittle spelling.
 Pure: reads sources, returns values. No game-specific names. The C# is raw text
 (regex/scan, no Roslyn AST), so matching is code-position-aware
 (comments/strings/char-literals are skipped) via the shared ``_cs_pos_is_code``
-precedent from ``child_ref_resolver``.
+helper in ``cs_text_scan``.
 """
 
 from __future__ import annotations
@@ -47,15 +47,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from converter.cs_text_scan import _canon_key, _cs_pos_is_code
 from unity.script_analyzer import ScriptInfo
-
-# NOTE: ``_canon_key`` + ``_cs_pos_is_code`` are copied (verbatim in behavior)
-# from ``child_ref_resolver`` — the fact-producer precedent this module mirrors.
-# They are inlined here rather than imported because this slice's branch base
-# predates ``child_ref_resolver.py``; when the two land together, slice 1.3 can
-# collapse these to a shared import. The semantics are identical: a canonical
-# ``str(path.resolve())`` path key and a from-start scan that classifies whether
-# a char index is real C# code (not inside a string/comment/char-literal).
 
 # Dispatch kinds.
 SEND = "send"
@@ -108,86 +101,6 @@ _OPTIONS_RE = re.compile(r"^SendMessageOptions\s*\.\s*[A-Za-z_]\w*$")
 # ``Physics.OverlapSphere(`` initializer — the collection an excluded foreach
 # iterates over (directly or via <=1 local alias hop).
 _OVERLAP_SPHERE_RE = re.compile(r"\bPhysics\s*\.\s*OverlapSphere\s*\(")
-
-
-def _canon_key(path: Path) -> str:
-    """The canonical .cs path key: ``str(path.resolve())`` when resolvable, else
-    the raw string (a synthetic test path that doesn't exist on disk)."""
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
-
-
-def _cs_pos_is_code(source: str, pos: int) -> bool:
-    """True if char index ``pos`` is real C# code, not inside a string literal
-    or a comment. Scans from the START of the file (block comments and verbatim
-    strings can open on a prior line, so a per-line scan would miss them),
-    tracking: ``//`` line comments, ``/* */`` block comments, regular ``"..."``
-    strings (``\\`` escapes), verbatim ``@"..."`` strings (``""`` escapes a
-    quote, ``\\`` is literal), and ``'...'`` char literals."""
-    i = 0
-    n = len(source)
-    while i < pos:
-        ch = source[i]
-        # Line comment — skip to end of line.
-        if ch == "/" and i + 1 < n and source[i + 1] == "/":
-            nl = source.find("\n", i)
-            if nl == -1 or nl >= pos:
-                return False  # comment runs through pos
-            i = nl + 1
-            continue
-        # Block comment — skip to closing ``*/``.
-        if ch == "/" and i + 1 < n and source[i + 1] == "*":
-            end = source.find("*/", i + 2)
-            if end == -1 or end + 2 > pos:
-                return False  # block comment encloses pos
-            i = end + 2
-            continue
-        # Verbatim string ``@"..."`` — ``""`` escapes a quote, ``\`` is literal.
-        if ch == "@" and i + 1 < n and source[i + 1] == '"':
-            j = i + 2
-            while j < n:
-                if source[j] == '"':
-                    if j + 1 < n and source[j + 1] == '"':
-                        j += 2
-                        continue
-                    break
-                j += 1
-            if j >= pos:
-                return False
-            i = j + 1
-            continue
-        # Regular string ``"..."`` — ``\`` escapes.
-        if ch == '"':
-            j = i + 1
-            while j < n:
-                if source[j] == "\\":
-                    j += 2
-                    continue
-                if source[j] == '"':
-                    break
-                j += 1
-            if j >= pos:
-                return False
-            i = j + 1
-            continue
-        # Char literal ``'...'`` — ``\`` escapes.
-        if ch == "'":
-            j = i + 1
-            while j < n:
-                if source[j] == "\\":
-                    j += 2
-                    continue
-                if source[j] == "'":
-                    break
-                j += 1
-            if j >= pos:
-                return False
-            i = j + 1
-            continue
-        i += 1
-    return True
 
 
 def classify_dispatch(call_name: str, raw_args: str) -> tuple[str, str, tuple[str, ...]] | None:
