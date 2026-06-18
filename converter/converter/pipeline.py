@@ -7089,6 +7089,12 @@ script.Disabled = true
         # on the dict when generate_scene_runtime_plan_module runs. NOT persisted
         # through conversion_plan.json; recomputed every write_output (D17).
         self._build_theme_seed_plan(scene_runtime)
+        # Phase 1 (consumable prototype materialization): RECOMPUTE the
+        # consumable-db seed onto scene_runtime in THIS window — same property
+        # as the theme seed (after the SO map, before the plan module emits, so
+        # the allowlisted ``consumable_db_seeds`` key is on the dict). NOT
+        # transpile-gated; pop-first authoritative recompute (D17).
+        self._build_consumable_db_seeds(scene_runtime)
 
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
@@ -7380,6 +7386,105 @@ script.Disabled = true
                 "db seed(s) (%d SO module(s) total)",
                 len(seeds), sum(len(s["so_module_paths"]) for s in seeds),
             )
+
+    def _build_consumable_db_seeds(self, scene_runtime: dict[str, object]) -> None:
+        """RECOMPUTE ``scene_runtime["consumable_db_seeds"]`` — the per-DB seed
+        records the boot shim replays to MATERIALIZE a consumable-style SO's
+        array of in-prefab-component refs into component instances before its
+        consumer drains it (design-phase1 §1.A/§1.B).
+
+        Distinct from the addressable/theme seed: that path keys on a
+        ``LoadAssetsAsync<T>("<label>", …)`` LABEL load; THIS path keys on an
+        emitted SO module whose ``.asset`` carries a field that is a list of
+        in-prefab component object-refs sharing one MonoBehaviour-derived base
+        (§1.A.4) AND whose owning DB C# drains the field as objects (§1.A.5).
+
+        RECOMPUTED every ``write_output`` — NOT persisted, NOT transpile-gated.
+        Inputs rehydrated by ESSENTIAL phases on a no-retranspile resume (the
+        ``.asset``/``.prefab``/``.cs`` re-read off disk; the SO guid->module map
+        from ``scene_runtime``). Pop-first AUTHORITATIVE: clear any stale seed
+        BEFORE any abstain, so every abstain path leaves NO seed (D17).
+        """
+        from converter.consumable_db_seed import (
+            ConsumableSeed,
+            build_base_by_class,
+            resolve_db_seed,
+        )
+        from converter.scriptable_object_converter import convert_asset_file
+
+        scene_runtime.pop("consumable_db_seeds", None)
+        so_map_obj = scene_runtime.get("scriptable_objects")
+        if not isinstance(so_map_obj, dict) or not so_map_obj:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # The class->immediate-base map for the common-base gate (built once,
+        # reused across every DB candidate).
+        base_by_class = build_base_by_class(guid_index)
+
+        seeds: list[ConsumableSeed] = []
+        seeded_db_paths: set[str] = set()
+        for guid in sorted(g for g in so_map_obj if isinstance(g, str)):
+            asset_path = guid_index.resolve(guid)
+            if asset_path is None or asset_path.suffix != ".asset":
+                continue
+            converted = convert_asset_file(asset_path, guid_index)
+            if converted is None:
+                continue
+            asset_body = self._asset_monobehaviour_body(asset_path)
+            if asset_body is None:
+                continue
+            # The owning DB CLASS is the .asset's backing m_Script class; its
+            # module is the emitted SO module, named by the converted asset.
+            db_name = converted.asset_name
+            db_module_path = self._module_plan_path(db_name)
+            if db_module_path is None or db_module_path in seeded_db_paths:
+                continue
+            db_cs_source = self._find_cs_source_for_module(db_name)
+            if db_cs_source is None:
+                continue
+            seed = resolve_db_seed(
+                db_module_path=db_module_path,
+                db_cs_source=db_cs_source,
+                asset_body=asset_body,
+                guid_index=guid_index,
+                base_by_class=base_by_class,
+            )
+            if seed is None:
+                continue
+            if not seed["elements"]:
+                log.warning(
+                    "[consumable_seed] %s: all elements dropped; seeding EMPTY "
+                    "array (degraded-but-bootable)", db_module_path,
+                )
+            seeds.append(seed)
+            seeded_db_paths.add(db_module_path)
+
+        if seeds:
+            scene_runtime["consumable_db_seeds"] = seeds
+            log.info(
+                "[write_output] scene-runtime generic: built %d consumable db "
+                "seed(s) (%d element(s) total)",
+                len(seeds), sum(len(s["elements"]) for s in seeds),
+            )
+
+    def _asset_monobehaviour_body(
+        self, asset_path: Path,
+    ) -> dict[str, object] | None:
+        """Re-parse a ScriptableObject ``.asset`` off disk and return its
+        MonoBehaviour body dict (the same doc the SO converter reads), or
+        ``None``. Resume-safe (off-disk parse)."""
+        from unity.yaml_parser import doc_body, parse_documents
+        try:
+            raw = asset_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        for class_id, _fid, doc in parse_documents(raw):
+            if class_id == 114 and "MonoBehaviour" in doc:
+                return doc_body(doc)
+        return None
 
     def _module_plan_path(self, module_name: str) -> str | None:
         """The dotted DataModel path of a runtime-bearing module by name —

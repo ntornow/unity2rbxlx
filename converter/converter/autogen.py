@@ -658,6 +658,12 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # at boot. LOAD-BEARING — without the allowlist entry the recomputed key is
     # elided from the emitted plan and the shim sees ``{}`` (dead registry).
     "addressable_db_seeds",
+    # Phase 1 consumable prototype materialization: per-DB seed records the boot
+    # shim replays to materialize a consumable-style SO's array of in-prefab
+    # component refs into component instances. LOAD-BEARING — without the
+    # allowlist entry the recomputed key is elided from the emitted plan and the
+    # shim sees ``{}`` (the OnEnable crash this phase fixes persists).
+    "consumable_db_seeds",
 )
 
 
