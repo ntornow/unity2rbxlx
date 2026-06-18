@@ -304,6 +304,44 @@ def test_common_base_abstain_mixed_family(tmp_path):
     assert seed is None
 
 
+def test_common_base_abstain_unrelated_component_families(tmp_path):
+    """End-to-end: an array of two UNRELATED components that each derive DIRECTLY
+    from MonoBehaviour (no shared project-local base) contributes NO seed — the
+    bare-MonoBehaviour shared root is rejected at gate (4)."""
+    root = tmp_path / "proj"
+    G_ALPHA_CS = _g("alpha_cs")
+    G_BETA_CS = _g("beta_cs")
+    G_ALPHA_PREFAB = _g("alpha_prefab")
+    G_BETA_PREFAB = _g("beta_prefab")
+    _cs(root, "Scripts/ConsumableDatabase.cs", G_DB_CS, _DB_CS_DRAINS_OBJECTS)
+    # Two unrelated component classes, each : MonoBehaviour, no common subclass.
+    _cs(root, "Scripts/Alpha.cs", G_ALPHA_CS,
+        "public class Alpha : MonoBehaviour { public int GetConsumableType() { return 1; } }\n")
+    _cs(root, "Scripts/Beta.cs", G_BETA_CS,
+        "public class Beta : MonoBehaviour { public int GetConsumableType() { return 2; } }\n")
+    _prefab_with_component(
+        root, "Prefabs/Alpha.prefab", G_ALPHA_PREFAB, 444, G_ALPHA_CS, "x: 1\n",
+    )
+    _prefab_with_component(
+        root, "Prefabs/Beta.prefab", G_BETA_PREFAB, 555, G_BETA_CS, "y: 2\n",
+    )
+    _asset_with_array(
+        root, "Prefabs/Consumables.asset", G_ASSET, G_DB_CS,
+        [(444, G_ALPHA_PREFAB), (555, G_BETA_PREFAB)],
+    )
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    body = _asset_body(root, "Prefabs/Consumables.asset")
+    seed = resolve_db_seed(
+        db_module_path="ServerStorage.ConsumableDatabase",
+        db_cs_source=_DB_CS_DRAINS_OBJECTS,
+        asset_body=body,
+        guid_index=guid_index,
+        base_by_class=base_by_class,
+    )
+    assert seed is None
+
+
 def test_common_monobehaviour_base_unit():
     # Two siblings -> shared Consumable base.
     bbc = {"CoinMagnet": "Consumable", "ExtraLife": "Consumable",
@@ -313,6 +351,24 @@ def test_common_monobehaviour_base_unit():
     bbc2 = {"CoinMagnet": "Consumable", "Consumable": "MonoBehaviour",
             "PlainThing": ""}
     assert common_monobehaviour_base(["CoinMagnet", "PlainThing"], bbc2) is None
+
+
+def test_common_base_abstains_on_bare_monobehaviour_shared_root():
+    """Two UNRELATED component families whose ONLY shared ancestor is the bare
+    ``MonoBehaviour`` base -> ABSTAIN (None). The shared root proves "all are
+    components", not "one coherent family"; accepting it reopens the unrelated-
+    component-array hole gate (4) exists to close.
+
+    Pre-fix this returned ``"MonoBehaviour"``: ``_full_ancestor_chain`` appends
+    the truthy external base, so both chains end in ``MonoBehaviour``, the
+    intersection is ``{"MonoBehaviour"}``, and the OLD selection loop returned it
+    via ``cls in _COMPONENT_BASE_CLASSES``.
+    """
+    bbc = {"A": "MonoBehaviour", "B": "MonoBehaviour"}
+    assert common_monobehaviour_base(["A", "B"], bbc) is None
+    # NetworkBehaviour is rejected the same way.
+    bbc_net = {"A": "NetworkBehaviour", "B": "NetworkBehaviour"}
+    assert common_monobehaviour_base(["A", "B"], bbc_net) is None
 
 
 # --------------------------------------------------------------------------- #

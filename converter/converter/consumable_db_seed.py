@@ -132,8 +132,14 @@ def find_component_ref_arrays(
 def _full_ancestor_chain(
     class_name: str, base_by_class: dict[str, str],
 ) -> list[str]:
-    """The class's full project-local ancestor chain (the class itself, then each
-    base) up to the first unknown/external base or a cycle.
+    """The class's ancestor chain (the class itself, then each base) up to the
+    first unknown/external base or a cycle.
+
+    Note: a directly-extended component base IS included — ``base_by_class`` may
+    map a project class to the external ``MonoBehaviour``/``NetworkBehaviour``
+    base, and that truthy value is appended as the chain's tail (the walk only
+    stops at a falsy/missing base or a cycle). Callers that intersect chains and
+    must reject a bare-component-base shared root do so at SELECTION, not here.
 
     Mirrors the cycle-safe walk in ``scene_runtime_planner._resolves_to_component``
     but RETURNS the visited chain so callers can intersect chains across elements.
@@ -180,29 +186,34 @@ def common_monobehaviour_base(
     base equality, so a mix of direct subclasses and an intermediate
     ``RareConsumable : Consumable`` still resolves the common ``Consumable``) and
     choosing the NEAREST shared ancestor — the first class on the first element's
-    chain that appears on every other element's chain — that is itself a
-    component (derives from MonoBehaviour). A bare ``MonoBehaviour`` shared root
-    is rejected: it proves "all components" but not "one coherent family".
+    chain that appears on every other element's chain. A bare ``MonoBehaviour``
+    (or ``NetworkBehaviour``) shared root is REJECTED at selection: it proves
+    "all components" but not "one coherent family", so we ABSTAIN rather than
+    return a component base. The shared root must be a PROJECT-LOCAL class that
+    itself derives from a component base.
+
+    Note: the component bases DO appear in an element's chain when a class
+    extends one directly (``_full_ancestor_chain`` appends each truthy base, and
+    ``"X": "MonoBehaviour"`` puts ``MonoBehaviour`` at the chain tail). It is the
+    SELECTION loop — not the chain construction — that rejects a bare-base shared
+    root; the topmost shared ancestor of two unrelated MonoBehaviour components
+    IS ``MonoBehaviour``, and accepting it would reopen the unrelated-component-
+    array hole this gate exists to close. The bare-base rejection is load-bearing.
 
     KNOWN LIMITATION (finding #4 — deliberately conservative, project-local).
-    Ancestor chains contain ONLY project-local classes: an external/package base
-    (anything without a project ``.cs``, including the Unity ``MonoBehaviour``
-    base itself) is never in ``base_by_class`` and so never appears in a chain.
-    Consequence: a family whose ONLY shared ancestor is an EXTERNAL base (e.g.
-    every element derives from a package ``PackageConsumable : MonoBehaviour``
-    that ships compiled, with no project ``.cs``) shares no project-local node →
-    this returns ``None`` (ABSTAIN). We do NOT widen to "share an ancestor that
-    transitively derives from MonoBehaviour where the topmost shared node may be
-    the Unity base," because the topmost shared ancestor of ANY two unrelated
-    MonoBehaviour components is ``MonoBehaviour`` — widening to accept a
-    Unity-base shared root would accept arbitrary unrelated component arrays
-    (the sprite/unrelated-array hole this gate exists to close); the bare-
-    ``MonoBehaviour`` rejection is load-bearing. Abstaining on the external-base
-    family is SAFE: gate (5) plus the per-element DROP invariant mean an abstain
-    seeds nothing and stringifies nothing — it merely leaves that exotic family's
-    pre-existing behavior unchanged, never introducing a wrong rewrite. (Trash-
-    Dash's ``Consumable`` is a project-local ``.cs``, so this is not a live
-    blocker; it bounds generality to project-local families.)
+    Beyond the external component bases, ancestor chains contain only project-
+    local classes: a non-component external/package base (anything without a
+    project ``.cs``) is never in ``base_by_class`` and so never appears in a
+    chain. Consequence: a family whose ONLY shared PROJECT-LOCAL ancestor would
+    be such an external base (e.g. every element derives from a package
+    ``PackageConsumable : MonoBehaviour`` that ships compiled, with no project
+    ``.cs``) shares no project-local node → this returns ``None`` (ABSTAIN). We
+    do NOT widen to accept a Unity-base shared root, for the reason above.
+    Abstaining is SAFE: gate (5) plus the per-element DROP invariant mean an
+    abstain seeds nothing and stringifies nothing — it merely leaves that exotic
+    family's pre-existing behavior unchanged, never introducing a wrong rewrite.
+    (Trash-Dash's ``Consumable`` is a project-local ``.cs``, so this is not a
+    live blocker; it bounds generality to project-local families.)
     """
     if not element_classes:
         return None
@@ -214,20 +225,26 @@ def common_monobehaviour_base(
     shared = set(chains[0])
     for chain in chains[1:]:
         shared &= set(chain)
-    # The component bases themselves (MonoBehaviour/NetworkBehaviour) live OUTSIDE
-    # base_by_class (external), so they never appear in a chain; a shared project-
-    # local ancestor is therefore guaranteed to be a project class. Pick the
-    # NEAREST shared ancestor along the first element's chain.
+    # The component bases (MonoBehaviour/NetworkBehaviour) DO appear in a chain
+    # whenever a class extends one directly: ``_full_ancestor_chain`` appends each
+    # truthy ``base_by_class`` value, and a ``"X": "MonoBehaviour"`` mapping makes
+    # ``MonoBehaviour`` the chain's tail. Pick the NEAREST shared ancestor along
+    # the first element's chain.
     for cls in chains[0]:
-        if cls in shared:
-            # The shared base must itself derive from MonoBehaviour. For a
-            # subclass family that is automatic (it's on every component's
-            # chain), but guard explicitly so a shared NON-component ancestor
-            # (e.g. a shared interface-less POCO base) is rejected.
-            if cls in _COMPONENT_BASE_CLASSES or _resolves_to_component(
-                cls, base_by_class,
-            ):
-                return cls
+        if cls not in shared:
+            continue
+        # A bare component base as the nearest shared ancestor means "all are
+        # components" but NOT "one coherent family" (the topmost shared ancestor
+        # of any two unrelated MonoBehaviour components is MonoBehaviour itself).
+        # ABSTAIN — this is the load-bearing rejection that closes the
+        # unrelated-component-array hole.
+        if cls in _COMPONENT_BASE_CLASSES:
+            return None
+        # Otherwise return the shared PROJECT-LOCAL class, but only when it
+        # itself derives from a component base (rejects a shared NON-component
+        # ancestor such as an interface-less POCO base).
+        if _resolves_to_component(cls, base_by_class):
+            return cls
     return None
 
 
