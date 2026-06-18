@@ -434,6 +434,261 @@ def test_empty_body_onenable_qualifies(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Adversarial precision cases (review round 1 — structural / bias-to-abstain).
+# --------------------------------------------------------------------------- #
+
+def test_abstain_getter_wraps_addcomponent_in_call(tmp_path: Path) -> None:
+    """[F1] A getter whose backing-field assignment WRAPS the AddComponent in
+    another call (``= Register(o.AddComponent<Foo>())``) is a side effect — the
+    statement-allow must be STRUCTURAL (allowed forms exactly), not substring, and
+    must ABSTAIN on a wrapped/extra-call assignment."""
+    src = """\
+        using UnityEngine;
+        public class WrappedSingleton : MonoBehaviour
+        {
+            static private WrappedSingleton m_Instance;
+            static public WrappedSingleton instance
+            {
+                get
+                {
+                    if(m_Instance == null)
+                    {
+                        GameObject o = new GameObject("Wrapped");
+                        m_Instance = Register(o.AddComponent<WrappedSingleton>());
+                    }
+                    return m_Instance;
+                }
+            }
+            static WrappedSingleton Register(WrappedSingleton w) { return w; }
+        }
+    """
+    seeds, _ = _resolve(
+        tmp_path,
+        {"WrappedSingleton": (_g("wrap"), src)},
+        {"WrappedSingleton": dict(
+            stem="WrappedSingleton", class_name="WrappedSingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_abstain_getter_without_null_guard(tmp_path: Path) -> None:
+    """[F1] The getter must carry the lazy ``if (<field> == null)`` null-guard a
+    lazy singleton always has; a getter that unconditionally constructs (no guard)
+    is not the lazy shape — ABSTAIN."""
+    src = """\
+        using UnityEngine;
+        public class NoGuardSingleton : MonoBehaviour
+        {
+            static private NoGuardSingleton m_Instance;
+            static public NoGuardSingleton instance
+            {
+                get
+                {
+                    GameObject o = new GameObject("NoGuard");
+                    m_Instance = o.AddComponent<NoGuardSingleton>();
+                    return m_Instance;
+                }
+            }
+        }
+    """
+    # The detector's Fact-conjunction still binds the field, but the boot-safety
+    # gate must abstain because the lazy null-guard shape is absent.
+    assert not passes_boot_safety_gate(src, "NoGuardSingleton", "m_Instance")
+    seeds, _ = _resolve(
+        tmp_path,
+        {"NoGuardSingleton": (_g("ng"), src)},
+        {"NoGuardSingleton": dict(
+            stem="NoGuardSingleton", class_name="NoGuardSingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_detect_initialized_static_backing_field(tmp_path: Path) -> None:
+    """[F2] The common ``private static Foo _instance = null;`` (an initialized
+    static self-typed backing field) must STILL be detected — the prior
+    uninitialized-only match false-abstained and missed the real lazy singleton."""
+    src = """\
+        using UnityEngine;
+        public class InitFieldSingleton : MonoBehaviour
+        {
+            private static InitFieldSingleton _instance = null;
+            static public InitFieldSingleton Instance
+            {
+                get
+                {
+                    if(_instance == null)
+                    {
+                        GameObject o = new GameObject("InitField");
+                        _instance = o.AddComponent<InitFieldSingleton>();
+                    }
+                    return _instance;
+                }
+            }
+        }
+    """
+    # The analyzer must capture the backing field despite the ``= null`` init.
+    p = tmp_path / "Assets" / "Scripts" / "InitFieldSingleton.cs"
+    _write(p, src)
+    _write_meta(p, _g("init"))
+    info = analyze_script(p)
+    assert info.lazy_singleton_field == "_instance"
+
+    seeds, _ = _resolve(
+        tmp_path,
+        {"InitFieldSingleton": (_g("init"), src)},
+        {"InitFieldSingleton": dict(
+            stem="InitFieldSingleton", class_name="InitFieldSingleton",
+        )},
+    )
+    assert len(seeds) == 1
+    assert seeds[0]["backing_field"] == "_instance"
+
+
+def test_abstain_generic_factory_field_initializer(tmp_path: Path) -> None:
+    """[F3] A generic factory-call instance field initializer
+    (``= Factory.Build<Foo>()`` — the ``(`` follows ``>``) runs at construction
+    time, so it must be flagged nontrivial and ABSTAIN."""
+    src = """\
+        using UnityEngine;
+        public class FactoryFieldSingleton : MonoBehaviour
+        {
+            private FactoryFieldSingleton _dep = Factory.Build<FactoryFieldSingleton>();
+            static private FactoryFieldSingleton m_Instance;
+            static public FactoryFieldSingleton instance
+            {
+                get
+                {
+                    if(m_Instance == null)
+                    {
+                        GameObject o = new GameObject("Factory");
+                        m_Instance = o.AddComponent<FactoryFieldSingleton>();
+                    }
+                    return m_Instance;
+                }
+            }
+        }
+    """
+    seeds, _ = _resolve(
+        tmp_path,
+        {"FactoryFieldSingleton": (_g("fac"), src)},
+        {"FactoryFieldSingleton": dict(
+            stem="FactoryFieldSingleton", class_name="FactoryFieldSingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_abstain_auto_property_initializer(tmp_path: Path) -> None:
+    """[F4] A non-trivial auto-property initializer
+    (``public int Score { get; set; } = Load();``) runs at construction like a
+    field initializer, so it must be flagged and ABSTAIN."""
+    src = """\
+        using UnityEngine;
+        public class AutoPropSingleton : MonoBehaviour
+        {
+            public int Score { get; set; } = Load();
+            static private AutoPropSingleton m_Instance;
+            static public AutoPropSingleton instance
+            {
+                get
+                {
+                    if(m_Instance == null)
+                    {
+                        GameObject o = new GameObject("AutoProp");
+                        m_Instance = o.AddComponent<AutoPropSingleton>();
+                    }
+                    return m_Instance;
+                }
+            }
+            static int Load() { return 0; }
+        }
+    """
+    seeds, _ = _resolve(
+        tmp_path,
+        {"AutoPropSingleton": (_g("ap"), src)},
+        {"AutoPropSingleton": dict(
+            stem="AutoPropSingleton", class_name="AutoPropSingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_trivial_auto_property_initializer_qualifies(tmp_path: Path) -> None:
+    """[F4] A TRIVIAL (constant) auto-property initializer
+    (``{ get; set; } = 0;``) is benign and must NOT abstain — proves the
+    auto-property scan does not over-fire on a literal."""
+    src = """\
+        using UnityEngine;
+        public class TrivialAutoPropSingleton : MonoBehaviour
+        {
+            public int Score { get; set; } = 0;
+            static private TrivialAutoPropSingleton m_Instance;
+            static public TrivialAutoPropSingleton instance
+            {
+                get
+                {
+                    if(m_Instance == null)
+                    {
+                        GameObject o = new GameObject("TrivAutoProp");
+                        m_Instance = o.AddComponent<TrivialAutoPropSingleton>();
+                    }
+                    return m_Instance;
+                }
+            }
+        }
+    """
+    seeds, _ = _resolve(
+        tmp_path,
+        {"TrivialAutoPropSingleton": (_g("tap"), src)},
+        {"TrivialAutoPropSingleton": dict(
+            stem="TrivialAutoPropSingleton",
+            class_name="TrivialAutoPropSingleton",
+        )},
+    )
+    assert len(seeds) == 1
+
+
+def test_fact3_assignment_not_matched_by_guard_comparison(tmp_path: Path) -> None:
+    """[F5] Fact-3 (the backing-field assignment) must be an lvalue assignment
+    (``=(?!=)``), NOT the ``<field> == null`` guard comparison. Here the getter
+    has the ``new GameObject`` + ``AddComponent<cls>`` facts (so the conjunction's
+    other two facts hold) but assigns the result to a DIFFERENT field — the
+    backing field ``m_Instance`` appears ONLY in the ``== null`` guard + the
+    ``return``. Pre-fix, ``m_Instance\\s*=`` matched the ``==`` guard and falsely
+    bound ``m_Instance``; post-fix Fact-3 finds no real assignment to it, so the
+    detector must NOT bind ``m_Instance``."""
+    from unity.script_analyzer import (
+        _find_lazy_singleton_field,
+        _strip_comments_and_strings,
+    )
+    src = """\
+        public class GuardCmpSingleton : MonoBehaviour
+        {
+            static private GuardCmpSingleton m_Instance;
+            static private GuardCmpSingleton m_Other;
+            static public GuardCmpSingleton instance
+            {
+                get
+                {
+                    if(m_Instance == null)
+                    {
+                        GameObject o = new GameObject("GuardCmp");
+                        m_Other = o.AddComponent<GuardCmpSingleton>();
+                    }
+                    return m_Instance;
+                }
+            }
+        }
+    """
+    dec = _strip_comments_and_strings(textwrap.dedent(src))
+    # ``m_Other`` is the only really-assigned candidate; ``m_Instance`` must NOT
+    # be bound off its ``== null`` guard comparison.
+    assert _find_lazy_singleton_field(dec, "GuardCmpSingleton") == "m_Other"
+
+
+# --------------------------------------------------------------------------- #
 # Determinism + dedup.
 # --------------------------------------------------------------------------- #
 

@@ -111,6 +111,11 @@ _RE_STATIC_SELF_FIELD = re.compile(
     r"(?:\s+(?:public|private|protected|internal|readonly|new))*"
     r"\s+(?P<type>[A-Za-z_]\w*)"
     r"\s+(?P<name>[A-Za-z_]\w*)"
+    r"\s*(?:=\s*[^;]+?)?"   # OPTIONAL initializer (``= null`` / ``= default`` /
+                            # ``= default(T)``) — the common lazy declaration
+                            # ``private static Foo _instance = null;`` is still a
+                            # static self-typed backing field; the getter, not the
+                            # declaration, decides lazy-singleton-ness.
     r"\s*;",
 )
 # A static ``instance``/``Instance`` property getter declaration head. The getter
@@ -194,7 +199,10 @@ def _find_lazy_singleton_field(decommented: str, class_name: str) -> str:
         # Fact 3: an assignment to ONE of the candidate backing fields. Bind the
         # field name from the assignment so the getter + field agree.
         for field_name in candidate_fields:
-            if re.search(rf"\b{re.escape(field_name)}\s*=", body):
+            # ``=(?!=)`` is an lvalue ASSIGNMENT, not the ``<field> == null`` guard
+            # comparison (precision; harmless today as the conjunction also requires
+            # ``new GameObject`` + ``AddComponent``).
+            if re.search(rf"\b{re.escape(field_name)}\s*=(?!=)", body):
                 return field_name
     return ""
 
