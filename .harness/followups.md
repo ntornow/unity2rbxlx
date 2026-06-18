@@ -1065,3 +1065,37 @@ Observed in the Unit-4 e2e cold-boot (2026-06-17), but PRE-EXISTING + roster-unr
 - CASCADE: CharacterInputController (line 1) and CharacterCollider (line 2) both `require(TrackManager)` at the top, so TrackManager returning no table makes BOTH fail "Module code did not return exactly one value". One root (TrackManager), three console errors.
 - Two follow-on angles: (a) transpile robustness — a complex MonoBehaviour (TrackManager) intermittently transpiles to a TODO-stub with no class-table return; (b) require-resilience — the emitted `require(X "..." ) or ServerStorage...` pattern does not guard against X loading to nil/non-table, so one inert module cascades into every requirer. Consider a fail-soft require wrapper or a post-transpile "module returns a class table" verifier.
 - Also: TrackManager is the D-P2-9 scoped-out post-boot consumer; its failure here is the stub/no-return issue, NOT the wrapper-vs-Instance concern (which only bites with a live body).
+
+<!-- promoted from /drive run trash-dash-playable-20260617T192649 (2026-06-18) -->
+# Follow-ups — trash-dash-playable-20260617T192649
+
+Out-of-scope items surfaced during Phase-1 detailed design. Not blocking Phase 1.
+
+- **Rename `component` provenance state → `non_roblox_table`** for naming honesty (it now covers host-component results AND require'd modules). Cosmetic, zero behavior change; touches `TrackLit`, `_COMPONENT_HOST_APIS`, 5+ call sites, and every literal-asserting test. Deferred — pure churn.
+- **Unify all THREE reprompt acceptance gates on `_reprompt_is_structurally_safe`.** The lint-syntax-repair path (`_lint_and_fix` / `_reprompt_fix:2656`) already has a weaker (0.3-length, `"end" in fixed`) sanity check; folding it into the shared guard is a clean consolidation but not load-bearing for Phase 1 (that path was not implicated in the fragment degradations).
+- **rule-a/b runtime-correctness in the FULL state modules** (module-scope side-effects from the C# static/state-machine pattern). Surfaced only by the Phase-1 cold re-convert + playtest; owned by Phase 2 if it gates a run.
+- **~222 semantic_warnings triage** — only if one is shown to gate a run after the Phase-1 re-convert.
+- **Remote Addressables / CDN content loading** — out of scope for this run.
+
+## Phase 2 (DEFERRED to its own /drive run) — Trash Dash downstream Addressables gameplay-spawn closure
+Decided 2026-06-18 (user): ship Phase 1 standalone; Phase 2 is a dedicated new /drive run.
+Scope captured from the Phase-1 live playtest (state machine now boots; these block a playable run):
+1. ConsumableDatabase: `self.consumbales` holds unresolved Addressable address STRINGS, not
+   materialized Consumable objects → `c:GetConsumableType()` throws (ConsumableDatabase:15 OnEnable).
+   = Addressables prototype-materialization gap (design doc Unit-4/Phase-5 consumables).
+2. CoroutineHandler.getInstance() called before any instance Awoke (x2) — boot ordering.
+3. connectGameObjectTriggerSignal: no touch part on nil — trigger wired to an unplaced/nil part.
+4. UI host clone for "...Main.unity:..." never landed; skipping deferred component (x3) — deferred UI clones dropped.
+5. No gameplay spawns (segment/coin/obstacle/character=0; TrackManager:Begin not reached / themes+segments unresolved).
+Anchor: docs/design/addressables-prefab-conversion.md (Units 1-4 merged; this is the residual runtime layer).
+Start a fresh /drive run on this scope; multi-subsystem → expect multiple phases.
+
+## Documented residuals — Phase-1 finalize (codex findings, overruled-at-integration, bounded)
+- `_is_require_call`→`component` assumes every transpiled `require(...)` is a MODULE require (returns a
+  table), which holds for the converter's emission (module deps only; never `require(anInstance)`). If a
+  future emission path ever `require()`s something returning a raw Roblox Instance and then does
+  `.Parent`/`.Instance:Method()`, the validator would abstain on it. No such path today; revisit only if
+  the transpiler starts emitting non-module requires. (codex finalize MAJOR, refuted at integration.)
+- `_has_top_level_return` keys on a column-0 `return`; an unconventionally-indented module-level return
+  would be missed. Idiomatic transpiled modules emit column-0 `return ClassName`. Cheap future hardening:
+  reuse runtime_contract's top-level-statement iteration. (codex finalize MINOR.)
