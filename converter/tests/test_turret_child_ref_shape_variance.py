@@ -154,6 +154,7 @@ def _drive(tmp_path: Path, fake_luau: str) -> tuple[str, RbxScript]:
         project_context: str = "",
         runtime_mode: str = "legacy",
         is_player_controller: bool = False,
+        send_message_facts: tuple = (),
     ) -> tuple[str, float, list[str]]:
         captured["csharp"] = csharp_source
         return fake_luau, 1.0, []
@@ -411,6 +412,7 @@ public class Player : MonoBehaviour {
             project_context: str = "",
             runtime_mode: str = "legacy",
             is_player_controller: bool = False,
+            send_message_facts: tuple = (),
         ) -> tuple[str, float, list[str]]:
             return fake_luau, 1.0, []
 
