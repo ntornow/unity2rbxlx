@@ -961,6 +961,24 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:playersInRadius(arg1, arg2)
 		end,
+		sendMessage = function(arg1, arg2, arg3, ...)
+			-- Colon: host:sendMessage(recv, name, ...) -> arg1=host,
+			--   arg2=recv, arg3=name, ...=gameplay args.
+			-- Dotted: host.sendMessage(recv, name, ...) -> arg1=recv,
+			--   arg2=name, arg3..=gameplay args.
+			if arg1 == host then
+				return engine:sendMessage(arg2, arg3, ...)
+			end
+			return engine:sendMessage(arg1, arg2, arg3, ...)
+		end,
+		broadcastMessage = function(arg1, arg2, arg3, ...)
+			-- Colon: host:broadcastMessage(recv, name, ...) -> arg1=host.
+			-- Dotted: host.broadcastMessage(recv, name, ...) -> arg1=recv.
+			if arg1 == host then
+				return engine:broadcastMessage(arg2, arg3, ...)
+			end
+			return engine:broadcastMessage(arg1, arg2, arg3, ...)
+		end,
 		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
 		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
 		-- Phase 3's Shoot raycast can reach ``self.host.player:getLookCFrame()``
@@ -1534,6 +1552,133 @@ function SceneRuntime:_callMethod(instance, name, ...)
 			self._warn(string.format(
 				"[scene_runtime] %s.%s threw: %s",
 				tostring(self._meta[instance].scriptId), name, tostring(err)))
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
+-- SendMessage / BroadcastMessage host primitives (Unity engine ops)
+-- ---------------------------------------------------------------------
+-- Unity's ``recv.SendMessage("M", arg)`` invokes ``M`` on EVERY component
+-- on ``recv``'s GameObject that implements it, but only while the
+-- GameObject is ``activeInHierarchy``. ``BroadcastMessage`` additionally
+-- descends to every child GameObject. Resolution is at RUNTIME because the
+-- receiver expression (a component, a Model/GameObject, or a touched
+-- BasePart) only resolves to a live GameObject id once instances exist.
+
+-- ``_resolveReceiverGoId(recv) -> gameObjectId?`` -- best-effort map of a
+-- SendMessage receiver onto an internal ``gameObjectId``:
+--   * a component table -> ``_meta[recv].gameObjectId``
+--   * a Model / GameObject instance -> ``getInstanceId(recv)``
+--   * a BasePart -> ``getInstanceId(part)`` else its ancestor Model's id
+--     (mirrors the ``playerFromTouch`` ancestor walk for touched parts)
+-- Returns nil (with a warn) when nothing resolves -- best-effort, matching
+-- Unity's ``SendMessageOptions.DontRequireReceiver`` (Roblox has no
+-- missing-handler error analog).
+function SceneRuntime:_resolveReceiverGoId(recv)
+	if recv == nil then return nil end
+	-- Component table: registered in ``_meta`` with its gameObjectId.
+	local meta = self._meta[recv]
+	if meta ~= nil then
+		return meta.gameObjectId
+	end
+	-- Roblox Instance (Model / GameObject / BasePart): resolve its own
+	-- stamped id first; a GameObject whose components are registered will
+	-- have a bucket under that id.
+	local getInstanceId = self._services.getInstanceId
+	if getInstanceId == nil then return nil end
+	local ownId = getInstanceId(recv)
+	if ownId ~= nil and self._componentsByGameObject[ownId] ~= nil then
+		return ownId
+	end
+	-- BasePart (or any descendant Instance) whose own id carries no
+	-- components: climb to the owning Model and resolve that.
+	if type(recv.FindFirstAncestorWhichIsA) == "function" then
+		local ok, ancestor = pcall(function()
+			return recv:FindFirstAncestorWhichIsA("Model")
+		end)
+		if ok and ancestor ~= nil then
+			local ancId = getInstanceId(ancestor)
+			if ancId ~= nil then
+				return ancId
+			end
+		end
+	end
+	-- Fall back to the receiver's own id even without a component bucket
+	-- so the caller can still attempt dispatch (no-op if empty).
+	return ownId
+end
+
+-- ``_dispatchToGameObject(goId, name, ...)`` -- invoke ``name`` on every
+-- component registered at ``goId`` that implements it, gated on the
+-- GameObject being ``activeInHierarchy`` (Unity targets only active
+-- GameObjects). Each call goes through ``_callMethod`` (pcall-wrapped).
+function SceneRuntime:_dispatchToGameObject(goId, name, ...)
+	if goId == nil then return end
+	-- Active gate: reuse the lifecycle's computed ``activeInHierarchy``.
+	-- A goId never seeded into the cache defaults to the parent-map
+	-- computation (absence == active, matching ``_injectHostSurface``).
+	local active = self._goActiveInHierarchy[goId]
+	if active == nil then
+		active = self:_computeActiveInHierarchyViaParentMap(goId)
+	end
+	if not active then return end
+	local bucket = self._componentsByGameObject[goId]
+	if bucket == nil then return end
+	-- Snapshot so a handler that mutates the bucket (adds/destroys a
+	-- component) does not disturb iteration.
+	local snap = {}
+	for i, comp in ipairs(bucket) do snap[i] = comp end
+	for _, comp in ipairs(snap) do
+		local meta = self._meta[comp]
+		local class = meta and meta.classTable
+		if class and type(class[name]) == "function" then
+			self:_callMethod(comp, name, ...)
+		end
+	end
+end
+
+-- ``sendMessage(recv, name, ...)`` -- Unity ``recv.SendMessage("name", ...)``:
+-- dispatch ``name`` to every implementing component on the resolved
+-- GameObject (active only).
+function SceneRuntime:sendMessage(recv, name, ...)
+	local goId = self:_resolveReceiverGoId(recv)
+	if goId == nil then
+		self._warn(string.format(
+			"[scene_runtime] sendMessage(%q): no GameObject for receiver",
+			tostring(name)))
+		return
+	end
+	self:_dispatchToGameObject(goId, name, ...)
+end
+
+-- ``broadcastMessage(recv, name, ...)`` -- Unity
+-- ``recv.BroadcastMessage("name", ...)``: dispatch to the GameObject AND
+-- every descendant GameObject (via the planner parent map walked DOWN).
+function SceneRuntime:broadcastMessage(recv, name, ...)
+	local goId = self:_resolveReceiverGoId(recv)
+	if goId == nil then
+		self._warn(string.format(
+			"[scene_runtime] broadcastMessage(%q): no GameObject for receiver",
+			tostring(name)))
+		return
+	end
+	self:_dispatchToGameObject(goId, name, ...)
+	-- Descend: every GameObject whose ancestor chain (``_goParentId``
+	-- walked UP) reaches ``goId`` is a descendant. Bounded by a depth
+	-- budget per node so an accidental cycle can't loop forever.
+	for childId in pairs(self._componentsByGameObject) do
+		if childId ~= goId then
+			local cur = self._goParentId[childId]
+			local depth = 0
+			while cur ~= nil and depth < 1024 do
+				if cur == goId then
+					self:_dispatchToGameObject(childId, name, ...)
+					break
+				end
+				cur = self._goParentId[cur]
+				depth = depth + 1
+			end
 		end
 	end
 end
