@@ -928,7 +928,21 @@ def _walk_scene(
             # above regardless, so the module still emits (the class may also
             # run on a runtime-instantiated rig). Keyed purely on the
             # deterministic ``m_IsActive`` ancestor-chain fact.
-            if ancestor_inactive:
+            #
+            # UI carve-out (cross-slice boundary with the ui_translator
+            # gap #4 fix): a host UNDER A CANVAS is NOT suppressed even when
+            # an ancestor is inactive. The UI producer-side fix emits the
+            # inactive UI subtree's ``_SceneRuntimeId``-stamped HOST CLONE
+            # into PlayerGui, and the runtime binds the component to that
+            # landed clone via the deferred ``awaitUiHost(sceneRuntimeId)``
+            # path — which is DRIVEN by this planner instance row (the host
+            # build loop calls ``awaitUiHost`` only for ``instance_owner_is_ui``
+            # rows). Suppressing the row here would delete the very deferred
+            # host row that fix depends on (D-P4-4 declared planner-side UI
+            # suppression WRONG — "kills SetActive-driven popups"). Gap #3 is
+            # a scene/world dormant-holder descendant whose host the converter
+            # never places, so it stays suppressed; UI hosts keep their row.
+            if ancestor_inactive and node.file_id not in ui_go_fids:
                 continue
             enabled_raw = comp.properties.get("m_Enabled", 1)
             enabled = bool(enabled_raw) if isinstance(enabled_raw, (int, bool)) else True

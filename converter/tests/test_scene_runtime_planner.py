@@ -2561,6 +2561,44 @@ class TestDormantHolderDescendantSuppression:
         # is dropped.
         assert artifact["modules"][guid]["runtime_bearing"] is True
 
+    def test_inactive_ancestor_ui_host_under_canvas_keeps_row(self, tmp_path: Path):
+        # Cross-slice (4.2 ↔ 4.3) regression. Mirrors gap #4's real topology:
+        # Canvas(active) → AboutPopup(INACTIVE) → VisitUnityButton(active, OpenURL
+        # MonoBehaviour). The host is UNDER A CANVAS, so the ui_translator
+        # producer-side fix lands its _SceneRuntimeId host clone in PlayerGui and
+        # the runtime binds via the deferred awaitUiHost path — which is DRIVEN by
+        # this planner instance row. Suppressing the row (the gap #3 ancestor-
+        # inactive rule, un-gated) would delete the deferred-host row that fix
+        # depends on, re-introducing the planner-side UI suppression D-P4-4
+        # declared WRONG ("kills SetActive-driven popups"). So a UI host KEEPS
+        # its row even under an inactive ancestor.
+        guid = "9" * 32
+        idx = self._idx(tmp_path, guid, "OpenURLButton")
+        button = _node("VisitUnityButton", "VisitUnityButton", active=True, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="1834564028",
+                properties=_mb_props(guid, go_fid="VisitUnityButton"),
+            )
+        ])
+        about = _node("AboutPopup", "AboutPopup", active=False, children=[button])
+        canvas = _node("Canvas", "Canvas", active=True, components=[
+            ComponentData(component_type="Canvas", file_id="canvas_comp", properties={}),
+        ], children=[about])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity", roots=[canvas],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        block = artifact["scenes"]["Assets/Scenes/Main.unity"]
+        host_id = "Assets/Scenes/Main.unity:VisitUnityButton"
+        rows = [i for i in block["instances"] if i["game_object_id"] == host_id]
+        assert len(rows) == 1, "UI host row under inactive ancestor must be retained for awaitUiHost binding"
+        # Stamped UI-owned so the host build loop routes it through awaitUiHost.
+        assert rows[0].get("instance_owner_is_ui") is True
+        assert rows[0]["instance_id"] in block["lifecycle_order"]
+
     def test_inactive_node_itself_still_emits_row(self, tmp_path: Path):
         # An inactive node with NO inactive ancestor keeps its row: it becomes
         # a dormant holder stamped with its own _SceneRuntimeId, so its own
