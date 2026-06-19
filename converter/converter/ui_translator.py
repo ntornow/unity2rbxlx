@@ -390,10 +390,18 @@ def _convert_ui_element(
 
     Returns:
         An RbxUIElement, or None if the node should be skipped.
-    """
-    if not node.active:
-        return None
 
+    Note on inactive nodes (Gap #4): an inactive Unity GameObject is NOT
+    pruned. Unity inactive objects still EXIST and are commonly woken later
+    by a script ``SetActive(true)`` (e.g. ``SettingPopup → AboutPopup``
+    popups). Pruning the subtree dropped the ``_SceneRuntimeId``-stamped
+    host clones the scene-runtime planner emits deferred-component rows
+    against, so those rows dangled ("UI host clone … never landed"). We
+    therefore EMIT the inactive subtree and KEEP RECURSING into children;
+    the element is created with ``visible=node.active`` (below), so an
+    inactive node lands hidden and the runtime ``_applyPlannerFlagsAndTag``
+    keeps it inactive until a script wakes it.
+    """
     # Determine element class from components.
     element_class = "Frame"  # Default to Frame if no specific UI component.
     ui_properties: dict[str, Any] = {}
