@@ -742,3 +742,175 @@ class TestToggleIsOnAttrConvention:
                     checked += 1
         # The corpus must contain at least one Toggle-isOn writer to anchor on.
         assert checked >= 1, "no Toggle-isOn writer found in contract corpus"
+
+
+class TestInactiveUiSubtreeEmission:
+    """Gap #4 — an inactive UI subtree is EMITTED (hidden), not pruned.
+
+    A Unity inactive GameObject (``m_IsActive: 0``) still EXISTS and is
+    commonly woken later by a script ``SetActive(true)`` (the
+    ``SettingPopup → AboutPopup`` popups). Before the fix
+    (``ui_translator.py:394`` ``if not node.active: return None``) the whole
+    inactive subtree was dropped from StarterGui, so none of its nodes got
+    the ``_SceneRuntimeId``-stamped host clone the scene-runtime planner
+    emits deferred-component rows against → "UI host clone … never landed".
+
+    The fix emits the node hidden (``Visible=false`` via
+    ``visible=node.active``) AND keeps recursing, so the host clone + its
+    descendants land while honoring Unity's inactive intent.
+    """
+
+    NS = "Assets/Scenes/Main.unity"
+
+    @staticmethod
+    def _node(
+        name: str, file_id: str, *, active: bool = True,
+        components: list[ComponentData] | None = None,
+        children: list[SceneNode] | None = None,
+    ) -> SceneNode:
+        return SceneNode(
+            name=name,
+            file_id=file_id,
+            active=active,
+            layer=0,
+            tag="Untagged",
+            components=components or [],
+            children=children or [],
+            parent_file_id=None,
+        )
+
+    def _convert(self, node: SceneNode) -> RbxUIElement | None:
+        from converter.ui_translator import _convert_ui_element
+        return _convert_ui_element(node, scene_namespace=self.NS)
+
+    def _by_sri(self, element: RbxUIElement) -> dict[str, RbxUIElement]:
+        """Flatten the produced tree into a ``_SceneRuntimeId -> element`` map."""
+        out: dict[str, RbxUIElement] = {}
+
+        def walk(el: RbxUIElement) -> None:
+            sri = el.attributes.get("_SceneRuntimeId")
+            if isinstance(sri, str):
+                out[sri] = el
+            for child in el.children:
+                walk(child)
+
+        walk(element)
+        return out
+
+    def _about_popup_tree(self) -> SceneNode:
+        """The real inactive ``SettingPopup → AboutPopup`` hierarchy that
+        hosts the 3 warned deferred components:
+
+          - ConfirmPopup ``1918594629`` (DataDeleteConfirmation, m_IsActive 0)
+          - VisitUnityButton ``1834564028`` (OpenURL)
+          - VisitGameChangerButton ``375939466`` (OpenURL)
+        """
+        confirm = self._node(
+            "ConfirmPopup", "1918594629", active=False,
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="a37c4b6",
+                properties={},
+            )],
+        )
+        visit_unity = self._node(
+            "VisitUnityButton", "1834564028",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="99717f89a",
+                properties={},
+            )],
+        )
+        visit_gc = self._node(
+            "VisitGameChangerButton", "375939466",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="99717f89b",
+                properties={},
+            )],
+        )
+        about = self._node(
+            "AboutPopup", "200", active=False,
+            children=[visit_unity, visit_gc],
+        )
+        return self._node(
+            "SettingPopup", "100", active=False,
+            children=[about, confirm],
+        )
+
+    def test_inactive_subtree_emitted_with_host_clones(self):
+        """AC4 — the 3 named deferred-component host ids land with their
+        ``_SceneRuntimeId`` stamped (descendants of an inactive subtree are
+        emitted, not pruned)."""
+        element = self._convert(self._about_popup_tree())
+        assert element is not None  # the inactive root itself is emitted
+        sris = self._by_sri(element)
+        for fid in ("100", "200", "1918594629", "1834564028", "375939466"):
+            assert f"{self.NS}:{fid}" in sris, (
+                f"host clone for {fid} missing — inactive subtree pruned"
+            )
+
+    def test_emitted_inactive_node_is_hidden_not_visible(self):
+        """E6 — the emitted inactive node lands hidden (``Visible=false``), so
+        the menu does not show the popup at boot; an active descendant under
+        an inactive parent keeps its own active visibility."""
+        element = self._convert(self._about_popup_tree())
+        assert element is not None
+        sris = self._by_sri(element)
+        # Inactive roots/subtree -> hidden.
+        assert sris[f"{self.NS}:100"].visible is False
+        assert sris[f"{self.NS}:200"].visible is False
+        assert sris[f"{self.NS}:1918594629"].visible is False
+        # An active descendant (the OpenURL buttons) keeps Visible=true; the
+        # runtime keeps the inactive PARENT hidden until SetActive(true).
+        assert sris[f"{self.NS}:1834564028"].visible is True
+        assert sris[f"{self.NS}:375939466"].visible is True
+
+    def test_active_subtree_unchanged(self):
+        """A normally-active subtree is emitted exactly as before (no
+        behavior change for the common path)."""
+        child = self._node(
+            "ActiveChild", "11",
+            components=[ComponentData(
+                component_type="Image", file_id="111", properties={},
+            )],
+        )
+        root = self._node("ActivePanel", "10", children=[child])
+        element = self._convert(root)
+        assert element is not None
+        sris = self._by_sri(element)
+        assert sris[f"{self.NS}:10"].visible is True
+        assert sris[f"{self.NS}:11"].visible is True
+        assert f"{self.NS}:11" in sris  # active child still recursed
+
+    def test_nested_inactive_within_inactive(self):
+        """Edge — an inactive node nested under another inactive node is still
+        emitted (recursion does not stop at the first inactive boundary)."""
+        deep = self._node(
+            "DeepInactive", "30", active=False,
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="300", properties={},
+            )],
+        )
+        mid = self._node("MidInactive", "20", active=False, children=[deep])
+        root = self._node("RootInactive", "10", active=False, children=[mid])
+        element = self._convert(root)
+        assert element is not None
+        sris = self._by_sri(element)
+        for fid in ("10", "20", "30"):
+            assert f"{self.NS}:{fid}" in sris
+            assert sris[f"{self.NS}:{fid}"].visible is False
+
+    def test_bug_guard_pre_fix_would_prune(self):
+        """BUG-GUARD (fails pre-fix) — under the old
+        ``if not node.active: return None`` an inactive node returned ``None``
+        and its descendants never landed. Post-fix the inactive root is a
+        real element whose deferred-component descendants carry a
+        ``_SceneRuntimeId``. This assertion is impossible against the pruned
+        (None) tree."""
+        element = self._convert(self._about_popup_tree())
+        # Pre-fix: element is None (whole subtree pruned) -> AttributeError on
+        # the next line, OR (if guarded) the descendant ids are simply absent.
+        assert element is not None
+        sris = self._by_sri(element)
+        # The deepest deferred-component descendants — only reachable if the
+        # inactive subtree was recursed into rather than dropped at the root.
+        assert f"{self.NS}:1834564028" in sris
+        assert f"{self.NS}:375939466" in sris
