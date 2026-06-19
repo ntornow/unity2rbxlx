@@ -13,6 +13,25 @@ Open work moves to `TODO.md`. Completed work and execution logs stay here.
 
 ---
 
+## 2026-06-20 — mesh-fidelity fixes (merged ntornow#212, /drive run mesh-fidelity-20260619T232452)
+
+- [x] **P1 — Mesh face cap stale (10k) + quality floor ignored it.** FIXED #212: `config.py
+  MESH_ROBLOX_MAX_FACES` 10_000 → 20_000; `mesh_processor.decimate_mesh` clamps the floored target to the
+  cap (`min(max(target,floor),cap)`). **Deeper bug found in finalize:** decimation NEVER RAN — the call
+  passed the face count positionally to trimesh 4.x `simplify_quadric_decimation(percent=,face_count=)` →
+  bound to `percent` → ValueError → `except` shipped the un-decimated original. Fixed via `face_count=`
+  keyword (output now strictly bounded by the clamped cap). LATENT: `decimate_mesh` has no production caller
+  today (meshes upload raw; Open Cloud decimates server-side) — correctness fix for when it's wired.
+  Residual followups (.harness): `except`-fallback can still ship oversized on a non-positional backend
+  failure; real-upload 20k-acceptance check deferred until the path is wired.
+- [x] **P1 — Embedded-mesh resolver shipped arbitrary geometry on a bad sub-mesh count.** FIXED #212:
+  the "exactly one sub-mesh" invariant was `log.warning`-only while `_resolve_sub_mesh` still returned
+  `sub_meshes[0]`. Now `_quarantine_bad_embedded_meshes` drops a key resolving to ≠1 sub-mesh from
+  `mesh_hierarchies`/`mesh_native_sizes`/`uploaded_assets` (the real MeshId binding gate, incl. slash
+  variants) + `asset_upload_errors`, so the face-decal fallback takes over. Post-merge on ctx dicts (evicts
+  force-rerun pre-seeded keys); `is_embedded_mesh_key` gate prevents quarantining valid non-embedded FBX;
+  no `scene_converter` change (downstream `_resolve_mesh_id` returns None crash-free).
+
 ## 2026-06-19 — items completed and moved from TODO.md (condensed; full prose in git history)
 
 - [x] **P0 (generic) — F10 door never opens (animation driver-domain → server fallback, pattern #9).**

@@ -28,13 +28,6 @@ cache. The items below are where code or docs are stale or wrong.
   stale error msg in `u2r.py`), 6 undocumented u2r subcommands, stale test counts, and convert
   all hardcoded `file:line` citations to grep-targets.
 
-- [ ] **P1 — Mesh face cap is stale (10k) and the quality floor ignores it.** Roblox's limit has
-  been **20,000** triangles since ~2021 (creator-docs mesh specifications); `config.py
-  MESH_ROBLOX_MAX_FACES = 10_000` over-decimates large meshes ~2×, AND `mesh_processor.py`
-  applies `MESH_QUALITY_FLOOR` with no cap clamp (50k faces × floor 0.6 → 30k > cap → upload
-  fails). Fix both: constant → 20_000, clamp after the floor. Open Cloud may also silently
-  decimate server-side (DevForum 2026-04) — enforce locally, don't rely on the server.
-
 - [ ] **P1 — Workspace gravity comment is false; physics diverges 5.6×.** `rbxlx_writer.py`
   writes `Gravity = 196.2` commented "(9.81 m/s²)" — at the converter's own 0.28 m/stud scale
   that is 54.9 m/s² (196.2 = 20×9.81 is the pre-2019 5 cm/stud convention). Unity-tuned
@@ -302,18 +295,6 @@ cache. The items below are where code or docs are stale or wrong.
   § "Persistent prefab/asset cache".
 
 ## Materials & meshes
-
-- [ ] **P1 — Embedded-mesh resolver only warns on bad sub-mesh count, then ships arbitrary geometry.** PR #121 review (codex + Claude, 2026-05-21).
-  `pipeline.py:2101+` asserts the "embedded synthesised FBX must resolve to
-  exactly one sub-mesh" invariant via `log.warning`, but `_resolve_sub_mesh()`
-  still returns `sub_meshes[0]` for embedded keys when the invariant is
-  violated. The comment claims "loud-fail" but the implementation is
-  loud-warn. Result: when `_strip_extra_geometries_and_dependents` misses a
-  Geometry node, the conversion ships wrong geometry instead of falling back
-  safely. Fix: quarantine the bad key by removing it from `mesh_hierarchies`
-  + `mesh_native_sizes` and appending to `asset_upload_errors`, so the
-  face-decal fallback path in `scene_converter` takes over instead of binding
-  to a coincidence Geometry. Codex sketched the ~12-line diff in the review.
 
 - [ ] **P2 — Multi-sub-mesh sizing emitters still inline the scale chain (parallel to the adapter).** PR #121 review (codex + Claude, 2026-05-21).
   Commit `141892d` centralised single-mesh sizing through
