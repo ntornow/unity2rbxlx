@@ -331,10 +331,14 @@ class TestPersistedSoPrefabIdsAxis:
     emit-gate consumers read that axis so the prefabs pass the emission gate."""
 
     def test_consumer_loop_reads_so_prefab_ids_axis(self):
-        # Replicate the pipeline emit-gate consumer-loop extraction (pipeline.py
-        # ``_generate_prefab_packages`` / ``select_emitted_prefab_ids`` loops): the
-        # by_address/by_label axes are label->[ids] dicts; so_prefab_ids is a FLAT
-        # list and must be read directly. Asserts the new axis flows into the set.
+        # Drives the REAL shared consumer (``prefab_packages.collect_addressable_prefab_ids``)
+        # that BOTH pipeline emit-gate arms (``_generate_prefab_packages`` and the
+        # collision-rekey pass) call — NOT a re-implemented inline loop. The
+        # by_address/by_label axes are label->[ids] dicts; so_prefab_ids (L0 gap #5)
+        # is a FLAT list read directly. If the real arm dropped the so_prefab_ids
+        # read, this would go RED (no longer green-for-wrong-reason).
+        from converter.prefab_packages import collect_addressable_prefab_ids
+
         addr_block = {
             "by_address": {"Coin": ["coin:Prefabs/Coin.prefab"]},
             "by_label": {},
@@ -343,21 +347,13 @@ class TestPersistedSoPrefabIdsAxis:
                 "seg2:Themes/Seg2.prefab",
             ],
         }
-        addressable_prefab_ids: set[str] = set()
-        for axis in ("by_address", "by_label"):
-            for ids in (addr_block.get(axis) or {}).values():
-                if isinstance(ids, (list, tuple, set)):
-                    addressable_prefab_ids.update(
-                        pid for pid in ids if isinstance(pid, str)
-                    )
-        so_ids = addr_block.get("so_prefab_ids")
-        if isinstance(so_ids, (list, tuple, set)):
-            addressable_prefab_ids.update(
-                pid for pid in so_ids if isinstance(pid, str)
-            )
+        addressable_prefab_ids = collect_addressable_prefab_ids(addr_block)
         assert "seg1:Themes/Seg1.prefab" in addressable_prefab_ids
         assert "seg2:Themes/Seg2.prefab" in addressable_prefab_ids
         assert "coin:Prefabs/Coin.prefab" in addressable_prefab_ids
+        # A FLAT-list mis-read via ``.values()`` (the bug the axis guards against)
+        # would iterate the id STRINGS char-by-char — assert that did not happen.
+        assert all(len(pid) > 1 for pid in addressable_prefab_ids)
 
     def test_so_prefab_ids_pass_emit_gate(self):
         # AC5(b): the so-prefab ids pass ``select_emitted_prefab_ids`` (i.e.

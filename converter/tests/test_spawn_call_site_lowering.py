@@ -239,27 +239,193 @@ def test_all_five_shapes_in_one_module() -> None:
     assert res2.rewritten == 0
 
 
-def test_real_track_manager_shapes() -> None:
-    """Drive the REAL #210 diag TrackManager.luau (not a synthetic fixture)."""
+# --- Real-output fixtures, vendored so the suite is hermetic (no env-dependent
+# skip). Captured verbatim from the #210 diag conversion; the live-path behaviour is
+# re-confirmed against the actual files by ``test_real_diag_outputs_when_present``. ---
+
+# Pooler.luau (real diag output): a GENERIC object pooler. ``local obj =
+# original:Clone(); obj.Parent = Workspace`` with NO ``Instantiate(`` origin comment.
+# Must ABSTAIN — rewriting it to instantiatePrefab(original, …) corrupts it (P1-1).
+REAL_POOLER_SRC = """\
+local function instantiate(original)
+\tlocal obj = original:Clone()
+\tobj.Parent = Workspace
+\treturn obj
+end
+"""
+
+# A generic clone with a NEARBY comment that mentions Instantiate( but is NOT the
+# attached origin block (a code line intervenes) — must still abstain (codex tweak:
+# only a comment block ATTACHED to the clone gates the rewrite).
+DETACHED_COMMENT_CLONE_SRC = """\
+function Foo:bar()
+    -- Instantiate(thing) somewhere else entirely.
+    local x = computeSomething()
+    local obj = template:Clone()
+    obj.Parent = Workspace
+end
+"""
+
+CLOUD_NO_COMMENT_SRC = """\
+function TrackManager:Update(dt)
+    if cloud ~= nil then
+        local obj = cloud:Clone()
+        obj.Parent = self.parallaxRoot
+    end
+end
+"""
+
+
+def test_cloud_abstains_without_instantiate_origin_comment() -> None:
+    # P1-1 regression: a cloud-shaped clone WITHOUT an attached ``Instantiate(``
+    # origin comment must NOT be rewritten (the comment is the identity gate).
+    new, res = lower_spawn_call_sites(CLOUD_NO_COMMENT_SRC)
+    assert res.rewritten == 0
+    assert res.deferred == 0
+    assert new == CLOUD_NO_COMMENT_SRC
+    assert "instantiatePrefab" not in new
+
+
+def test_real_pooler_shape_is_not_rewritten() -> None:
+    # P1-1 regression on the REAL Pooler.luau shape: a generic pooler clone with no
+    # origin comment must be left byte-identical (no wrong-region rewrite).
+    new, res = lower_spawn_call_sites(REAL_POOLER_SRC)
+    assert res.rewritten == 0
+    assert res.deferred == 0
+    assert new == REAL_POOLER_SRC
+    assert "instantiatePrefab" not in new
+
+
+def test_clone_with_detached_instantiate_comment_abstains() -> None:
+    # The ``Instantiate(`` mention is in a comment separated from the clone by a code
+    # line — the attached-block rule rejects it (no leak-down false positive).
+    new, res = lower_spawn_call_sites(DETACHED_COMMENT_CLONE_SRC)
+    assert res.rewritten == 0
+    assert new == DETACHED_COMMENT_CLONE_SRC
+
+
+def test_obstacle_recovers_param_from_func_signature() -> None:
+    # P1-2 generality: the obstacle prefab-id is recovered structurally even when the
+    # ``local _ = <param>`` discard is absent — fall back to the function's first
+    # parameter, NOT a game-specific method name.
+    src = """\
+function SomeManager:loadThing(myRef, segment, posIndex)
+    -- Addressables.LoadAssetAsync<GameObject>(reference): no Roblox equivalent.
+    local obj = nil
+    if obj ~= nil then
+        obj:doStuff()
+    end
+end
+"""
+    new, res = lower_spawn_call_sites(src)
+    assert res.rewritten == 1
+    assert "local obj = self.host.instantiatePrefab(myRef, segment.gameObject, nil)" in new
+
+
+def test_obstacle_origin_without_recoverable_param_logs_abstain(caplog) -> None:
+    # AC6 uniform fail-soft: obstacle origin present but neither a discard line nor a
+    # function signature is in scope to recover the prefab-id → LOG + abstain.
+    src = """\
+-- Addressables.LoadAssetAsync<GameObject>(reference): no Roblox equivalent.
+local obj = nil
+if obj ~= nil then
+    obj:doStuff()
+end
+"""
+    with caplog.at_level("WARNING"):
+        new, res = lower_spawn_call_sites(src)
+    assert res.rewritten == 0
+    assert new == src
+    assert any("obstacle origin present" in r.message for r in caplog.records)
+
+
+def test_instantiate_async_origin_without_shape_logs_abstain(caplog) -> None:
+    # AC6 uniform fail-soft: InstantiateAsync origin present but no <v>=nil+warn-abort
+    # shape located (transpiler drift) → LOG + abstain.
+    src = """\
+function M:f()
+    -- Addressables.InstantiateAsync(thing name): UNCONVERTED.
+    doSomethingElse()
+end
+"""
+    with caplog.at_level("WARNING"):
+        new, res = lower_spawn_call_sites(src)
+    assert res.rewritten == 0
+    assert res.deferred == 0
+    assert new == src
+    assert any(
+        "Addressables.InstantiateAsync origin present" in r.message
+        for r in caplog.records
+    )
+
+
+def test_pooler_clone_does_not_log_spurious_cloud_abstain(caplog) -> None:
+    # The generic Pooler clone has NO ``Instantiate(`` origin comment, so the cloud
+    # fail-soft must stay SILENT (no spurious drift warning).
+    with caplog.at_level("WARNING"):
+        lower_spawn_call_sites(REAL_POOLER_SRC)
+    assert not any("Instantiate(" in r.message for r in caplog.records)
+
+
+def test_obstacle_dot_form_self_param_does_not_misbind() -> None:
+    # Hardening: a dot-form method listing an explicit ``self`` first param (and NO
+    # ``local _ =`` discard) must NOT bind ``self`` as the prefab-id — fail-closed.
+    src = """\
+function TrackManager.spawn(self, reference)
+    -- Addressables.LoadAssetAsync<GameObject>(reference): no Roblox equivalent.
+    local obj = nil
+    if obj ~= nil then
+        obj:doStuff()
+    end
+end
+"""
+    new, res = lower_spawn_call_sites(src)
+    assert res.rewritten == 0  # self is not a prefab-id; abstain
+    assert "instantiatePrefab(self," not in new
+    assert new == src
+
+
+def test_real_diag_outputs_when_present() -> None:
+    """Re-confirm the vendored fixtures against the REAL diag files when present.
+
+    NOT a silent skip-if-absent: when the diag tree exists we assert the live
+    behaviour (4 rewrites + 1 deferral on TrackManager; Pooler untouched). When it is
+    absent (CI / a fresh clone) the hermetic vendored fixtures above carry the
+    coverage, so this is a best-effort cross-check, explicitly marked.
+    """
     import os
 
-    real = (
+    base = (
         "/Users/jiazou/.claude/harness-runs/trash-dash-phase2-20260618T102928/"
-        "wt/diag/converter/output/trash-dash-phase2-diag/scripts/TrackManager.luau"
+        "wt/diag/converter/output/trash-dash-phase2-diag/scripts/"
     )
-    if not os.path.exists(real):
-        pytest.skip("diag TrackManager.luau not present in this environment")
-    src = open(real, encoding="utf-8").read()
-    new, res = lower_spawn_call_sites(src)
+    tm_path = base + "TrackManager.luau"
+    pooler_path = base + "Pooler.luau"
+    if not (os.path.exists(tm_path) and os.path.exists(pooler_path)):
+        pytest.skip(
+            "diag tree absent in this environment — vendored real-shape fixtures "
+            "(REAL_POOLER_SRC, the combined-module test) carry the coverage."
+        )
+    tm = open(tm_path, encoding="utf-8").read()
+    new, res = lower_spawn_call_sites(tm)
     assert res.rewritten == 4, "segment/obstacle/premium/cloud must all rewrite"
     assert res.deferred == 1, "consumable must defer"
     assert ":Clone()" not in new  # cloud clone-on-string fixed
-    # No spawn site still parks on a dead ``= nil`` sentinel followed by an abort.
     assert "local newSegment = nil" not in new
-    # Idempotent on the real source.
+    assert new.count("instantiatePrefab") == 4
+    # The premium expr is recovered structurally (not by the C# arg name).
+    assert "instantiatePrefab(self.currentTheme.premiumCollectible," in new
+    # The consumable site is deferred (its loud warn-abort path is preserved).
+    assert "Unable to load consumable" in new
+    assert "instantiatePrefab(self.consumableDatabase" not in new
     again, res2 = lower_spawn_call_sites(new)
     assert again == new
     assert res2.rewritten == 0
+    # Pooler: a generic clone with no origin comment is left untouched.
+    pooler = open(pooler_path, encoding="utf-8").read()
+    pnew, pres = lower_spawn_call_sites(pooler)
+    assert pres.rewritten == 0
+    assert pnew == pooler
 
 
 @dataclass

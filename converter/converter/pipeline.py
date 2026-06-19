@@ -6547,7 +6547,9 @@ script.Disabled = true
         rbxlx from bloating with every parsed prefab in the project.
         """
         from converter.prefab_packages import (
-            generate_prefab_packages, write_packages_manifest,
+            collect_addressable_prefab_ids,
+            generate_prefab_packages,
+            write_packages_manifest,
         )
 
         prefab_library = self.state.prefab_library
@@ -6573,22 +6575,11 @@ script.Disabled = true
             tname = sub.get("template_name") if isinstance(sub, dict) else None
             if isinstance(tname, str):
                 resolved_template_names[pid] = tname
-        addressable_prefab_ids: set[str] = set()
         addr_block = scene_runtime.get("addressables") or {}
-        for axis in ("by_address", "by_label"):
-            for ids in (addr_block.get(axis) or {}).values():
-                if isinstance(ids, (list, tuple, set)):
-                    addressable_prefab_ids.update(
-                        pid for pid in ids if isinstance(pid, str)
-                    )
-        # L0 (gap #5): ``so_prefab_ids`` is a FLAT list of prefab ids (reachable
-        # from emitted SO AssetReference fields), not a label/address -> [ids]
-        # dict, so read it directly rather than via ``.values()``.
-        _so_ids = addr_block.get("so_prefab_ids")
-        if isinstance(_so_ids, (list, tuple, set)):
-            addressable_prefab_ids.update(
-                pid for pid in _so_ids if isinstance(pid, str)
-            )
+        # Shared reader of the persisted addressables axes (incl. the L0 gap #5
+        # ``so_prefab_ids`` flat list) — same helper as the sibling consumer arm,
+        # so the two emit-gate target sets never diverge.
+        addressable_prefab_ids = collect_addressable_prefab_ids(addr_block)
 
         result = generate_prefab_packages(
             prefab_library=prefab_library,
@@ -6830,24 +6821,16 @@ script.Disabled = true
         if prefab_library is None:
             return set()
 
-        from converter.prefab_packages import select_emitted_prefab_ids
+        from converter.prefab_packages import (
+            collect_addressable_prefab_ids,
+            select_emitted_prefab_ids,
+        )
         from converter.scene_converter import _prefab_stable_id
 
         addr_block = scene_runtime.get("addressables") or {}
-        addressable_prefab_ids: set[str] = set()
-        for axis in ("by_address", "by_label"):
-            for ids in (addr_block.get(axis) or {}).values():
-                if isinstance(ids, (list, tuple, set)):
-                    addressable_prefab_ids.update(
-                        pid for pid in ids if isinstance(pid, str)
-                    )
-        # L0 (gap #5): the flat ``so_prefab_ids`` axis (see the sibling consumer
-        # in ``_generate_prefab_packages``) — read directly, not via ``.values()``.
-        _so_ids = addr_block.get("so_prefab_ids")
-        if isinstance(_so_ids, (list, tuple, set)):
-            addressable_prefab_ids.update(
-                pid for pid in _so_ids if isinstance(pid, str)
-            )
+        # Shared reader of the persisted addressables axes (see the sibling consumer
+        # in ``_generate_prefab_packages``) — incl. the L0 gap #5 ``so_prefab_ids``.
+        addressable_prefab_ids = collect_addressable_prefab_ids(addr_block)
 
         # Scope the collision domain to the EMITTED set, not the full plan's
         # ``prefabs`` block (which carries every parsed prefab).

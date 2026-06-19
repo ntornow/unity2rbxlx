@@ -228,7 +228,7 @@ def resolve_scriptable_object_addressables(
 
 def resolve_so_assetref_prefab_ids(
     so_guids: set[str],
-    guid_index: object,
+    guid_index: GuidIndexLike,
 ) -> set[str]:
     """Return the prefab ids (``"<guid>:<path>"``) reachable from the
     ``AssetReference`` / object-ref fields of every EMITTED ScriptableObject
@@ -260,8 +260,7 @@ def resolve_so_assetref_prefab_ids(
     out: set[str] = set()
     if not so_guids:
         return out
-    gi = cast(GuidIndexLike, guid_index)
-    guid_to_entry = getattr(gi, "guid_to_entry", {})
+    guid_to_entry = getattr(guid_index, "guid_to_entry", {})
 
     for so_guid in so_guids:
         entry = guid_to_entry.get(so_guid)
@@ -276,11 +275,11 @@ def resolve_so_assetref_prefab_ids(
         # and the ``guid:`` (object-ref) spellings. The shared ``.prefab`` filter
         # narrows to instantiable prefabs; non-prefab targets resolve to ``None``.
         for m in _ASSET_GUID_TOKEN.finditer(text):
-            pid = prefab_id_for_guid(m.group(1), gi)
+            pid = prefab_id_for_guid(m.group(1), guid_index)
             if pid is not None:
                 out.add(pid)
         for m in _GUID_TOKEN.finditer(text):
-            pid = prefab_id_for_guid(m.group(1), gi)
+            pid = prefab_id_for_guid(m.group(1), guid_index)
             if pid is not None:
                 out.add(pid)
     return out

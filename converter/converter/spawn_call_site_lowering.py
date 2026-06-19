@@ -78,13 +78,19 @@ class _Span:
     replacement: str
 
 
-# Each origin comment is the transpiler's deterministic marker for one C# spawn
-# call. The text is emitted verbatim for the unconverted Instantiate/LoadAsset
-# calls; we anchor on a stable SUBSTRING of it. These are the identity gates.
+# Each origin comment marker is the GENERIC Unity-API name the AI transpiler is
+# prompted to name on the ``-- ...`` origin line above an unconverted spawn call
+# (code_transpiler instructs ``-- UNCONVERTED: <Unity API> ...``). We anchor on
+# the Unity-API substring ONLY — never the game's argument/method names that
+# follow it (``premiumCollectible``/``consumable``/``cloud``/``SpawnFromAssetReference``
+# are Trash-Dash identifiers; keying on them would abstain on every other game).
+# Premium vs consumable share the SAME ``Addressables.InstantiateAsync`` marker
+# and the SAME downstream shape; they are disambiguated STRUCTURALLY (positive
+# prefab-id evidence), not by the C# arg name — see ``_locate_instantiate_async``.
 _C_SEGMENT = "AssetReference.InstantiateAsync"
 _C_OBSTACLE = "Addressables.LoadAssetAsync<GameObject>"
-_C_CONSUMABLE = "Addressables.InstantiateAsync(consumable name)"
-_C_PREMIUM = "Addressables.InstantiateAsync(premiumCollectible name)"
+_C_INSTANTIATE_ASYNC = "Addressables.InstantiateAsync"  # premium AND consumable
+_C_DIRECT_INSTANTIATE = "Instantiate("  # direct GameObject Instantiate -> :Clone() (cloud)
 
 
 # --- Per-shape span matchers (anchored, ADJACENT, capture the prefab-id expr) ---
@@ -101,41 +107,48 @@ _RE_SEGMENT = re.compile(
 _RE_SEGMENT_ZONE = re.compile(r"local (\w+) = [^\n]*\.zones\[[^\n]*\]\n")
 _RE_SEGMENT_INDEX = re.compile(r"local (\w+) = math\.random\(0, \w+ - 1\)")
 
-# OBSTACLE (inverted): ``local <v> = nil`` + ``if <v> ~= nil then`` inside
-# ``function <N>:SpawnFromAssetReference(reference, ...)``. The prefab-id is the
-# ``reference`` parameter; keep the body (uses <v>), re-bind <v>.
+# OBSTACLE (inverted): ``local <v> = nil`` + ``if <v> ~= nil then``. The prefab-id
+# is the enclosing function's FIRST parameter (the AssetReference the call loaded);
+# recovered STRUCTURALLY from the function signature / the ``local _ = <param>``
+# discard line the transpiler emits, NOT a game-specific method name.
 _RE_OBSTACLE = re.compile(
     r"(?P<ind>[ \t]*)local (?P<var>\w+) = nil\n"
     r"(?P<rest>[ \t]*if (?P=var) ~= nil then\n)"
 )
-_RE_OBSTACLE_PARAM = re.compile(r"function \w+[:.]SpawnFromAssetReference\((\w+)")
+# Generic first-parameter recovery: the function whose body holds the obstacle
+# sentinel. We anchor on the ``local _ = <param>`` discard the transpiler emits for
+# the unused asset-reference param, falling back to the nearest preceding function
+# signature's first parameter. Neither names a game-specific method.
+_RE_PARAM_DISCARD = re.compile(r"^[ \t]*local _ = (\w+)\s*$", re.MULTILINE)
+_RE_FUNC_FIRST_PARAM = re.compile(r"^[ \t]*function [\w.:]+\((\w+)", re.MULTILINE)
 
-# PREMIUM: bare ``<v> = nil`` reassign + ``if <v> == nil then warn(... <EXPR>.name)
-# return end``. The prefab-id expr is ``<EXPR>`` (a GameObject serialized as a
-# prefab-id string — themeData.premiumCollectible).
-_RE_PREMIUM = re.compile(
+# INSTANTIATE-ASYNC (premium + consumable share this): bare ``<v> = nil`` reassign +
+# ``if <v> == nil then warn(...) return end``. Both have the SAME origin marker and
+# shape; they are disambiguated by the prefab-id expr the warn/tostring path exposes
+# (positive evidence — see ``_extract_prefab_id_expr``), NOT by the C# arg name.
+_RE_INSTANTIATE_ASYNC = re.compile(
     r"(?P<ind>[ \t]*)(?P<var>\w+) = nil\n"
     r"[ \t]*if (?P=var) == nil then\n"
-    r"[ \t]*warn\(string\.format\(\"Unable to load collectable[^\n]*\n"
-    r"[ \t]*tostring\((?P<expr>[^\n]*?)\.name\)\)\)\n"
+    r"[ \t]*warn\(string\.format\((?P<warn>\"Unable to load[^\n]*\n"
+    r"[ \t]*tostring\((?P<expr>[^\n]*?)\)\)\))\n"
     r"[ \t]*return\n"
     r"[ \t]*end"
 )
 
-# CONSUMABLE (DEFERRED — detection only, D-P4-11): bare ``<v> = nil`` + warn
-# "Unable to load consumable". Matched so the deferral is counted/loud.
-_RE_CONSUMABLE = re.compile(
-    r"[ \t]*(?P<var>\w+) = nil\n"
-    r"[ \t]*if (?P=var) == nil then\n"
-    r"[ \t]*warn\(string\.format\(\"Unable to load consumable"
-)
-
-# CLOUD: ``local <v> = <expr>:Clone()`` (expr is a prefab-id string;
-# ``:Clone()`` on a string errors — D-P4-7), then ``<v>.Parent = <parent>``.
+# CLOUD (direct ``Instantiate`` -> ``:Clone()``): ``local <v> = <expr>:Clone()``
+# (expr is a prefab-id string; ``:Clone()`` on a string errors — D-P4-7), then
+# ``<v>.Parent = <parent>``. The clone shape ALONE is generic to any pooler, so the
+# rewrite is gated on a ``-- ... Instantiate( ...`` origin comment in the contiguous
+# comment block immediately above the clone (``_instantiate_comment_above``).
 _RE_CLOUD = re.compile(
     r"(?P<ind>[ \t]*)local (?P<var>\w+) = (?P<expr>[\w.]+):Clone\(\)\n"
     r"(?P<parentind>[ \t]*)(?P=var)\.Parent = (?P<parent>[^\n]+)\n"
 )
+# Adjacency window: how many contiguous comment/blank lines above the clone shape we
+# scan for the ``Instantiate(`` origin marker before giving up (codex tweak: only a
+# comment block ATTACHED to the clone counts, so an unrelated earlier comment cannot
+# leak down).
+_CLOUD_COMMENT_LOOKBACK = 3
 
 
 def _comment_present(source: str, marker: str) -> bool:
@@ -179,15 +192,41 @@ def _locate_segment(source: str) -> _Span | None:
     return _Span(m.start(), m.end(), replacement)
 
 
+def _recover_obstacle_ref(source: str, before: int) -> str | None:
+    """Recover the obstacle prefab-id expr (the loaded AssetReference) STRUCTURALLY.
+
+    The unconverted ``Addressables.LoadAssetAsync<GameObject>(<ref>)`` is the first
+    parameter of the enclosing function; the transpiler emits ``local _ = <ref>`` to
+    keep it referenced. Prefer that discard line (closest to the sentinel); else fall
+    back to the nearest preceding function signature's first parameter. Returns the
+    expr or ``None`` (fail-soft). Never keys on a game-specific method name.
+    """
+    pre = source[:before]
+    discard = list(_RE_PARAM_DISCARD.finditer(pre))
+    if discard:
+        return discard[-1].group(1)
+    # Fallback: the enclosing function's first parameter. In a dot-form method the
+    # first listed param can be the explicit ``self``/context (Lua method ``:``
+    # syntax hides ``self``, but ``function T.m(self, ref)`` lists it), which is NOT
+    # the asset-reference; fail-closed rather than bind the wrong symbol.
+    sig = list(_RE_FUNC_FIRST_PARAM.finditer(pre))
+    if sig and sig[-1].group(1) != "self":
+        return sig[-1].group(1)
+    return None
+
+
 def _locate_obstacle(source: str) -> _Span | None:
     if not _comment_present(source, _C_OBSTACLE):
         return None
-    param_m = _RE_OBSTACLE_PARAM.search(source)
-    if param_m is None:
-        return None
-    ref = param_m.group(1)
     m = _RE_OBSTACLE.search(source)
     if m is None:
+        return None
+    ref = _recover_obstacle_ref(source, m.start())
+    if ref is None:
+        logger.warning(
+            "[spawn-lowering] obstacle origin present but the asset-reference "
+            "parameter could not be recovered; fail-closed (no rewrite)."
+        )
         return None
     ind = m.group("ind")
     var = m.group("var")
@@ -200,24 +239,103 @@ def _locate_obstacle(source: str) -> _Span | None:
     return _Span(m.start(), m.end(), replacement)
 
 
-def _locate_premium(source: str) -> _Span | None:
-    if not _comment_present(source, _C_PREMIUM):
-        return None
-    m = _RE_PREMIUM.search(source)
+# A struct-flattened access (e.g. ``…[i].gameObject.Name``) names a GameObject
+# sub-field, NOT a prefab-id holder: there is no stable prefab-id expr to pass to
+# instantiatePrefab, so the site is DEFERRED (D-P4-11). A direct ``<EXPR>.name`` on a
+# prefab field IS a prefab-id holder and is rewritten. Generic, structural — keys on
+# the access SHAPE, not the C# arg name.
+_RE_STRUCT_GAMEOBJECT = re.compile(r"\.gameObject\b")
+
+
+def _extract_prefab_id_expr(tostring_inner: str) -> str | None:
+    """Positive-evidence prefab-id extraction from the warn ``tostring(<X>)`` body.
+
+    Returns the prefab-id expr iff ``<X>`` is ``<EXPR>.name``/``<EXPR>.Name`` where
+    ``<EXPR>`` is a direct prefab-id holder (a field/index access NOT routed through a
+    ``.gameObject`` struct sub-field). Otherwise returns ``None`` → DEFER. Never
+    classifies "consumable-like"; it only rewrites on positive prefab-id evidence.
+    """
+    inner = tostring_inner.strip()
+    m = re.fullmatch(r"(?P<expr>.+?)\.[Nn]ame", inner)
     if m is None:
         return None
-    ind = m.group("ind")
-    var = m.group("var")
     expr = m.group("expr").strip()
-    replacement = (
-        f"{ind}{var} = self.host.instantiatePrefab({expr}, segment.gameObject, nil)\n"
-        f"{ind}if {var} == nil then\n"
-        f"{ind}    warn(string.format(\"Unable to load collectable %s.\",\n"
-        f"{ind}        tostring({expr}.name)))\n"
-        f"{ind}    return\n"
-        f"{ind}end"
-    )
-    return _Span(m.start(), m.end(), replacement)
+    if _RE_STRUCT_GAMEOBJECT.search(expr):
+        return None  # struct-flattened (…gameObject…) — no prefab-id, defer
+    return expr
+
+
+def _instantiate_async_outcomes(source: str) -> tuple[list[_Span], int]:
+    """Classify EVERY ``Addressables.InstantiateAsync`` spawn site in ``source``.
+
+    Premium and consumable share the marker AND the ``<v> = nil``+warn-abort shape and
+    BOTH appear in the same module (consumable first in source order), so we scan ALL
+    matches — not just the first — and split them by positive prefab-id evidence:
+    a site whose warn path exposes a stable prefab-id expr is REWRITTEN (premium); one
+    that cannot (struct-flattened ``…gameObject.Name`` — consumable) is DEFERRED.
+
+    Returns ``(rewrite_spans, deferred_count)``. Empty/zero if the origin marker is
+    absent (the shape alone, without the marker, is not our site).
+    """
+    if not _comment_present(source, _C_INSTANTIATE_ASYNC):
+        return [], 0
+    spans: list[_Span] = []
+    deferred = 0
+    matches = list(_RE_INSTANTIATE_ASYNC.finditer(source))
+    if not matches:
+        logger.warning(
+            "[spawn-lowering] Addressables.InstantiateAsync origin present but no "
+            "<v>=nil+warn-abort spawn shape located; fail-closed (no rewrite)."
+        )
+        return [], 0
+    for m in matches:
+        expr = _extract_prefab_id_expr(m.group("expr"))
+        if expr is None:
+            deferred += 1  # no prefab-id expr → DEFER (consumable), counted/loud
+            continue
+        ind = m.group("ind")
+        var = m.group("var")
+        warn = m.group("warn")
+        replacement = (
+            f"{ind}{var} = self.host.instantiatePrefab({expr}, segment.gameObject, nil)\n"
+            f"{ind}if {var} == nil then\n"
+            f"{ind}    warn(string.format({warn})\n"
+            f"{ind}    return\n"
+            f"{ind}end"
+        )
+        spans.append(_Span(m.start(), m.end(), replacement))
+    return spans, deferred
+
+
+def _instantiate_comment_above(source: str, clone_start: int) -> bool:
+    """True iff a ``-- … Instantiate( …`` origin comment sits in the contiguous
+    comment block ATTACHED immediately above the clone shape at ``clone_start``.
+
+    Scans up to ``_CLOUD_COMMENT_LOOKBACK`` preceding lines; only comment (``--``) and
+    blank lines may intervene. A non-comment code line ends the block (so an unrelated
+    earlier comment cannot leak down to a generic pooler clone). This is the identity
+    gate that distinguishes the cloud spawn site from a generic ``:Clone()`` pooler.
+    """
+    pre = source[:clone_start]
+    lines = pre.splitlines()
+    scanned = 0
+    for line in reversed(lines):
+        s = line.strip()
+        if s == "":
+            continue  # blank lines inside the attached block are allowed
+        if not s.startswith("--"):
+            return False  # code line — block ends, gate fails
+        if _C_DIRECT_INSTANTIATE in s:
+            return True
+        scanned += 1
+        if scanned >= _CLOUD_COMMENT_LOOKBACK:
+            return False
+    return False
+
+
+def _has_direct_instantiate_comment(source: str) -> bool:
+    """True iff any origin comment line names a direct ``Instantiate(`` call."""
+    return _comment_present(source, _C_DIRECT_INSTANTIATE)
 
 
 def _locate_cloud(source: str) -> _Span | None:
@@ -225,6 +343,10 @@ def _locate_cloud(source: str) -> _Span | None:
         return None
     m = _RE_CLOUD.search(source)
     if m is None:
+        return None
+    if not _instantiate_comment_above(source, m.start()):
+        # No attached ``Instantiate(`` origin comment → a generic pooler clone; abstain
+        # (do NOT corrupt it into an instantiatePrefab call — the P1-1 Pooler.luau fix).
         return None
     ind = m.group("ind")
     var = m.group("var")
@@ -240,16 +362,10 @@ def _locate_cloud(source: str) -> _Span | None:
     return _Span(m.start(), m.end(), replacement)
 
 
-# The active (rewriting) site locators, applied in source order each pass.
-_LOCATORS = (_locate_segment, _locate_obstacle, _locate_premium, _locate_cloud)
-
-
-def _consumable_deferred(source: str) -> bool:
-    """True iff a consumable spawn site is present (DEFERRED — never rewritten)."""
-    return (
-        _comment_present(source, _C_CONSUMABLE)
-        and _RE_CONSUMABLE.search(source) is not None
-    )
+# Single-span site locators (segment/obstacle/cloud — one site per shape per module);
+# the InstantiateAsync sites (premium + consumable) are handled by
+# ``_instantiate_async_outcomes`` (multi-span + deferral split).
+_LOCATORS = (_locate_segment, _locate_obstacle, _locate_cloud)
 
 
 def lower_spawn_call_sites(source: str) -> tuple[str, SpawnRewriteResult]:
@@ -267,18 +383,34 @@ def lower_spawn_call_sites(source: str) -> tuple[str, SpawnRewriteResult]:
     Idempotent: a rewritten span no longer carries its sentinel, so a re-run
     re-anchors, finds no shape, and returns byte-identical source.
     """
-    deferred = 1 if _consumable_deferred(source) else 0
-    rewritten = 0
     # Collect non-overlapping spans, then splice right-to-left so earlier offsets
-    # stay valid. Each locator returns at most one span (one site per shape in the
-    # real input); if a future build emits two, the second is picked up on the
-    # idempotent re-run pass the orchestrator could repeat (out of scope here).
+    # stay valid. The single-span locators return at most one span each; the
+    # InstantiateAsync handler returns all premium rewrite spans + the consumable
+    # deferral count.
     spans: list[_Span] = []
+    cloud_span: _Span | None = None
     for locate in _LOCATORS:
         span = locate(source)
         if span is not None:
             spans.append(span)
-            rewritten += 1
+            if locate is _locate_cloud:
+                cloud_span = span
+    # Cloud fail-soft (uniform with segment/obstacle/instantiate-async): a direct
+    # ``Instantiate(`` origin comment + a live ``:Clone()`` shape, but no located cloud
+    # span, is a transpiler-shape drift — abstain LOUDLY. (``:Clone()`` is absent after
+    # a successful rewrite, so the idempotent re-run does not trip this.)
+    if (
+        cloud_span is None
+        and ":Clone()" in source
+        and _has_direct_instantiate_comment(source)
+    ):
+        logger.warning(
+            "[spawn-lowering] direct Instantiate( origin present with a live "
+            ":Clone() but no cloud spawn shape located; fail-closed (no rewrite)."
+        )
+    async_spans, deferred = _instantiate_async_outcomes(source)
+    spans.extend(async_spans)
+    rewritten = len(spans)
     spans.sort(key=lambda s: s.start, reverse=True)
     new_source = source
     for span in spans:
