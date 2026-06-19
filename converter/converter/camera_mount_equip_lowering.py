@@ -168,7 +168,13 @@ def _method_body_span(source: str, method: str) -> tuple[int, int] | None:
 
     Block-keyword balanced over code positions (long-bracket strings/comments
     skipped wholesale by ``_rig``-style scanning). ``elseif`` cancels its own
-    upcoming ``then`` so an if/elseif chain does not overrun the span."""
+    upcoming ``then`` so an if/elseif chain does not overrun the span.
+
+    FAIL CLOSED (return None) on ``>1`` code-position ``function …:<method>(``
+    declaration sharing ``method``'s name (the Luau-side analog of the C# overload
+    collapse): the rewrite site cannot be disambiguated, so the lowering edits
+    nothing (present=False) and the verifier scan does not discharge."""
+    matches: list[re.Match[str]] = []
     for m in _FUNCTION_METHOD_RE.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
             continue
@@ -176,9 +182,12 @@ def _method_body_span(source: str, method: str) -> tuple[int, int] | None:
             continue
         if m.group(2) != method:
             continue
-        body_end = _luau_block_end(source, m.start())
-        return (m.end(), body_end)
-    return None
+        matches.append(m)
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+    body_end = _luau_block_end(source, m.start())
+    return (m.end(), body_end)
 
 
 def _luau_block_end(source: str, decl_start: int) -> int:
@@ -362,9 +371,14 @@ def _statement_end(source: str, rhs_start: int) -> int:
 def _maybe_span_following_guard(
     source: str, after_assign: int, body_end: int, capvar: str
 ) -> int:
-    """If the next statement after the assignment is an ``if <capvar> then … end``
-    guard, return the index just past that guard's closing ``end`` (so the whole
-    obsolete client-side weld/placement block is excised). Otherwise return
+    """If the next statement after the assignment is the TRIVIAL obsolete weld guard
+    ``if <capvar> then … end`` — condition EXACTLY the captured local, NOTHING ELSE —
+    return the index just past that guard's closing ``end`` (so the whole obsolete
+    client-side weld/placement block is excised). A COMPOUND condition
+    (``if <capvar> and …``, ``if <capvar> ~= nil then``, etc.) is NOT spanned: it may
+    carry real post-equip logic (``if <capvar> and X then self.currentRifle = <capvar>
+    end``), so leaving it intact leaves a ``<capvar>`` read OUTSIDE the excised region
+    → the dangling_capvar check fail-closes (edit nothing). Otherwise return
     ``after_assign`` unchanged (only the assignment is replaced)."""
     j = after_assign
     n = len(source)
@@ -372,7 +386,11 @@ def _maybe_span_following_guard(
         j += 1
     if j >= body_end:
         return after_assign
-    guard_re = re.compile(r"if\s+" + re.escape(capvar) + r"\b")
+    # EXACT trivial guard only: ``if <capvar> then`` (condition == capvar alone). The
+    # ``then`` immediately following the bare capvar is the discriminator — a compound
+    # condition has another token (``and``/``~=``/``or``/``==``/``.``/``:`` …) where
+    # ``then`` would be, so it does not match and falls through to dangling_capvar.
+    guard_re = re.compile(r"if\s+" + re.escape(capvar) + r"\s+then\b")
     gm = guard_re.match(source, j)
     if gm is None or not _luau_pos_is_code(source, j):
         return after_assign

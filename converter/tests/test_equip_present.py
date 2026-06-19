@@ -360,3 +360,93 @@ def test_p1_real_contiguous_block_still_discharges() -> None:
     assert _equip_request_discharged(
         s.luau_source, "riflePrefab", "equipWeaponRemote", "GetRifle"
     ) is True
+
+
+# === P2 — equip_binding carrier load/serialize round-trip (resume path) ======
+# ``_load_equip_binding_for_rehydration`` (pipeline.py) + the serialize-save have
+# zero coverage while rig_binding/roster_binding both have loader tests. Mirrors
+# ``test_rifle_rig_retarget.test_r3_rehydrate_*``: a well-formed row restored
+# verbatim; partial/malformed dropped to {} (the safe abstain default); missing
+# plan -> {}; sub-flags preserved.
+
+
+def _pipeline_for_rehydrate(out_dir: Path):
+    from converter.pipeline import Pipeline
+    p = Pipeline.__new__(Pipeline)
+    p.output_dir = out_dir  # the only attr _load_equip_binding_for_rehydration reads
+    return p
+
+
+def _write_equip_plan(out_dir: Path, equip_binding: dict) -> None:
+    import json as _json
+    (out_dir / "conversion_plan.json").write_text(
+        _json.dumps({"equip_binding": equip_binding}), encoding="utf-8")
+
+
+def test_p2_rehydrate_load_preserves_wellformed_row(tmp_path: Path) -> None:
+    # A well-formed 4-key carrier round-trips intact (the discharge anchor + stamp
+    # survive a preserve/resume assemble).
+    carrier = {
+        "prefab": "riflePrefab", "method": "GetRifle",
+        "remote": "equipWeaponRemote", "present": True,
+    }
+    _write_equip_plan(tmp_path, {"Player": carrier})
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_equip_binding_for_rehydration() == {"Player": carrier}
+
+
+def test_p2_rehydrate_present_false_subflags_preserved(tmp_path: Path) -> None:
+    # A present=False fail-closed carrier MUST survive intact (incl. the
+    # multi_site/dangling_capvar sub-flags) so the verifier fires loud on resume —
+    # NOT get dropped to None (which would silently abstain).
+    for flag in ("multi_site", "dangling_capvar"):
+        carrier = {
+            "prefab": "riflePrefab", "method": "GetRifle",
+            "remote": "equipWeaponRemote", "present": False, flag: True,
+        }
+        _write_equip_plan(tmp_path, {"Player": carrier})
+        p = _pipeline_for_rehydrate(tmp_path)
+        assert p._load_equip_binding_for_rehydration() == {"Player": carrier}, flag
+
+
+def test_p2_rehydrate_drops_partial_row_missing_core_key(tmp_path: Path) -> None:
+    # A partial carrier (missing ``remote``) is dropped -> {} -> the verifier abstains
+    # (the safe default), NEVER a partial carrier that would anchor on a missing key.
+    _write_equip_plan(tmp_path, {"Player": {
+        "prefab": "riflePrefab", "method": "GetRifle", "present": True}})
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_equip_binding_for_rehydration() == {}
+
+
+def test_p2_rehydrate_drops_malformed_present(tmp_path: Path) -> None:
+    # ``present`` must be a real bool (not a truthy string / int) — a malformed value
+    # drops the whole row.
+    for bad in ["true", 1, None, 0]:
+        _write_equip_plan(tmp_path, {"Player": {
+            "prefab": "riflePrefab", "method": "GetRifle",
+            "remote": "equipWeaponRemote", "present": bad}})
+        p = _pipeline_for_rehydrate(tmp_path)
+        assert p._load_equip_binding_for_rehydration() == {}, bad
+
+
+def test_p2_rehydrate_drops_nonstr_prefab(tmp_path: Path) -> None:
+    _write_equip_plan(tmp_path, {"Player": {
+        "prefab": 123, "method": "GetRifle",
+        "remote": "equipWeaponRemote", "present": True}})
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_equip_binding_for_rehydration() == {}
+
+
+def test_p2_rehydrate_missing_plan_returns_empty(tmp_path: Path) -> None:
+    # No conversion_plan.json on disk -> {} (a fresh-transpile / no-resume run).
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_equip_binding_for_rehydration() == {}
+
+
+def test_p2_rehydrate_plan_without_equip_block_returns_empty(tmp_path: Path) -> None:
+    # A plan that pre-dates the equip_binding field (no ``equip_binding`` key) -> {}.
+    import json as _json
+    (tmp_path / "conversion_plan.json").write_text(
+        _json.dumps({"rig_binding": {}}), encoding="utf-8")
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_equip_binding_for_rehydration() == {}

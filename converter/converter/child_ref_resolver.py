@@ -1056,7 +1056,30 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
     distinct = set(candidates)
     if len(distinct) != 1:
         return None
+    method_name = candidates[0][0]
+    # OVERLOAD COLLAPSE (D8 abstain-on-ambiguity): the obligation is keyed by bare
+    # method NAME, but C# permits overloads sharing a name (``GetRifle(int)`` /
+    # ``GetRifle(Transform)``). If >1 C# method declaration shares the resolved
+    # ``equip_method`` name, the Luau-side lowering/verifier cannot disambiguate the
+    # rewrite site, so ABSTAIN rather than bind one arbitrary obligation.
+    if _count_cs_methods_named(source, method_name) > 1:
+        return None
     return candidates[0]
+
+
+def _count_cs_methods_named(source: str, name: str) -> int:
+    """The number of distinct C# method DECLARATIONS named ``name`` (code positions
+    only). Used to ABSTAIN on overload collapse — two ``GetRifle(…)`` overloads
+    collapse to one bare-name obligation, so the recognizer must not bind either."""
+    count = 0
+    for m in _CS_METHOD_DECL_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        if m.group(1) in _CS_NOT_A_METHOD_NAME:
+            continue
+        if m.group(1) == name:
+            count += 1
+    return count
 
 
 def _resolve_rig_facts(

@@ -478,6 +478,82 @@ def test_c2b_dangling_capvar_fails_closed() -> None:
     assert s.equip_binding.get("dangling_capvar") is True
 
 
+# === P1-A — guard-span only the TRIVIAL ``if <capvar> then`` weld guard ======
+
+
+def test_p1a_compound_guard_not_spanned_fails_closed() -> None:
+    # A following guard with REAL logic ``if rifle and self.shouldTrack then
+    # self.currentRifle = rifle end`` must NOT be spanned wholesale (it would drop
+    # the ``self.currentRifle = rifle`` logic). The compound condition is left intact
+    # -> a ``rifle`` read survives OUTSIDE the excised region -> dangling_capvar
+    # fail-closed, edit NOTHING. Pre-fix: the span consumed any ``if rifle …`` guard,
+    # silently deleting the compound guard's body.
+    src = (
+        "function Player:GetRifle()\n"
+        "    local rifle = self.host.instantiatePrefab(self.riflePrefab, slot)\n"
+        "    if rifle and self.shouldTrack then self.currentRifle = rifle end\n"
+        "    self.gotWeapon = true\n"
+        "end\n"
+        "return Player\n"
+    )
+    s = _lower(src)
+    assert s.luau_source == src  # edit NOTHING
+    assert s.equip_binding is not None
+    assert s.equip_binding["present"] is False
+    assert s.equip_binding.get("dangling_capvar") is True
+    # The compound guard's real logic survives untouched.
+    assert "self.currentRifle = rifle" in s.luau_source
+
+
+def test_p1a_trivial_guard_still_spans_and_discharges() -> None:
+    # The TRIVIAL obsolete weld guard ``if rifle then rifle:ScaleTo(..);
+    # rifle:PivotTo(..) end`` (condition EXACTLY ``rifle``, only obsolete client-side
+    # placement inside) is still spanned + discharged.
+    src = (
+        "function Player:GetRifle()\n"
+        "    local rifle = self.host.instantiatePrefab(self.riflePrefab, slot)\n"
+        "    if rifle then rifle:ScaleTo(0.2); rifle:PivotTo(slot:GetPivot()) end\n"
+        "    self.gotWeapon = true\n"
+        "end\n"
+        "return Player\n"
+    )
+    s = _lower(src)
+    assert _luau_syntax_ok(s.luau_source)
+    assert s.equip_binding is not None and s.equip_binding["present"] is True
+    assert 'FireServer("riflePrefab")' in s.luau_source
+    assert "if rifle then" not in s.luau_source  # the trivial guard was excised
+    assert "rifle:ScaleTo" not in s.luau_source
+    assert "self.gotWeapon = true" in s.luau_source
+
+
+# === P1-B — overloaded C# equip method name -> ABSTAIN (D8) ==================
+
+
+def test_p1b_overloaded_equip_method_abstains(tmp_path: Path) -> None:
+    # Two ``GetRifle(...)`` overloads share the equip name; one carries the equip
+    # shape. The obligation is keyed by bare method NAME, so the two collapse -> the
+    # recognizer must ABSTAIN (no obligation) rather than bind one arbitrary site.
+    # Pre-fix: the resolver records (GetRifle, riflePrefab).
+    src = (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    var r = Instantiate(riflePrefab);\n"
+        "    r.transform.SetParent(weaponSlot);\n"
+        "  }\n"
+        "  void GetRifle(int ammo) {\n"
+        "    Debug.Log(ammo);\n"
+        "  }\n"
+        "}\n"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    fact = entry.rig_facts[0]
+    assert fact.equip_method == "" and fact.prefab_field == ""
+
+
 # === Criterion 9 — MULTI fail-closed ========================================
 
 
