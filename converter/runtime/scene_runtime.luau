@@ -3123,6 +3123,11 @@ end
 function SceneRuntime:reequipLastWeapon(player, character)
 	local prefabId = self._lastEquip and self._lastEquip[player]
 	if not prefabId or not character then return end
+	-- Liveness guard: the bounded heal-window watcher (or a queued initial task)
+	-- can fire AFTER the character despawned; re-equipping a parent-less orphan is
+	-- wasted work + a brief leak, so no-op when the character is no longer in the
+	-- DataModel.
+	if not character.Parent then return end
 	-- Respawn path: the limbs may not be parented yet -> bounded WaitForChild.
 	self:equipWeaponOnCharacter(character, prefabId, true)
 end

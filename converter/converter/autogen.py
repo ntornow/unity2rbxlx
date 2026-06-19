@@ -1341,41 +1341,51 @@ end)
 equipWeaponRemote.Parent = RS
 -- 6. Re-equip on respawn: a NEW Character has no welded weapon, so re-run the
 --    last successful equip (remembered per-Player in step 5).
---    RIG-STABLE GATE: CharacterAdded fires while the R15 avatar is still
---    streaming, and the FIRST RightHand to appear is a TRANSIENT limb that the
---    HumanoidDescription/appearance load REPLACES a moment later. Welding to that
---    transient limb means the replacement destroys the limb -> the WeldConstraint
---    (Part0 = that limb) is destroyed -> the un-anchored weapon detaches,
---    free-falls, and is destroyed at workspace.FallenPartsDestroyHeight. So the
---    respawn re-equip waits for the appearance to finish (Player:HasAppearanceLoaded,
---    generic across R6/R15) before welding, with a BOUNDED fallback because the
---    appearance signal can be slow or absent. Run in a task.spawn so the wait never
---    stalls the CharacterAdded signal. The manual (gameplay) equip path is
---    unaffected -- it fires on a stable, already-loaded Character.
-local function reequipWhenRigStable(p, char)
-    task.spawn(function()
-        -- Bounded wait for the avatar appearance/rig to finish so the resolved
-        -- hand is the FINAL limb (not a transient one that gets replaced).
-        local waited = 0
-        while not p:HasAppearanceLoaded() and waited < 5 and char.Parent ~= nil do
-            task.wait(0.1)
-            waited = waited + 0.1
+--    SELF-HEALING MOUNT (generic across R6/R15): CharacterAdded fires while the
+--    avatar is still streaming, and a hand limb present now can be REPLACED by the
+--    HumanoidDescription/appearance load a moment later. Welding to a limb that is
+--    then replaced destroys the WeldConstraint (Part0 = the old limb) -> the
+--    un-anchored weapon detaches, free-falls, and is destroyed at
+--    workspace.FallenPartsDestroyHeight. Rather than GUESS a stable instant (an
+--    appearance signal can fire BEFORE the final limb lands, so a one-shot weld
+--    races the rig build), we re-equip whenever a hand limb ARRIVES under the
+--    Character, for a bounded window: the durable mount converges onto the FINAL
+--    limb regardless of the replacement timing. equipWeaponOnCharacter removes the
+--    prior _EquippedWeapon FIRST, so repeated re-equips are idempotent (never a
+--    duplicate weapon); on the watcher path the hand already exists, so the equip
+--    resolves immediately (no 5s poll, no concurrent-clone yield race). The manual
+--    (gameplay) equip path is unaffected -- it fires on an already-stable Character.
+local REEQUIP_HAND_LIMBS = {RightHand = true, ["Right Arm"] = true}
+local REEQUIP_HEAL_WINDOW = 10  -- seconds to watch for a post-spawn limb swap
+local function reequipOnRespawn(p, char)
+    -- Connect the limb-swap watcher FIRST so a hand arriving between CharacterAdded
+    -- and now is not missed; then the initial equip covers a hand already present.
+    -- DescendantAdded (NOT ChildAdded) matches this runtime's other limb-arrival
+    -- watchers (the late-HRP resync) and is a strict superset: a hand parented at
+    -- any depth still heals. reequipLastWeapon re-checks character liveness, so a
+    -- late fire on a despawned character is a safe no-op.
+    local conn
+    conn = char.DescendantAdded:Connect(function(child)
+        if REEQUIP_HAND_LIMBS[child.Name] then
+            task.spawn(function() engine:reequipLastWeapon(p, char) end)
         end
-        if char.Parent == nil then return end  -- char despawned while waiting
-        engine:reequipLastWeapon(p, char)
     end)
+    task.delay(REEQUIP_HEAL_WINDOW, function()
+        if conn then conn:Disconnect() end
+    end)
+    task.spawn(function() engine:reequipLastWeapon(p, char) end)
 end
 Players.PlayerAdded:Connect(function(p)
     p.CharacterAdded:Connect(function(char)
-        reequipWhenRigStable(p, char)
+        reequipOnRespawn(p, char)
     end)
 end)
 for _, p in Players:GetPlayers() do
     if p.Character then
-        reequipWhenRigStable(p, p.Character)
+        reequipOnRespawn(p, p.Character)
     end
     p.CharacterAdded:Connect(function(char)
-        reequipWhenRigStable(p, char)
+        reequipOnRespawn(p, char)
     end)
 end'''
 

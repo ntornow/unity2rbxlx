@@ -542,6 +542,7 @@ class TestReequipOnRespawn:
         _assert_ok(textwrap.dedent("""\
             local player = {}
             local character = mockInst("Character", "Model")
+            character.Parent = mockInst("workspace", "Folder")  -- live (respawn) char
             -- R6: "Right Arm" present now, no "RightHand", and none will arrive.
             local rightArm = mockInst("Right Arm", "Part")
             rightArm.CFrame = "armCF"
@@ -589,6 +590,7 @@ class TestReequipOnRespawn:
         _assert_ok(textwrap.dedent("""\
             local player = {}  -- opaque per-player key
             local character = mockInst("Character", "Model")
+            character.Parent = mockInst("workspace", "Folder")  -- live (respawn) char
             -- RightHand is NOT a child yet; it "arrives" once the poll has
             -- yielded 3 times (modelling the limb landing a few frames later).
             local rightHand = mockInst("RightHand", "Part")
@@ -633,6 +635,7 @@ class TestReequipOnRespawn:
         _assert_ok(textwrap.dedent("""\
             local player = {}
             local character = mockInst("Character", "Model")  -- no hand ever
+            character.Parent = mockInst("workspace", "Folder")  -- live (respawn) char
             local engine = SceneRuntime.new(
                 equipServices(function() return mockInst("g", "Part") end),
                 {equip_prefabs = {riflePrefab = "p"}})
@@ -642,6 +645,29 @@ class TestReequipOnRespawn:
             assert(#createdWelds() == before, "no weld when the hand never arrives")
             assert(character:FindFirstChild("_EquippedWeapon") == nil,
                 "no weapon parented when the hand never arrives")
+            print("OK")
+        """))
+
+    def test_reequip_no_op_on_despawned_character(self):
+        # Liveness guard: a heal-window task that fires AFTER the character left the
+        # DataModel (Parent == nil) must no-op — no weld, no orphan weapon — even
+        # though the hand is present, so a stale watcher fire is harmless.
+        _assert_ok(textwrap.dedent("""\
+            local player = {}
+            local character = mockInst("Character", "Model")
+            -- Despawned: NOT parented to the DataModel.
+            character.Parent = nil
+            local rightHand = mockInst("RightHand", "Part")
+            addChild(character, rightHand)  -- hand present, but char is orphaned
+            local engine = SceneRuntime.new(
+                equipServices(function() return mockInst("g", "Part") end),
+                {equip_prefabs = {riflePrefab = "p"}})
+            engine:rememberEquip(player, "p")
+            local before = #createdWelds()
+            engine:reequipLastWeapon(player, character)
+            assert(#createdWelds() == before, "no weld on a despawned character")
+            assert(character:FindFirstChild("_EquippedWeapon") == nil,
+                "no orphan weapon parented on a despawned character")
             print("OK")
         """))
 

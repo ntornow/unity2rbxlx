@@ -83,6 +83,21 @@ class TestHandlerDelegatesToEngine:
         # Remembered on a successful equip so respawn re-equips.
         assert "engine:rememberEquip(player, prefabId)" in src
 
+    def test_respawn_reequip_is_self_healing_on_limb_swap(self):
+        # Bug-1 fix: the respawn re-equip must NOT one-shot weld at a guessed-stable
+        # instant (the appearance signal can fire before the final hand limb lands).
+        # It watches for a hand limb ARRIVING under the Character and re-equips, so a
+        # transient limb that gets replaced is healed onto the final limb.
+        src = _server_source()
+        # DescendantAdded (matches the runtime's late-HRP watcher; depth-robust).
+        assert "char.DescendantAdded:Connect" in src, "limb-swap watcher must be wired"
+        assert "RightHand" in src and "Right Arm" in src, \
+            "watcher must cover R15 (RightHand) and R6 (Right Arm) hand limbs"
+        # The old appearance-gate one-shot was flagged (gates the wrong event) and
+        # must be gone.
+        assert "HasAppearanceLoaded" not in src, \
+            "the appearance-load gate (wrong event) must be removed"
+
 
 # ---------------------------------------------------------------------------
 # Criterion 3 — client-only _services injection parity
