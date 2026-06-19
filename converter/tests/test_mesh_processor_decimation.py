@@ -58,6 +58,40 @@ class TestRobloxFaceCap:
         assert floored < config.MESH_ROBLOX_MAX_FACES  # precondition
         assert effective == floored == 12_000
 
+    def test_clamp_is_wired_into_production_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC 2 (regression guard, backend-INDEPENDENT): the clamp must actually
+        # be applied to the value decimate_mesh hands the backend, not just be a
+        # truth recomputed in the test. Spy on simplify_quadric_decimation to
+        # capture the target it receives -- no quadric backend needed (the spy
+        # raises to take the export-original fallback). Pre-fix code (max only,
+        # no min-cap) would pass the floored target (overshoots the cap) and
+        # FAIL this assertion; post-fix passes the cap.
+        import converter.mesh_processor as mp
+
+        sphere = _high_poly_sphere(2000)
+        original_faces = len(sphere.faces)
+        src = tmp_path / "clamp_wired.obj"
+        sphere.export(str(src))
+
+        cap = int(original_faces * 0.5)  # 50% < 60% floor -> floored overshoots cap
+        floored = int(original_faces * mp.MESH_QUALITY_FLOOR)
+        assert floored > cap  # precondition: floor would overshoot the cap
+        monkeypatch.setattr(mp, "MESH_ROBLOX_MAX_FACES", cap)
+
+        captured: dict[str, int] = {}
+
+        def _spy(self: "trimesh.Trimesh", target: int) -> "trimesh.Trimesh":
+            captured["target"] = target
+            raise RuntimeError("backend disabled for spy")
+
+        monkeypatch.setattr(trimesh.Trimesh, "simplify_quadric_decimation", _spy)
+
+        # target tiny -> ratio below floor -> floor branch fires -> clamp to cap.
+        decimate_mesh(src, target_faces=10)
+        assert captured["target"] == cap  # clamped, not the floored overshoot
+
 
 def _high_poly_sphere(face_count: int) -> "trimesh.Trimesh":
     """A sphere with at least `face_count` faces (uses icosphere subdivision)."""
