@@ -2499,3 +2499,179 @@ class TestStrippedRefRealPlan:
                 if found:
                     break
             assert found, (src, field, target)
+
+
+# ---------------------------------------------------------------------------
+# Gap #3 — never-placed dormant-holder descendant suppression (slice 4.2)
+# ---------------------------------------------------------------------------
+
+class TestDormantHolderDescendantSuppression:
+    """The scene-runtime planner must NOT emit a component instance row for a
+    MonoBehaviour whose host GameObject has an INACTIVE ANCESTOR.
+
+    ``scene_converter`` prunes an inactive GameObject's children in every mode
+    (legacy prunes the whole subtree; generic emits the inactive node as a
+    CHILDLESS dormant holder — ``_emit_dormant_holder`` never recurses), so
+    such a host is never placed in the workspace. A row bound to it makes the
+    host runtime ``workspaceFind`` a missing GameObject → ``self.gameObject =
+    nil`` → ``connectGameObjectTriggerSignal: no touch part on nil`` at boot
+    (gap #3). The host node's OWN inactive flag does NOT suppress — an
+    inactive-but-referenced node still gets its dormant holder, so its own
+    MonoBehaviour rows resolve to that holder.
+    """
+
+    def _idx(self, tmp_path: Path, guid: str, stem: str) -> GuidIndex:
+        scripts = tmp_path / "Assets" / "Scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        cs = scripts / f"{stem}.cs"
+        cs.write_text(f"public class {stem} : MonoBehaviour {{ }}")
+        return _make_guid_index(tmp_path, {guid: (cs, "script")})
+
+    def test_descendant_of_inactive_ancestor_row_suppressed(self, tmp_path: Path):
+        # Mirrors the real bug: CharacterCollider (active GO "CharacterSlot")
+        # under an INACTIVE parent ("PlayerPivot"). The collider row must NOT
+        # be emitted because CharacterSlot is never placed.
+        guid = "a" * 32
+        idx = self._idx(tmp_path, guid, "CharacterCollider")
+
+        # active child host with a MonoBehaviour, under an inactive parent.
+        slot = _node("CharacterSlot", "CharacterSlot", active=True, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="200",
+                properties=_mb_props(guid, go_fid="CharacterSlot"),
+            )
+        ])
+        pivot = _node("PlayerPivot", "PlayerPivot", active=False, children=[slot])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity", roots=[pivot],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        block = artifact["scenes"]["Assets/Scenes/Main.unity"]
+        # No dangling row bound to the never-placed CharacterSlot.
+        slot_id = "Assets/Scenes/Main.unity:CharacterSlot"
+        assert all(i["game_object_id"] != slot_id for i in block["instances"])
+        assert block["instances"] == []
+        assert block["references"] == []
+        assert block["lifecycle_order"] == []
+        # AC7 corollary: the module is still emitted (runtime_bearing) so the
+        # class can run on a runtime-instantiated rig — only the dangling row
+        # is dropped.
+        assert artifact["modules"][guid]["runtime_bearing"] is True
+
+    def test_inactive_node_itself_still_emits_row(self, tmp_path: Path):
+        # An inactive node with NO inactive ancestor keeps its row: it becomes
+        # a dormant holder stamped with its own _SceneRuntimeId, so its own
+        # MonoBehaviour binds to that holder. (Self-inactive != ancestor-inactive.)
+        guid = "b" * 32
+        idx = self._idx(tmp_path, guid, "Popup")
+        node = _node("10", "Popup", active=False, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="20",
+                properties=_mb_props(guid, go_fid="10"),
+            )
+        ])
+        scene = _scene(tmp_path / "Assets" / "Scenes" / "S.unity", roots=[node])
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        insts = artifact["scenes"]["Assets/Scenes/S.unity"]["instances"]
+        assert len(insts) == 1
+        assert insts[0]["game_object_id"] == "Assets/Scenes/S.unity:10"
+        assert insts[0]["active"] is False
+
+    def test_active_descendant_of_active_ancestor_emits_row(self, tmp_path: Path):
+        # A normally-placed trigger: active host with an all-active ancestor
+        # chain still emits its row (no over-suppression).
+        guid = "c" * 32
+        idx = self._idx(tmp_path, guid, "Trigger")
+        child = _node("child", "TriggerGO", active=True, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="20",
+                properties=_mb_props(guid, go_fid="child"),
+            )
+        ])
+        parent = _node("parent", "ActiveParent", active=True, children=[child])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity", roots=[parent],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        insts = artifact["scenes"]["Assets/Scenes/Main.unity"]["instances"]
+        assert len(insts) == 1
+        assert insts[0]["game_object_id"] == "Assets/Scenes/Main.unity:child"
+
+    def test_inactive_subtree_does_not_suppress_active_sibling(self, tmp_path: Path):
+        # Edge: a dormant holder with active descendants ELSEWHERE. An inactive
+        # branch suppresses only ITS OWN descendants; an active sibling subtree
+        # under the same active root still emits its rows.
+        dead_guid = "d" * 32
+        live_guid = "e" * 32
+        idx = self._idx(tmp_path, dead_guid, "DeadMono")
+        # add the second script to the same index
+        scripts = tmp_path / "Assets" / "Scripts"
+        cs2 = scripts / "LiveMono.cs"
+        cs2.write_text("public class LiveMono : MonoBehaviour { }")
+        idx = _make_guid_index(
+            tmp_path,
+            {dead_guid: (scripts / "DeadMono.cs", "script"),
+             live_guid: (cs2, "script")},
+        )
+
+        dead_child = _node("deadchild", "DeadChild", active=True, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="200",
+                properties=_mb_props(dead_guid, go_fid="deadchild"),
+            )
+        ])
+        inactive_branch = _node(
+            "inactive", "InactiveBranch", active=False, children=[dead_child],
+        )
+        live = _node("live", "LiveGO", active=True, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="300",
+                properties=_mb_props(live_guid, go_fid="live"),
+            )
+        ])
+        root = _node("root", "Root", active=True, children=[inactive_branch, live])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity", roots=[root],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        insts = artifact["scenes"]["Assets/Scenes/Main.unity"]["instances"]
+        gids = {i["game_object_id"] for i in insts}
+        # active sibling under an active root emits; dead branch's descendant
+        # is suppressed.
+        assert "Assets/Scenes/Main.unity:live" in gids
+        assert "Assets/Scenes/Main.unity:deadchild" not in gids
+
+    def test_deep_descendant_of_inactive_ancestor_suppressed(self, tmp_path: Path):
+        # The inactive ancestor need not be the immediate parent — any inactive
+        # ancestor anywhere up the chain suppresses the row.
+        guid = "f" * 32
+        idx = self._idx(tmp_path, guid, "DeepMono")
+        leaf = _node("leaf", "Leaf", active=True, components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="20",
+                properties=_mb_props(guid, go_fid="leaf"),
+            )
+        ])
+        mid = _node("mid", "Mid", active=True, children=[leaf])
+        top_inactive = _node("top", "TopInactive", active=False, children=[mid])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity", roots=[top_inactive],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        block = artifact["scenes"]["Assets/Scenes/Main.unity"]
+        assert block["instances"] == []
