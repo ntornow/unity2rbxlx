@@ -2442,10 +2442,11 @@ def _equip_request_discharged(
       (3) NO surviving ``instantiatePrefab(<prefab>)`` camera-mount equip call
           remains (the request REPLACED it, not added alongside).
     Delegates to the producer's shared ``equip_request_discharged_in_span`` so
-    producer + checker apply the EXACT same predicate. ``remote`` is accepted for
-    signature symmetry / future use; the discharge anchors on the marker + the
-    ``FireServer("<prefab>")`` shape, both deterministic."""
-    if not prefab or not method:
+    producer + checker apply the EXACT same predicate. ``remote`` is LOAD-BEARING
+    (round-2 P1-1): the request must fire on an alias bound to the carrier's OWN
+    ``self._services.<remote>`` — a ``FireServer("<prefab>")`` on a DIFFERENT
+    remote/alias does NOT discharge."""
+    if not prefab or not method or not remote:
         return False
     span = _equip_method_body_span(source, method)
     if span is None:
@@ -2453,7 +2454,9 @@ def _equip_request_discharged(
     from converter.camera_mount_equip_lowering import (
         equip_request_discharged_in_span,
     )
-    return equip_request_discharged_in_span(source, span[0], span[1], prefab)
+    return equip_request_discharged_in_span(
+        source, span[0], span[1], prefab, remote
+    )
 
 
 def _check_equip_present(

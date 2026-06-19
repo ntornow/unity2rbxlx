@@ -238,3 +238,69 @@ def test_discharge_scan_directly_false_on_undischarged() -> None:
     assert _equip_request_discharged(
         s.luau_source, "riflePrefab", "equipWeaponRemote", "GetRifle"
     ) is True
+
+
+# === Round-2 P1-1: discharge is REMOTE-bound (FireServer on a foreign remote fails)
+
+
+# A method that carries the own-emit marker + a same-prefab FireServer, BUT the
+# alias is bound to a DIFFERENT service and the prefab is fired on THAT alias.
+# Pre-fix this verified CLEAN (the marker + bare FireServer("riflePrefab") were the
+# only requirements); the fix ties the FireServer to the carrier's own-remote
+# binding, so this must FAIL discharge.
+_FOREIGN_REMOTE_GETRIFLE = """local Player = {}
+Player.__index = Player
+
+function Player:GetRifle()
+    -- _EQUIP_REQUEST_riflePrefab (auto: camera-mount equip lowered to server request)
+    local otherRemote = self._services and self._services.notEquipRemote
+    if otherRemote and otherRemote.FireServer then
+        otherRemote:FireServer("riflePrefab")
+    end
+    self.gotWeapon = true
+end
+
+return Player
+"""
+
+
+def test_p1_1_fireserver_on_foreign_remote_fails_discharge() -> None:
+    # The attack codex confirmed: marker + FireServer("riflePrefab") present, but
+    # fired on an alias bound to a NON-equip remote -> NOT discharged.
+    assert _equip_request_discharged(
+        _FOREIGN_REMOTE_GETRIFLE, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is False
+    # And it fails the full verifier even with a forged present=True stamp.
+    script = _rbx("Player", _FOREIGN_REMOTE_GETRIFLE, _carrier(present=True))
+    rows = _equip_rows([script])
+    assert len(rows) == 1
+    assert "discharged=False" in rows[0].detail
+
+
+def test_p1_1_carrier_remote_threaded_to_predicate() -> None:
+    # The real lowered output discharges only when checked against ITS own remote
+    # (equipWeaponRemote). Checking against a DIFFERENT remote name (as if the
+    # carrier recorded another remote) must NOT discharge — proving the carrier's
+    # `remote` is load-bearing, not ignored.
+    s = _lowered_player()
+    assert _equip_request_discharged(
+        s.luau_source, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is True
+    assert _equip_request_discharged(
+        s.luau_source, "riflePrefab", "someOtherRemote", "GetRifle"
+    ) is False
+
+
+def test_p1_1_marker_present_but_no_alias_binding_fails() -> None:
+    # Marker + a bare FireServer with NO `local <alias> = self._services...` binding
+    # at all -> not discharged (the request must fire on a proven own-remote alias).
+    src = """function Player:GetRifle()
+    -- _EQUIP_REQUEST_riflePrefab (auto: camera-mount equip lowered to server request)
+    someGlobal:FireServer("riflePrefab")
+    self.gotWeapon = true
+end
+return Player
+"""
+    assert _equip_request_discharged(
+        src, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is False

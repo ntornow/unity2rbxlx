@@ -278,6 +278,113 @@ def test_c8_setparent_onto_different_slot_abstains(tmp_path: Path) -> None:
     assert entry.rig_facts[0].equip_method == ""
 
 
+# === Round-2 P1-2: the PARENTED object must be the INSTANTIATED one =========
+
+
+def test_p1_2_setparent_of_different_object_abstains(tmp_path: Path) -> None:
+    # ``fx = Instantiate(riflePrefab)`` but ``existingWeapon.SetParent(weaponSlot)``
+    # parents a DIFFERENT object. Pre-fix this credited (GetRifle, riflePrefab); the
+    # fix requires the SetParent receiver to be the Instantiate result -> ABSTAIN.
+    src = (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  GameObject existingWeapon;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    var fx = Instantiate(riflePrefab);\n"
+        "    existingWeapon.transform.SetParent(weaponSlot);\n"
+        "  }\n"
+        "}\n"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert entry.rig_facts[0].equip_method == ""
+    assert entry.rig_facts[0].prefab_field == ""
+
+
+def test_p1_2_chained_instantiate_setparent_fires(tmp_path: Path) -> None:
+    # The directly-chained form: Instantiate(prefab).transform.SetParent(slot) —
+    # the parented object IS the result by construction. Must FIRE.
+    src = (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    Instantiate(riflePrefab).transform.SetParent(weaponSlot);\n"
+        "  }\n"
+        "}\n"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert (entry.rig_facts[0].equip_method,
+            entry.rig_facts[0].prefab_field) == ("GetRifle", "riflePrefab")
+
+
+def test_p1_2_bound_symbol_setparent_via_transform_fires(tmp_path: Path) -> None:
+    # The real GetRifle shape: var r = Instantiate(riflePrefab);
+    # r.transform.SetParent(weaponSlot) — the receiver base symbol (r) IS the bound
+    # Instantiate result. Must FIRE. (This is also c1's shape; pinned explicitly.)
+    src = (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    var r = Instantiate(riflePrefab);\n"
+        "    r.transform.SetParent(weaponSlot);\n"
+        "  }\n"
+        "}\n"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert (entry.rig_facts[0].equip_method,
+            entry.rig_facts[0].prefab_field) == ("GetRifle", "riflePrefab")
+
+
+def test_p1_2_bound_symbol_direct_setparent_fires(tmp_path: Path) -> None:
+    # var r = Instantiate(riflePrefab); r.SetParent(weaponSlot) (no .transform).
+    src = (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    var r = Instantiate(riflePrefab);\n"
+        "    r.SetParent(weaponSlot);\n"
+        "  }\n"
+        "}\n"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert (entry.rig_facts[0].equip_method,
+            entry.rig_facts[0].prefab_field) == ("GetRifle", "riflePrefab")
+
+
+def test_p1_2_unbound_instantiate_then_setparent_other_var_abstains(
+    tmp_path: Path,
+) -> None:
+    # No binding at all: Instantiate(riflePrefab) (result discarded) on one line,
+    # r.transform.SetParent(weaponSlot) where r was never the Instantiate result.
+    src = (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  Transform r;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    Instantiate(riflePrefab);\n"
+        "    r.SetParent(weaponSlot);\n"
+        "  }\n"
+        "}\n"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    # The Instantiate result is never bound to ``r`` -> parented object unproven.
+    assert entry.rig_facts[0].equip_method == ""
+
+
 def test_c8_instantiate_setparent_in_different_methods_abstains(
     tmp_path: Path,
 ) -> None:
@@ -451,3 +558,47 @@ def test_committed_fixture_player_carries_lowered_equip() -> None:
     assert eb["method"] == "GetRifle"
     assert 'FireServer("riflePrefab")' in player["source"]
     assert "instantiatePrefab(self.riflePrefab" not in player["source"]
+
+
+def test_committed_fixture_player_is_real_lowering_fixed_point() -> None:
+    """PROVABILITY (round-2 P1-3b): the committed fixture's Player equip block is a
+    genuine FIXED POINT of the REAL production lowering, not a hand-fabrication that
+    merely looks lowered. Drive the actual ``lower_camera_mount_equip`` (with the
+    obligation the REAL Player.cs yields) over the committed source: it must be a
+    no-op (already discharged, own-emit marker recognized) AND re-stamp
+    ``present=True`` with the exact carrier — i.e. running production code over the
+    fixture reproduces the fixture. A hand-edit that diverged from the lowering's
+    output (different marker, alias name, or guard shape) would FAIL this idempotency
+    check."""
+    fixture = (
+        Path(__file__).parent
+        / "fixtures" / "contract_corpus" / "SimpleFPS" / "fixture.json"
+    )
+    if not fixture.exists():
+        pytest.skip("SimpleFPS corpus fixture not committed")
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    player = next((s for s in data["scripts"] if s.get("name") == "Player"), None)
+    assert player is not None
+    committed_eb = player["equip_binding"]
+    s = _Script(player["source"])
+    n = lower_camera_mount_equip(
+        [s],
+        _equip_map(
+            field="weaponSlot", child="WeaponSlot",
+            equip_method=committed_eb["method"],
+            prefab_field=committed_eb["prefab"],
+            path="/proj/Player.cs",
+        ),
+    )
+    # No-op: the committed source already carries the lowering's own output.
+    assert n == 0
+    assert s.luau_source == player["source"], (
+        "the real lowering changed the committed fixture's Player source — the "
+        "committed source is NOT the lowering's output (hand-fabricated?). "
+        "Re-run the equip-fixture regen."
+    )
+    assert s.equip_binding is not None
+    assert s.equip_binding["present"] is True
+    assert s.equip_binding["prefab"] == committed_eb["prefab"]
+    assert s.equip_binding["method"] == committed_eb["method"]
+    assert s.equip_binding["remote"] == committed_eb["remote"]

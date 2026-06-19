@@ -145,20 +145,40 @@ _CS_CAM_GETCHILD_RE = re.compile(
 
 
 # --- Equip-obligation matchers (Phase 1) ----------------------------------
-# An ``Instantiate(<prefab>, …)`` call whose FIRST argument is a bare or
-# ``this.``-qualified field identifier (the prefab to spawn). Group 1 is the
-# optional ``this.`` qualifier; group 2 is the bare field name. A first arg that
-# is a literal / call / foreign member access (``Instantiate(new GameObject())``,
-# ``Instantiate(a.b)``) does NOT match group 2 as a lone field -> ABSTAIN (D11).
-_CS_INSTANTIATE_PREFAB_RE = re.compile(
-    r"\bInstantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*(?:[,)])"
+# A first ``Instantiate`` arg that is a literal / call / foreign member access
+# (``Instantiate(new GameObject())``, ``Instantiate(a.b)``) is NOT a lone bare /
+# ``this.``-field prefab -> the bind/chain matchers below do not capture it as a
+# prefab field -> ABSTAIN (D11).
+#
+# A ``<receiver>.SetParent(<slot>)`` call. Group 1 is the FULL receiver chain text
+# preceding ``.SetParent`` (e.g. ``r``, ``r.transform``, ``this.r.transform``);
+# group 2 is the ``<slot>`` argument text. The resolver (a) compares the slot
+# against the recognized rig ``field`` AND (b) binds the receiver back to the
+# Instantiate result symbol — proving the PARENTED object IS the instantiated one
+# (round-2 P1-2). The receiver class is captured greedily as a dotted/`this.` chain.
+_CS_SETPARENT_RE = re.compile(
+    r"\b((?:this\.)?[A-Za-z_][\w.]*?)\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
 )
 
-# A ``<x>.SetParent(<slot>)`` / ``<x>.transform.SetParent(<slot>)`` call. Group 1
-# is the ``<slot>`` argument text — a bare field, a ``this.``-qualified field, or
-# a dotted access; the resolver compares it against the recognized rig ``field``.
-_CS_SETPARENT_RE = re.compile(
-    r"\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
+# A directly-chained ``Instantiate(<prefab>)[.transform].SetParent(<slot>)`` —
+# the result symbol is implicit (never bound to a var). Group 1 = optional
+# ``this.`` on the prefab, group 2 = the bare prefab field, group 3 = the slot arg.
+# The optional ``.transform`` between the call and ``.SetParent`` is allowed (and
+# nothing else — a foreign member access breaks the chain -> no match).
+_CS_INSTANTIATE_CHAIN_SETPARENT_RE = re.compile(
+    r"\bInstantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*\)"
+    r"(?:\.transform)?\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
+)
+
+# The Instantiate-result binding ``[var] <sym> = Instantiate(<prefab>, …)`` —
+# binds the spawned object to a local/field ``<sym>`` so a later
+# ``<sym>[.transform].SetParent(<slot>)`` can be proven to parent THAT object.
+# Group 1 = ``<sym>`` (the bound symbol), group 2 = optional ``this.`` on the
+# prefab, group 3 = the bare prefab field. ``var``/a type prefix is optional.
+_CS_INSTANTIATE_BIND_RE = re.compile(
+    r"\b(?:var\s+|[A-Za-z_][\w.<>]*\s+)?"
+    r"(this\.[A-Za-z_]\w*|[A-Za-z_]\w*)\s*=\s*"
+    r"Instantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*(?:[,)])"
 )
 
 # A C# method declaration header ``<modifiers/ret> <Name>(…)`` immediately
@@ -945,6 +965,19 @@ def _cs_block_end(source: str, open_brace_idx: int) -> int | None:
     return None
 
 
+def _setparent_receiver_base(receiver: str) -> str:
+    """The base symbol of a SetParent receiver chain — strip a trailing
+    ``.transform`` and a leading ``this.``, leaving the spawned-object symbol so it
+    can be matched against the Instantiate-result binding. ``r`` / ``r.transform``
+    / ``this.r.transform`` all reduce to ``r``."""
+    base = receiver
+    if base.endswith(".transform"):
+        base = base[: -len(".transform")]
+    if base.startswith("this."):
+        base = base[len("this.") :]
+    return base
+
+
 def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None:
     """For an admitted rig fact on C# field ``field``, return
     ``(equip_method, prefab_field)`` iff the script contains the UNAMBIGUOUS
@@ -952,40 +985,71 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
 
     Unambiguous shape (ALL required, code-position-aware, in the SAME C# method):
       1. an ``Instantiate(<prefabField>, …)`` whose first arg is a bare /
-         ``this.``-field identifier (the prefab), AND
-      2. a ``<x>.SetParent(<slot>)`` whose ``<slot>`` is EXACTLY the recognized rig
-         ``field`` (bare or ``this.``-qualified), AND
-      3. both calls in the SAME enclosing method ``M``.
+         ``this.``-field identifier (the prefab), bound to a result symbol
+         ``<sym>`` (``[var] <sym> = Instantiate(<prefab>)``) OR directly chained
+         (``Instantiate(<prefab>)[.transform].SetParent(...)``), AND
+      2. a ``<receiver>.SetParent(<slot>)`` whose ``<slot>`` is EXACTLY the
+         recognized rig ``field`` (bare or ``this.``-qualified) AND whose
+         ``<receiver>`` base symbol IS that same ``<sym>`` — i.e. the PARENTED
+         object is provably the INSTANTIATED one (round-2 P1-2), AND
+      3. both in the SAME enclosing method ``M``.
 
     ABSTAIN (None) on: no qualifying Instantiate; a SetParent whose slot is not
-    ``field``; the two calls in DIFFERENT methods; ``>1`` distinct qualifying
-    method (ambiguous — §Edge f); an unresolvable prefab arg (literal/call/foreign
-    member access — D11). Pure; code-position-aware; keyed entirely on the C#
-    ``field`` already proven to be the MainCamera-child slot."""
+    ``field``; a SetParent whose receiver is NOT the Instantiate result (parents a
+    DIFFERENT object — round-2 P1-2); the two in DIFFERENT methods; ``>1`` distinct
+    qualifying method (ambiguous — §Edge f); an unresolvable prefab arg (D11).
+    Pure; code-position-aware; keyed entirely on the C# ``field`` already proven to
+    be the MainCamera-child slot."""
     # Find every SetParent(slot) whose slot is EXACTLY ``field`` (the rig slot),
-    # bucketed by enclosing method.
-    setparent_methods: dict[str, tuple[int, int]] = {}
+    # capturing the receiver base symbol + enclosing method.
+    # method -> list of (receiver_base_symbol, body_open, body_close)
+    setparent_hits: dict[str, list[tuple[str, int, int]]] = {}
     for m in _CS_SETPARENT_RE.finditer(source):
         if not _cs_pos_is_code(source, m.start()):
             continue
-        slot = m.group(1)
+        slot = m.group(2)
         if slot != field and slot != f"this.{field}":
             continue  # SetParent onto a different slot -> not this obligation
         enc = _enclosing_cs_method(source, m.start())
         if enc is None:
             continue
-        setparent_methods[enc[0]] = (enc[1], enc[2])
-    if not setparent_methods:
+        recv_base = _setparent_receiver_base(m.group(1))
+        setparent_hits.setdefault(enc[0], []).append((recv_base, enc[1], enc[2]))
+    if not setparent_hits:
         return None  # no SetParent onto the rig slot -> abstain
 
-    # For each such method, find a qualifying Instantiate(<prefabField>) within the
-    # SAME method body. Collect the (method, prefab_field) candidates.
     candidates: list[tuple[str, str]] = []
-    for method, (body_open, body_close) in setparent_methods.items():
-        prefab = _instantiate_prefab_in_span(source, body_open, body_close)
-        if prefab is None:
-            continue  # no resolvable held-prefab Instantiate in this method -> skip
-        candidates.append((method, prefab))
+    for method, hits in setparent_hits.items():
+        body_open, body_close = hits[0][1], hits[0][2]
+        # (A) Directly-chained Instantiate(prefab)[.transform].SetParent(field) —
+        # the parented object IS the instantiate result by construction.
+        chain_prefabs: set[str] = set()
+        for cm in _CS_INSTANTIATE_CHAIN_SETPARENT_RE.finditer(
+            source, body_open, body_close
+        ):
+            if not _cs_pos_is_code(source, cm.start()):
+                continue
+            cslot = cm.group(3)
+            if cslot != field and cslot != f"this.{field}":
+                continue
+            chain_prefabs.add(cm.group(2))
+        # (B) Symbol-bound: <sym> = Instantiate(prefab) where <sym> is the base
+        # symbol parented by one of this method's SetParent(field) receivers.
+        bind_prefabs: set[str] = set()
+        receiver_bases = {h[0] for h in hits}
+        for bm in _CS_INSTANTIATE_BIND_RE.finditer(source, body_open, body_close):
+            if not _cs_pos_is_code(source, bm.start()):
+                continue
+            sym_base = _setparent_receiver_base(bm.group(1))
+            if sym_base not in receiver_bases:
+                continue  # this Instantiate binds a DIFFERENT symbol -> not it
+            bind_prefabs.add(bm.group(3))
+        method_prefabs = chain_prefabs | bind_prefabs
+        if len(method_prefabs) != 1:
+            # zero -> the parented object isn't a proven Instantiate result (the
+            # over-broad false-positive P1-2 fixes); >1 -> ambiguous. Abstain.
+            continue
+        candidates.append((method, next(iter(method_prefabs))))
 
     # >1 distinct qualifying (method, prefab) -> ambiguous obligation -> ABSTAIN
     # (the single carrier holds one obligation; bias to the recognizer's abstain).
@@ -993,23 +1057,6 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
     if len(distinct) != 1:
         return None
     return candidates[0]
-
-
-def _instantiate_prefab_in_span(
-    source: str, span_start: int, span_end: int
-) -> str | None:
-    """The bare prefab-field name of the UNIQUE ``Instantiate(<prefabField>, …)``
-    whose first arg is a resolvable bare/``this.`` field, within
-    ``source[span_start:span_end]`` (code positions only). None if there is no such
-    call, or MORE THAN ONE distinct prefab field (ambiguous within the method)."""
-    prefabs: set[str] = set()
-    for m in _CS_INSTANTIATE_PREFAB_RE.finditer(source, span_start, span_end):
-        if not _cs_pos_is_code(source, m.start()):
-            continue
-        prefabs.add(m.group(2))
-    if len(prefabs) != 1:
-        return None  # zero (abstain) or ambiguous (multiple distinct prefab fields)
-    return next(iter(prefabs))
 
 
 def _resolve_rig_facts(
