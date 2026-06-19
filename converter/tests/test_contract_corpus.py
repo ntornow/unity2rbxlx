@@ -265,6 +265,78 @@ def test_corpus_exercises_rig_binding_present_check() -> None:
         )
 
 
+@pytest.mark.skipif(not _FIXTURES, reason="no contract-corpus fixtures committed yet")
+def test_corpus_exercises_equip_present_check() -> None:
+    """The equip_present FAIL_CLOSED check must be corpus-EXERCISED, not vacuously
+    green by abstain. ``equip_present`` only fires when a script carries a non-None
+    ``equip_binding`` carrier; a future regen that dropped the carrier (or the hook
+    wiring drifting so the carrier never reaches ``RbxScript``) would let the check
+    silently abstain green-for-the-wrong-reason. Assert the corpus carries at least
+    one DISCHARGED equip obligation (``present=True``) AND that the carrier is
+    backed by a REAL discharge in the captured Luau (the lowering's own-emit marker
+    + the ``equipWeaponRemote``-bound ``FireServer("<prefab>")`` request + no
+    surviving ``instantiatePrefab(<prefab>)``), derived through the SAME shared
+    predicate the verifier uses — so a carrier-present-but-source-undischarged regen
+    is caught too. Generic: scans every fixture/script, keys on the carrier's own
+    prefab/method/remote (no game-specific hardcode)."""
+    from converter.camera_mount_equip_lowering import (
+        _method_body_span,
+        equip_request_discharged_in_span,
+    )
+
+    discharged: list[tuple[str, str, dict]] = []
+    for fp in _FIXTURES:
+        fx = json.loads(fp.read_text(encoding="utf-8"))
+        for s in fx["scripts"]:
+            eb = s.get("equip_binding")
+            if isinstance(eb, dict) and eb.get("present") is True:
+                discharged.append((fp.parent.name, s["name"], s))
+
+    assert discharged, (
+        "equip_present unexercised — no corpus script carries an equip_binding "
+        "with present=True, so the FAIL_CLOSED check abstains "
+        "green-for-the-wrong-reason. A regen must capture the discharged Player "
+        "equip request (re-run tools/regen_contract_corpus.py / the equip-fixture "
+        "regen helper)."
+    )
+
+    # Prove the discharge is REAL via the shared predicate (the verifier's own
+    # authority), scoped to the carrier's recorded method + remote — a dropped key
+    # or a carrier-present-but-undischarged regen REDS here.
+    for project, script_name, s in discharged:
+        eb = s["equip_binding"]
+        prefab = eb.get("prefab")
+        method = eb.get("method")
+        remote = eb.get("remote")
+        src = s.get("source") or ""
+        assert isinstance(prefab, str) and prefab, (
+            f"{project}/{script_name}: equip_binding.prefab must be a non-empty str, "
+            f"got {prefab!r}. Re-run the equip-fixture regen."
+        )
+        assert isinstance(method, str) and method, (
+            f"{project}/{script_name}: equip_binding.method must be a non-empty str, "
+            f"got {method!r}. Re-run the equip-fixture regen."
+        )
+        assert isinstance(remote, str) and remote, (
+            f"{project}/{script_name}: equip_binding.remote must be a non-empty str "
+            f"(the carrier's own _services handle, the discharge anchor), got "
+            f"{remote!r}. Re-run the equip-fixture regen."
+        )
+        span = _method_body_span(src, method)
+        assert span is not None, (
+            f"{project}/{script_name}: equip_binding present=True but the recognized "
+            f"method {method!r} is absent from the captured source — the carrier "
+            f"disagrees with the source. Re-run the equip-fixture regen."
+        )
+        assert equip_request_discharged_in_span(src, span[0], span[1], prefab, remote), (
+            f"{project}/{script_name}: equip_binding present=True but the source is "
+            f"NOT discharged via the shared predicate (own-emit marker + "
+            f"{remote}-bound FireServer({prefab!r}) + no surviving "
+            f"instantiatePrefab({prefab})) — carrier-present-but-undischarged; the "
+            f"equip request was dropped/reshaped. Re-run the equip-fixture regen."
+        )
+
+
 # ===========================================================================
 # Key-check canonical-contract regression (door run, D9)
 # ===========================================================================

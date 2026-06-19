@@ -143,6 +143,10 @@ def verify_contract(
     # a dropped/reshaped rig binding is the real cause; the surviving ordinal it
     # might leave behind is the downstream symptom.
     violations.extend(_check_rig_binding_present(topology, scripts))
+    # The equip-request floor reports right after the rig-binding floor: the equip
+    # lowering runs AFTER (and depends on) the rig retarget, so its obligation is
+    # the next link in the same camera-mount chain.
+    violations.extend(_check_equip_present(topology, scripts))
     violations.extend(_check_surviving_child_ordinal(topology, scripts))
     violations.extend(
         _check_static_event_rendezvous(scripts, static_events_by_module or {})
@@ -612,6 +616,7 @@ FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
         "cross_domain_attribute",
         "child_ordinal_survivor",
         "rig_binding_present",
+        "equip_present",
     }
 )
 
@@ -2405,6 +2410,98 @@ def _rig_code_contains(source: str, token: str) -> bool:
             return True
         idx = source.find(token, idx + 1)
     return False
+
+
+def _equip_method_body_span(source: str, method: str) -> tuple[int, int] | None:
+    """The (body_start, body_end) char span of the Luau method ``method``'s body —
+    from just past its ``function <Class>:<method>(…)`` header through the char just
+    past its matching closing ``end``. None if the method is not found. Reuses the
+    rig method-body-span machinery (``_rig_method_body_end``) so the equip checker
+    scopes IDENTICALLY to the lowering's producer."""
+    for m in _RIG_FUNCTION_METHOD_RE.finditer(source):
+        if not _rig_pos_is_real_code(source, m.start()):
+            continue
+        if m.group(2) != method:
+            continue
+        return (m.end(), _rig_method_body_end(source, m.start()))
+    return None
+
+
+def _equip_request_discharged(
+    source: str, prefab: str, remote: str, method: str
+) -> bool:
+    """INDEPENDENT, code-position-aware derivation (the LOAD-BEARING authority): is
+    the camera-mount equip request discharged WITHIN ``method``'s body in THIS final
+    source? Scoped to the recognized ``equip_method`` (not a script-global scan: a
+    same-prefab spawn in an unrelated method neither satisfies nor breaks this
+    obligation). True IFF, at code positions within the method body:
+      (1) the lowering's own-emit marker ``-- _EQUIP_REQUEST_<prefab>`` is present
+          (the request block landed), AND — WITHIN that marker's contiguous emitted
+          block —
+      (2) an alias bound to ``self._services.<remote>`` fires
+          ``:FireServer("<prefab>")`` (so a shadowing rebind to a foreign remote +
+          foreign fire OUTSIDE the block does NOT discharge — round-2 alias-shadow),
+          AND
+      (3) NO surviving ``instantiatePrefab(<prefab>)`` camera-mount equip call
+          remains in the method body (the request REPLACED it, not added alongside).
+    Delegates to the producer's shared ``equip_request_discharged_in_span`` so
+    producer + checker apply the EXACT same predicate. ``remote`` is LOAD-BEARING
+    (round-2 P1-1): the request must fire on an alias bound to the carrier's OWN
+    ``self._services.<remote>`` — a ``FireServer("<prefab>")`` on a DIFFERENT
+    remote/alias does NOT discharge."""
+    if not prefab or not method or not remote:
+        return False
+    span = _equip_method_body_span(source, method)
+    if span is None:
+        return False
+    from converter.camera_mount_equip_lowering import (
+        equip_request_discharged_in_span,
+    )
+    return equip_request_discharged_in_span(
+        source, span[0], span[1], prefab, remote
+    )
+
+
+def _check_equip_present(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Fail-closed: every IR-declared camera-mount equip obligation (the
+    ``equip_binding`` carrier's prefab/remote/method) must be DISCHARGED into an
+    emitted client->server equip REQUEST in the final ``script.source`` — derived
+    INDEPENDENTLY from source (the carrier's ``present`` is a cross-check, not the
+    gate). Scoped to REQUEST emission ONLY (D6): asserts the FireServer request
+    landed, NOT a runtime weld (Phase 2). ``equip_binding=None`` ABSTAINS."""
+    violations: list[ContractViolation] = []
+    for script in scripts:
+        eb = script.equip_binding
+        if not eb:
+            continue  # no equip obligation -> abstain
+        prefab = str(eb.get("prefab") or "")
+        remote = str(eb.get("remote") or "")
+        method = str(eb.get("method") or "")
+        discharged = _equip_request_discharged(
+            script.source or "", prefab, remote, method
+        )
+        stamp = eb.get("present") is True
+        if discharged and stamp:
+            continue  # PASS — the independent scan AND the cross-check agree
+        violations.append(
+            ContractViolation(
+                check="equip_present",
+                severity="warning",
+                script=script.name,
+                detail=(
+                    f"{script.name}: the IR-declared camera-mount equip "
+                    f"(prefab {prefab!r} -> {remote}:FireServer) was NOT confirmed "
+                    f"in the lowered output (source-scan discharged={discharged}, "
+                    f"lowering-stamp={stamp}); the weapon equip request was "
+                    f"dropped/reshaped/reverted."
+                ),
+                identity=f"equip_present:{script.name}:{prefab}",
+            )
+        )
+    return violations
 
 
 def _check_rig_binding_present(

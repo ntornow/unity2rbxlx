@@ -96,6 +96,15 @@ class TranspiledScript:
     # live by construction (NEW-FINDING-B). ``None`` for every non-re-lowered
     # script.
     roster_binding: dict[str, object] | None = None
+    # Per-script camera-mount equip-request binding carrier from the generic-mode
+    # post-transpile ``camera_mount_equip_lowering``: a JSON-native dict
+    # ``{"prefab": str, "method": str, "remote": str, "present": bool}`` (+ optional
+    # ``multi_site``/``dangling_capvar`` fail-closed sub-flags) or ``None``. Stamped
+    # ONLY on a script whose rig fact carries an equip obligation. Copied onto the
+    # produced ``RbxScript.equip_binding`` so the contract verifier's
+    # ``_check_equip_present`` fail-closed check can assert the IR-declared equip
+    # request was discharged. ``None`` when the script has no equip obligation.
+    equip_binding: dict[str, object] | None = None
 
 
 @dataclass

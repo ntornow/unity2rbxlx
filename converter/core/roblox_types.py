@@ -161,6 +161,17 @@ class RbxScript:
     # Roblox-dead set: the canonical re-lowered body is deterministically inert
     # (would otherwise classify dead) yet live by construction (NEW-FINDING-B).
     roster_binding: dict[str, object] | None = None
+    # Per-script camera-mount equip-request binding carrier (mirrors rig_binding): a
+    # JSON-native dict ``{"prefab": str, "method": str, "remote": str,
+    # "present": bool}`` (+ optional ``multi_site``/``dangling_capvar`` fail-closed
+    # sub-flags) that survives ``json.dumps`` in the corpus regen, rehydrates as a
+    # plain dict via ``RbxScript(**s)`` in the corpus replay, and is stamped
+    # identically live. ``None`` for every script except one whose rig fact carried a
+    # held-prefab equip obligation. The contract verifier's ``_check_equip_present``
+    # fail-closed check reads it for the IR anchor (prefab/method/remote), then
+    # INDEPENDENTLY scans the source to confirm the equip request was discharged —
+    # ``present`` is a cross-check, not the gate.
+    equip_binding: dict[str, object] | None = None
 
 
 @dataclass

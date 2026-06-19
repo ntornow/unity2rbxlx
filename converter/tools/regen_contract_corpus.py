@@ -79,6 +79,10 @@ _FIELDS = (
     # and rig_binding_present goes DEAD (abstains green-for-the-wrong-reason
     # instead of asserting the discharged Player binding).
     "rig_binding",
+    # The camera-mount equip-request carrier the equip-present fail-closed check
+    # reads. Without it equip_present goes DEAD on the corpus (abstains
+    # green-for-the-wrong-reason instead of asserting the discharged Player request).
+    "equip_binding",
 )
 
 _FIXTURE_ROOT = _REPO / "tests" / "fixtures" / "contract_corpus"

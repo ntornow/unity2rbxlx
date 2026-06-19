@@ -3331,6 +3331,9 @@ return table.concat(allData, "\\n")'''
                     # the dead-module exemption (a re-lowered roster consumer is
                     # live by construction; its canonical body is inert).
                     roster_binding=ts.roster_binding,
+                    # Generic-mode camera-mount equip-request binding carrier (or
+                    # None) for the equip-present fail-closed check.
+                    equip_binding=ts.equip_binding,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -4820,6 +4823,7 @@ script.Disabled = true
         child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
         rig_binding_lookup = self._load_rig_binding_for_rehydration()
         roster_binding_lookup = self._load_roster_binding_for_rehydration()
+        equip_binding_lookup = self._load_equip_binding_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -4890,6 +4894,13 @@ script.Disabled = true
             rob = roster_binding_lookup.get(name)
             if rob is not None:
                 script.roster_binding = rob
+            # Restore the camera-mount equip-request carrier so the equip-present
+            # fail-closed check has the IR anchor + discharge stamp on a
+            # preserve/resume assemble (else it would abstain on every rehydrated
+            # script). The check still INDEPENDENTLY scans ``source``.
+            eqb = equip_binding_lookup.get(name)
+            if eqb is not None:
+                script.equip_binding = eqb
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -5097,6 +5108,55 @@ script.Disabled = true
             }
         return out
 
+    def _load_equip_binding_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Load the persisted per-script camera-mount equip-request carrier from
+        ``conversion_plan.json`` into ``name -> {prefab, method, remote, present}``
+        (+ optional ``multi_site``/``dangling_capvar`` sub-flags).
+
+        Mirrors the ``rig_binding`` rehydration. Returns ``{}`` on a
+        missing/malformed plan or a plan that pre-dates the field; a malformed row
+        is dropped (absent -> ``None`` -> the equip-present check abstains, the same
+        safe pre-field default). All FOUR core keys must be well-formed (str prefab/
+        method/remote, bool present) or the row is dropped — a partial carrier would
+        let the fail-closed check anchor on a missing prefab and exempt blind."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("equip_binding")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, object]] = {}
+        for name, eb in block.items():
+            if not isinstance(name, str) or not isinstance(eb, dict):
+                continue
+            prefab = eb.get("prefab")
+            method = eb.get("method")
+            remote = eb.get("remote")
+            present = eb.get("present")
+            if not (isinstance(prefab, str) and isinstance(method, str)
+                    and isinstance(remote, str) and isinstance(present, bool)):
+                continue
+            row: dict[str, object] = {
+                "prefab": prefab,
+                "method": method,
+                "remote": remote,
+                "present": present,
+            }
+            for flag in ("multi_site", "dangling_capvar"):
+                val = eb.get(flag)
+                if isinstance(val, bool):
+                    row[flag] = val
+            out[name] = row
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -5192,6 +5252,16 @@ script.Disabled = true
             s.name: s.roster_binding
             for s in self.state.rbx_place.scripts
             if s.roster_binding is not None
+        }
+
+        # Persist each camera-mount equip carrier so a preserve/resume assemble that
+        # rehydrates from disk can restore the equip-present check's IR anchor +
+        # discharge stamp (without it the check would abstain on that path). Keyed by
+        # script name; ``None`` carriers are dropped (absent == no equip obligation).
+        equip_binding: dict[str, dict[str, object]] = {
+            s.name: s.equip_binding
+            for s in self.state.rbx_place.scripts
+            if s.equip_binding is not None
         }
 
         # Animation routing (Phase 4.5): per-clip target + reason.
@@ -5317,6 +5387,7 @@ script.Disabled = true
                 "child_ref_resolution": child_ref_resolution,
                 "rig_binding": rig_binding,
                 "roster_binding": roster_binding,
+                "equip_binding": equip_binding,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),
