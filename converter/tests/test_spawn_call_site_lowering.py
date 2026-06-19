@@ -152,6 +152,27 @@ def test_premium_rewrite_recovers_prefab_id_expr() -> None:
     assert "Unable to load collectable" in new
 
 
+def test_premium_rewrite_warn_parens_balanced() -> None:
+    # Bug-guard: the InstantiateAsync rewrite re-emits the ORIGINAL warn(...) call by
+    # splicing the captured ``warn`` group (which already closes tostring+format+warn).
+    # An over-eager trailing paren in the replacement over-closes the call and produces
+    # a Luau syntax error that fails the whole module to compile. Assert the warn line
+    # the rewrite leaves behind is paren-balanced byte-for-byte vs the original.
+    orig_warn_line = next(
+        ln for ln in PREMIUM_SRC.splitlines() if "premiumCollectible.name" in ln
+    )
+    new, _ = lower_spawn_call_sites(PREMIUM_SRC)
+    new_warn_line = next(
+        ln for ln in new.splitlines() if "premiumCollectible.name" in ln
+    )
+    # The rewrite must not touch the warn-args line — it is preserved verbatim.
+    assert new_warn_line == orig_warn_line
+    assert new_warn_line.count("(") == orig_warn_line.count("(")
+    assert new_warn_line.count(")") == orig_warn_line.count(")")
+    # Whole-module paren balance is preserved (no stray opener/closer introduced).
+    assert new.count("(") - new.count(")") == PREMIUM_SRC.count("(") - PREMIUM_SRC.count(")")
+
+
 def test_cloud_clone_on_string_rewritten() -> None:
     new, res = lower_spawn_call_sites(CLOUD_SRC)
     assert res.rewritten == 1

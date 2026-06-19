@@ -296,10 +296,15 @@ def _instantiate_async_outcomes(source: str) -> tuple[list[_Span], int]:
         ind = m.group("ind")
         var = m.group("var")
         warn = m.group("warn")
+        # ``warn`` already captures the three closing parens that close
+        # ``tostring(``, ``string.format(`` AND ``warn(`` in the original — so the
+        # replacement re-emits ONLY the ``warn(string.format(`` prefix and must NOT
+        # add a trailing paren (doing so over-closes -> a Luau syntax error that
+        # fails the whole module to compile).
         replacement = (
             f"{ind}{var} = self.host.instantiatePrefab({expr}, segment.gameObject, nil)\n"
             f"{ind}if {var} == nil then\n"
-            f"{ind}    warn(string.format({warn})\n"
+            f"{ind}    warn(string.format({warn}\n"
             f"{ind}    return\n"
             f"{ind}end"
         )
