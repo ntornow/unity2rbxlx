@@ -499,14 +499,53 @@ def _alias_binding_re(remote: str) -> re.Pattern[str]:
     )
 
 
+def _marked_block_span(
+    source: str, body_start: int, body_end: int, prefab: str
+) -> tuple[int, int] | None:
+    """The CONTIGUOUS own-emitted request block — from the own-emit marker through
+    the matching ``end`` of the nil-guard ``if`` the lowering writes (see
+    ``_request_block``). Returns ``(marker_start, block_end)`` at code positions, or
+    None if the marker or its guard ``end`` is absent. Anchoring clauses (2)/(3) to
+    THIS span (not the whole method body) is what closes the alias-shadow bypass: a
+    later ``local <alias> = self._services.<foreign>`` rebind + foreign fire lives
+    OUTSIDE the marked block and so cannot satisfy the binding+fire requirement."""
+    marker = _own_emit_marker(prefab)
+    marker_start = source.find(marker, body_start)
+    while marker_start != -1 and marker_start < body_end:
+        if _luau_pos_is_code(source, marker_start) and not _luau_pos_in_long_bracket(
+            source, marker_start
+        ):
+            break
+        marker_start = source.find(marker, marker_start + 1)
+    if marker_start == -1 or marker_start >= body_end:
+        return None
+    # The block's nil-guard ``if`` opens on the line(s) after the binding; find the
+    # first code-position ``if`` token after the marker and balance to its ``end``.
+    if_re = re.compile(r"\bif\b")
+    for im in if_re.finditer(source, marker_start, body_end):
+        if not _luau_pos_is_code(source, im.start()):
+            continue
+        if _luau_pos_in_long_bracket(source, im.start()):
+            continue
+        block_end = _luau_if_block_end(source, im.start(), body_end)
+        if block_end is None:
+            return None
+        return marker_start, block_end
+    return None
+
+
 def equip_request_discharged_in_span(
     source: str, body_start: int, body_end: int, prefab: str,
     remote: str = EQUIP_REMOTE_SERVICE,
 ) -> bool:
     """The shared discharge predicate over an explicit method-body span (so the
     verifier can reuse the EXACT producer logic, scoping with its own
-    ``_rig``-style span helper). True IFF, all at code positions within the span:
-      (1) the own-emit marker ``-- _EQUIP_REQUEST_<prefab>`` is present, AND
+    ``_rig``-style span helper). True IFF, all at code positions:
+      (1) the own-emit marker ``-- _EQUIP_REQUEST_<prefab>`` is present (within the
+          method body), AND — WITHIN that marker's CONTIGUOUS emitted block
+          ``[marker, guard-if's end]`` (round-2 P1: NOT scattered across the body,
+          so a shadowing rebind to a foreign remote + foreign fire OUTSIDE the block
+          cannot satisfy these) —
       (2) an alias is bound to the carrier's OWN remote — ``local <alias> =
           self._services and self._services.<remote>`` (``remote`` defaults to
           ``EQUIP_REMOTE_SERVICE``; the verifier passes the carrier's recorded
@@ -515,17 +554,18 @@ def equip_request_discharged_in_span(
       (3) that SAME ``<alias>`` fires the request ``<alias>:FireServer("<prefab>")``
           (so firing the prefab on a DIFFERENT remote/alias does NOT discharge —
           round-2 P1-1), AND
-      (4) NO surviving ``instantiatePrefab(<prefab>)`` equip call (the request
-          REPLACED it, not added alongside)."""
+      (4) NO surviving ``instantiatePrefab(<prefab>)`` equip call anywhere in the
+          method body (the request REPLACED it, not added alongside)."""
     if not remote:
         return False
-    marker = _own_emit_marker(prefab)
-    if not _span_code_contains(source, body_start, body_end, marker):
+    block = _marked_block_span(source, body_start, body_end, prefab)
+    if block is None:
         return False
+    block_start, block_end = block
 
-    # (2) find the alias(es) bound to self._services.<remote> at code positions.
+    # (2) the alias(es) bound to self._services.<remote> WITHIN the marked block.
     bound_aliases: set[str] = set()
-    for bm in _alias_binding_re(remote).finditer(source, body_start, body_end):
+    for bm in _alias_binding_re(remote).finditer(source, block_start, block_end):
         if not _luau_pos_is_code(source, bm.start()):
             continue
         if _luau_pos_in_long_bracket(source, bm.start()):
@@ -534,15 +574,16 @@ def equip_request_discharged_in_span(
     if not bound_aliases:
         return False
 
-    # (3) require <alias>:FireServer("<prefab>") on one of THOSE aliases — tie the
-    # FireServer call to the carrier's own-remote binding (not any FireServer).
+    # (3) require <alias>:FireServer("<prefab>") on one of THOSE aliases, WITHIN the
+    # marked block — tie the FireServer call to the carrier's own-remote binding in
+    # the same contiguous block (not any FireServer anywhere in the method).
     fired = False
     for alias in bound_aliases:
         call_re = re.compile(
             r"\b" + re.escape(alias) + r"\s*:\s*FireServer\s*\(\s*"
             r'"' + re.escape(prefab) + r'"\s*\)'
         )
-        for cm in call_re.finditer(source, body_start, body_end):
+        for cm in call_re.finditer(source, block_start, block_end):
             if _luau_pos_is_code(source, cm.start()) and not _luau_pos_in_long_bracket(
                 source, cm.start()
             ):
@@ -553,7 +594,7 @@ def equip_request_discharged_in_span(
     if not fired:
         return False
 
-    # (4) no surviving camera-mount instantiate equip call.
+    # (4) no surviving camera-mount instantiate equip call (full method body).
     inst_re = re.compile(
         r"\binstantiatePrefab\s*\(\s*(?:self\.)?" + re.escape(prefab) + r"\b"
     )

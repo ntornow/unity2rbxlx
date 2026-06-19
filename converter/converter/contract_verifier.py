@@ -2436,11 +2436,14 @@ def _equip_request_discharged(
     same-prefab spawn in an unrelated method neither satisfies nor breaks this
     obligation). True IFF, at code positions within the method body:
       (1) the lowering's own-emit marker ``-- _EQUIP_REQUEST_<prefab>`` is present
-          (the request block landed), AND
-      (2) a ``:FireServer("<prefab>")`` request call exists (fired on the
-          deterministic ``equipWeaponRemote`` alias), AND
+          (the request block landed), AND — WITHIN that marker's contiguous emitted
+          block —
+      (2) an alias bound to ``self._services.<remote>`` fires
+          ``:FireServer("<prefab>")`` (so a shadowing rebind to a foreign remote +
+          foreign fire OUTSIDE the block does NOT discharge — round-2 alias-shadow),
+          AND
       (3) NO surviving ``instantiatePrefab(<prefab>)`` camera-mount equip call
-          remains (the request REPLACED it, not added alongside).
+          remains in the method body (the request REPLACED it, not added alongside).
     Delegates to the producer's shared ``equip_request_discharged_in_span`` so
     producer + checker apply the EXACT same predicate. ``remote`` is LOAD-BEARING
     (round-2 P1-1): the request must fire on an alias bound to the carrier's OWN

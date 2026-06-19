@@ -304,3 +304,59 @@ return Player
     assert _equip_request_discharged(
         src, "riflePrefab", "equipWeaponRemote", "GetRifle"
     ) is False
+
+
+# === Round-3 P1: alias-SHADOW bypass — discharge anchors on the contiguous block
+
+# The attack codex confirmed: the marker + an own-remote binding land, but the FIRE
+# that actually carries the prefab is on a SHADOWING `local _equipRemote =
+# self._services.notEquipRemote` rebind to a FOREIGN remote, OUTSIDE the marked block.
+# Pre-fix the predicate collected the own-remote alias NAME anywhere in the body and
+# matched a same-name fire anywhere -> the foreign fire false-passed. The fix scopes
+# the binding+fire to the marker's CONTIGUOUS block, so the out-of-block shadow fire
+# (the only fire of the prefab) cannot satisfy discharge.
+_ALIAS_SHADOW_GETRIFLE = """local Player = {}
+Player.__index = Player
+
+function Player:GetRifle()
+    -- _EQUIP_REQUEST_riflePrefab (auto: camera-mount equip lowered to server request)
+    local _equipRemote = self._services and self._services.equipWeaponRemote
+    if _equipRemote and _equipRemote.FireServer then
+        local _ = _equipRemote
+    end
+    -- shadowing rebind to a FOREIGN remote + the real fire, OUTSIDE the marked block
+    local _equipRemote = self._services and self._services.notEquipRemote
+    _equipRemote:FireServer("riflePrefab")
+    self.gotWeapon = true
+end
+
+return Player
+"""
+
+
+def test_p1_alias_shadow_outside_block_fails_discharge() -> None:
+    src = _ALIAS_SHADOW_GETRIFLE
+    # Sanity: the marked block carries the own-remote binding; the FOREIGN shadow +
+    # the only prefab fire live OUTSIDE the block, reusing the `_equipRemote` name.
+    assert "self._services.equipWeaponRemote" in src  # own-remote binding (in block)
+    assert "self._services.notEquipRemote" in src      # foreign shadow (out of block)
+    assert src.count("local _equipRemote") == 2
+    # The own-remote fire is NOT inside the marked block; the only fire is the foreign
+    # shadow -> NOT discharged.
+    assert _equip_request_discharged(
+        src, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is False
+    # And the full verifier reds even with a forged present=True stamp.
+    script = _rbx("Player", src, _carrier(present=True))
+    rows = _equip_rows([script])
+    assert len(rows) == 1
+    assert "discharged=False" in rows[0].detail
+
+
+def test_p1_real_contiguous_block_still_discharges() -> None:
+    # The genuine lowered output (the marker's own block carries binding+fire) MUST
+    # still pass — the block-scoping must not regress the real corpus shape.
+    s = _lowered_player()
+    assert _equip_request_discharged(
+        s.luau_source, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is True
