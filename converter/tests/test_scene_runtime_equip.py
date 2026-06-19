@@ -106,7 +106,7 @@ local function mockInst(name, className)
         Massless = false,
         -- Real prefab-field templates are emitted HIDDEN (transparency=1.0) and
         -- parts default Anchored=true. Default the mock to that pinned/hidden
-        -- shape so the equip path must reset it (P1-A).
+        -- shape so the equip path must reset it.
         Transparency = 1,
         Anchored = true,
         CFrame = "cf0",
@@ -306,7 +306,7 @@ class TestEquipWeaponOnCharacter:
             -- A Model relocates as a unit via PivotTo(hand.CFrame).
             assert(clone._pivotedTo == "handCF", "model pivoted to the hand CFrame")
             -- (iii) clone BaseParts CanCollide=false, Massless=true, and the
-            -- live weapon is VISIBLE + un-anchored (P1-A).
+            -- live weapon is VISIBLE + un-anchored.
             assert(muzzle.CanCollide == false, "muzzle CanCollide disabled")
             assert(muzzle.Massless == true, "muzzle Massless enabled")
             assert(muzzle.Transparency == 0, "muzzle un-hidden")
@@ -315,11 +315,11 @@ class TestEquipWeaponOnCharacter:
         """))
 
     def test_multipart_hidden_anchored_model_is_unhidden_unanchored_and_rigid(self):
-        # P1-A: a real prefab template is HIDDEN (Transparency=1) and ANCHORED.
+        # A real prefab template is HIDDEN (Transparency=1) and ANCHORED.
         # A ge-2-part Model must come back fully visible, un-anchored, pivoted to
         # the hand, with every descendant welded to the anchor and the anchor
-        # welded to the hand. This FAILS against the pre-fix code (which left
-        # Transparency=1 / Anchored=true and created only the hand weld).
+        # welded to the hand -- not left Transparency=1 / Anchored=true with only
+        # the hand weld created.
         _assert_ok(textwrap.dedent("""\
             local character = mockInst("Character", "Model")
             local rightHand = mockInst("RightHand", "Part")
@@ -371,13 +371,12 @@ class TestEquipWeaponOnCharacter:
         """))
 
     def test_no_primarypart_model_anchor_lands_on_hand(self):
-        # P1 (round 2): a multi-part Model clone with NO PrimaryPart set. The
-        # equip path picks the first BasePart as the anchor; it MUST pin that as
-        # PrimaryPart before PivotTo so the ANCHOR lands exactly at hand.CFrame.
-        # Without the pin, PivotTo uses the bounding-box pivot, leaving the anchor
-        # at an arbitrary offset that the hand weld freezes (gun floats off). The
-        # parts start at distinct non-origin CFrames so a bbox pivot != anchor.
-        # FAILS against the pre-fix code (no PrimaryPart pin before PivotTo).
+        # A multi-part Model clone with NO PrimaryPart set. The equip path picks
+        # the first BasePart as the anchor; it MUST pin that as PrimaryPart before
+        # PivotTo so the ANCHOR lands exactly at hand.CFrame. Without the pin,
+        # PivotTo uses the bounding-box pivot, leaving the anchor at an arbitrary
+        # offset that the hand weld freezes (gun floats off). The parts start at
+        # distinct non-origin CFrames so a bbox pivot != anchor.
         _assert_ok(textwrap.dedent("""\
             local character = mockInst("Character", "Model")
             local rightHand = mockInst("RightHand", "Part")
@@ -523,13 +522,13 @@ class TestRightHandFallback:
 
 
 # ---------------------------------------------------------------------------
-# Criterion 15 — survives respawn (P1: late-arriving R15 limb)
+# Criterion 15 — survives respawn (late-arriving R15 limb)
 # ---------------------------------------------------------------------------
 
 class TestReequipOnRespawn:
 
     def test_reequip_r6_resolves_immediately_no_timeout_stall(self):
-        # P1: an R6 avatar has "Right Arm" and NEVER grows a "RightHand". A
+        # An R6 avatar has "Right Arm" and NEVER grows a "RightHand". A
         # WaitForChild("RightHand", 5)-first resolver would stall the FULL 5s on
         # every R6 respawn (unarmed for 5s) before falling back to "Right Arm".
         # The bounded POLL must check BOTH names each tick and resolve on the
@@ -577,11 +576,11 @@ class TestReequipOnRespawn:
         """))
 
     def test_reequip_waits_for_late_arriving_right_hand(self):
-        # P1 (round 3): on respawn CharacterAdded fires BEFORE the R15 RightHand
-        # is parented. reequipLastWeapon must POLL (bounded) so the just-spawned
-        # Character (RightHand ABSENT at call time, arriving a few ticks later)
-        # still gets the weapon re-equipped. FAILS against the pre-fix one-shot
-        # FindFirstChild (resolves nil -> no weld, no _EquippedWeapon).
+        # On respawn CharacterAdded fires BEFORE the R15 RightHand is parented.
+        # reequipLastWeapon must POLL (bounded) so the just-spawned Character
+        # (RightHand ABSENT at call time, arriving a few ticks later) still gets
+        # the weapon re-equipped -- a one-shot FindFirstChild would resolve nil
+        # (no weld, no _EquippedWeapon).
         _assert_ok(textwrap.dedent("""\
             local player = {}  -- opaque per-player key
             local character = mockInst("Character", "Model")

@@ -278,13 +278,13 @@ def test_c8_setparent_onto_different_slot_abstains(tmp_path: Path) -> None:
     assert entry.rig_facts[0].equip_method == ""
 
 
-# === Round-2 P1-2: the PARENTED object must be the INSTANTIATED one =========
+# === the PARENTED object must be the INSTANTIATED one =========
 
 
 def test_p1_2_setparent_of_different_object_abstains(tmp_path: Path) -> None:
     # ``fx = Instantiate(riflePrefab)`` but ``existingWeapon.SetParent(weaponSlot)``
-    # parents a DIFFERENT object. Pre-fix this credited (GetRifle, riflePrefab); the
-    # fix requires the SetParent receiver to be the Instantiate result -> ABSTAIN.
+    # parents a DIFFERENT object. Recognition requires the SetParent receiver to be
+    # the Instantiate result -> ABSTAIN.
     src = (
         "using UnityEngine;\n"
         "public class Player : MonoBehaviour {\n"
@@ -478,7 +478,7 @@ def test_c2b_dangling_capvar_fails_closed() -> None:
     assert s.equip_binding.get("dangling_capvar") is True
 
 
-# === P1-A — guard-span only the TRIVIAL ``if <capvar> then`` weld guard ======
+# === guard-span only the TRIVIAL ``if <capvar> then`` weld guard ======
 
 
 def test_p1a_compound_guard_not_spanned_fails_closed() -> None:
@@ -486,8 +486,8 @@ def test_p1a_compound_guard_not_spanned_fails_closed() -> None:
     # self.currentRifle = rifle end`` must NOT be spanned wholesale (it would drop
     # the ``self.currentRifle = rifle`` logic). The compound condition is left intact
     # -> a ``rifle`` read survives OUTSIDE the excised region -> dangling_capvar
-    # fail-closed, edit NOTHING. Pre-fix: the span consumed any ``if rifle …`` guard,
-    # silently deleting the compound guard's body.
+    # fail-closed, edit NOTHING. The span must NOT consume any ``if rifle …`` guard,
+    # which would silently delete the compound guard's body.
     src = (
         "function Player:GetRifle()\n"
         "    local rifle = self.host.instantiatePrefab(self.riflePrefab, slot)\n"
@@ -526,14 +526,13 @@ def test_p1a_trivial_guard_still_spans_and_discharges() -> None:
     assert "self.gotWeapon = true" in s.luau_source
 
 
-# === P1-B — overloaded C# equip method name -> ABSTAIN (D8) ==================
+# === overloaded C# equip method name -> ABSTAIN (D8) ==================
 
 
 def test_p1b_overloaded_equip_method_abstains(tmp_path: Path) -> None:
     # Two ``GetRifle(...)`` overloads share the equip name; one carries the equip
     # shape. The obligation is keyed by bare method NAME, so the two collapse -> the
     # recognizer must ABSTAIN (no obligation) rather than bind one arbitrary site.
-    # Pre-fix: the resolver records (GetRifle, riflePrefab).
     src = (
         "using UnityEngine;\n"
         "public class Player : MonoBehaviour {\n"
@@ -578,8 +577,8 @@ def test_c9_multi_obligation_fails_closed() -> None:
     # D8 abstain-on-ambiguity: a single script with TWO distinct equip
     # obligations (two camera-mounted weapon slots, two prefab fields) cannot
     # be disambiguated to one request. The lowering must edit NOTHING and stamp
-    # present=False + multi_obligation=True. FAILS against the pre-fix
-    # ``fact = obligations[0]`` behavior (which lowered the first slot silently).
+    # present=False + multi_obligation=True, rather than silently lowering the first
+    # slot via ``fact = obligations[0]``.
     src = (
         "function Player:GetRifle()\n"
         "    local a = self.host.instantiatePrefab(self.riflePrefab, slot)\n"
@@ -677,7 +676,7 @@ def test_committed_fixture_player_carries_lowered_equip() -> None:
 
 
 def test_committed_fixture_player_is_real_lowering_fixed_point() -> None:
-    """PROVABILITY (round-2 P1-3b): the committed fixture's Player equip block is a
+    """PROVABILITY: the committed fixture's Player equip block is a
     genuine FIXED POINT of the REAL production lowering, not a hand-fabrication that
     merely looks lowered. Drive the actual ``lower_camera_mount_equip`` (with the
     obligation the REAL Player.cs yields) over the committed source: it must be a

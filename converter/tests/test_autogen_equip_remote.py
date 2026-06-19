@@ -137,8 +137,8 @@ class TestNameCannotDrift:
 class TestConnectBeforeParentOrdering:
 
     def test_connect_precedes_parent(self):
-        # Round-1 codex P1: the handler must be connected BEFORE the remote is
-        # parented to RS (Roblox does not buffer OnServerEvent for late listeners).
+        # The handler must be connected BEFORE the remote is parented to RS
+        # (Roblox does not buffer OnServerEvent for late listeners).
         src = _server_source()
         connect_at = src.index("equipWeaponRemote.OnServerEvent:Connect")
         parent_at = src.index("equipWeaponRemote.Parent = RS")

@@ -225,7 +225,7 @@ class TestBridgeReachesEmittedPlan:
 
 
 # ---------------------------------------------------------------------------
-# Criterion 10 (d) — build-time collision fail-close (RISK-1 / codex AVOID-B)
+# Criterion 10 (d) — build-time collision fail-close
 # ---------------------------------------------------------------------------
 
 class TestCollisionFailClose:
@@ -305,11 +305,10 @@ class TestCollisionFailClose:
         assert equip_prefabs == {"riflePrefab": "prefab_same"}
 
     def test_same_script_multi_instance_different_prefab_fails_closed(self):
-        # P1-B: ONE script class with TWO authored instances sharing the equip
-        # field name but referencing DIFFERENT prefabs. The pre-fix code took the
-        # first matching row and never raised (silent misbinding); the bridge
-        # must now collect ALL target_refs for (script_id, field) and fail CLOSED
-        # because the resolved set has size > 1.
+        # ONE script class with TWO authored instances sharing the equip field name
+        # but referencing DIFFERENT prefabs. Taking the first matching row would be a
+        # silent misbinding; the bridge collects ALL target_refs for
+        # (script_id, field) and fails CLOSED because the resolved set has size > 1.
         scene_runtime: dict[str, object] = {
             "scenes": {
                 "Game.unity": {

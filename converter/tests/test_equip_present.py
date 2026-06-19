@@ -4,7 +4,7 @@ Covers acceptance criteria 5, 6 (design-phase1.md §3):
   5  VERIFIER fails closed when a recognized obligation is UNDISCHARGED — a script
      whose equip_binding obligates a request the source does not carry (or a
      present=True mis-stamp) -> exactly one ``equip_present`` violation, promoted by
-     ``fail_closed_errors``. Pre-fix-RED proof: passes WITHOUT the check, fails WITH.
+     ``fail_closed_errors``. RED proof: passes WITHOUT the check, fails WITH.
   6  VERIFIER ABSTAINS on ``equip_binding=None`` (no equip obligation) — no rows.
 
 The GREEN/discharged source is produced by S1's REAL lowering on the verbatim
@@ -175,7 +175,7 @@ def test_c5_pre_fix_red_proof(monkeypatch: pytest.MonkeyPatch) -> None:
         "the check must catch the dropped equip request"
     )
 
-    # WITHOUT the check (emulate pre-fix): stub _check_equip_present to a no-op. The
+    # WITHOUT the check: stub _check_equip_present to a no-op. The
     # dropped request now sails through -> the assertion above would FAIL against
     # this no-op, proving the check is load-bearing, not a tautology.
     monkeypatch.setattr(
@@ -183,7 +183,7 @@ def test_c5_pre_fix_red_proof(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     errs_without = fail_closed_errors(verify_contract(_TOPOLOGY, [script]))
     assert not any("equip_present" in e for e in errs_without), (
-        "pre-fix code (check absent) must NOT catch the dropped request"
+        "code with the check absent must NOT catch the dropped request"
     )
 
 
@@ -240,14 +240,13 @@ def test_discharge_scan_directly_false_on_undischarged() -> None:
     ) is True
 
 
-# === Round-2 P1-1: discharge is REMOTE-bound (FireServer on a foreign remote fails)
+# === Discharge is REMOTE-bound (FireServer on a foreign remote fails) ===
 
 
 # A method that carries the own-emit marker + a same-prefab FireServer, BUT the
 # alias is bound to a DIFFERENT service and the prefab is fired on THAT alias.
-# Pre-fix this verified CLEAN (the marker + bare FireServer("riflePrefab") were the
-# only requirements); the fix ties the FireServer to the carrier's own-remote
-# binding, so this must FAIL discharge.
+# Discharge ties the FireServer to the carrier's own-remote binding, so a bare
+# marker + a foreign-remote FireServer must FAIL discharge.
 _FOREIGN_REMOTE_GETRIFLE = """local Player = {}
 Player.__index = Player
 
@@ -265,8 +264,8 @@ return Player
 
 
 def test_p1_1_fireserver_on_foreign_remote_fails_discharge() -> None:
-    # The attack codex confirmed: marker + FireServer("riflePrefab") present, but
-    # fired on an alias bound to a NON-equip remote -> NOT discharged.
+    # Marker + a same-prefab FireServer present, but fired on an alias bound to a
+    # NON-equip remote -> NOT discharged.
     assert _equip_request_discharged(
         _FOREIGN_REMOTE_GETRIFLE, "riflePrefab", "equipWeaponRemote", "GetRifle"
     ) is False
@@ -306,14 +305,12 @@ return Player
     ) is False
 
 
-# === Round-3 P1: alias-SHADOW bypass — discharge anchors on the contiguous block
+# === alias-SHADOW bypass — discharge anchors on the contiguous block ===
 
-# The attack codex confirmed: the marker + an own-remote binding land, but the FIRE
-# that actually carries the prefab is on a SHADOWING `local _equipRemote =
-# self._services.notEquipRemote` rebind to a FOREIGN remote, OUTSIDE the marked block.
-# Pre-fix the predicate collected the own-remote alias NAME anywhere in the body and
-# matched a same-name fire anywhere -> the foreign fire false-passed. The fix scopes
-# the binding+fire to the marker's CONTIGUOUS block, so the out-of-block shadow fire
+# The marker + an own-remote binding land, but the FIRE that actually carries the
+# prefab is on a SHADOWING `local _equipRemote = self._services.notEquipRemote`
+# rebind to a FOREIGN remote, OUTSIDE the marked block. Discharge scopes the
+# binding+fire to the marker's CONTIGUOUS block, so the out-of-block shadow fire
 # (the only fire of the prefab) cannot satisfy discharge.
 _ALIAS_SHADOW_GETRIFLE = """local Player = {}
 Player.__index = Player
@@ -362,7 +359,7 @@ def test_p1_real_contiguous_block_still_discharges() -> None:
     ) is True
 
 
-# === Round-4 P1-B: verifier span is SYMMETRIC with the producer on duplicates ===
+# === verifier span is SYMMETRIC with the producer on duplicates ===
 # The producer (`camera_mount_equip_lowering._method_body_span`) fails closed
 # (returns None) on >1 same-named `function …:<method>(` declaration, so the lowering
 # refuses to pick an ambiguous rewrite site. The verifier's `_equip_method_body_span`
@@ -375,8 +372,8 @@ def test_p1_real_contiguous_block_still_discharges() -> None:
 def _duplicate_getrifle(src: str) -> str:
     # Append a SECOND `function Player:GetRifle(...)` so two same-named methods exist.
     # The first body is the genuine discharged one; the second is an inert stub. A
-    # pre-fix verifier that returns the FIRST span would still discharge -> the test
-    # only goes RED once the span fails closed on the duplicate.
+    # verifier that returns the FIRST span would still discharge -> the test only
+    # goes RED once the span fails closed on the duplicate.
     return src.replace(
         "return Player\n",
         "function Player:GetRifle()\n"
@@ -397,9 +394,8 @@ def test_p1b_verifier_span_none_on_duplicate_method() -> None:
 
 
 def test_p1b_discharge_false_on_duplicate_even_if_first_body_discharged() -> None:
-    # The genuine discharged body is FIRST; pre-fix the verifier would discharge
-    # against it. With the symmetric fail-closed span, the duplicate -> None span ->
-    # NOT discharged.
+    # The genuine discharged body is FIRST. With the symmetric fail-closed span, the
+    # duplicate -> None span -> NOT discharged.
     s = _lowered_player()
     dup = _duplicate_getrifle(s.luau_source)
     # Sanity: the single-method form genuinely discharges (so the duplicate is the
@@ -426,7 +422,7 @@ def test_p1b_verifier_fails_closed_on_duplicate_method_carrier_present() -> None
     assert any("equip_present" in e for e in fail_closed_errors(res))
 
 
-# === P2 — equip_binding carrier load/serialize round-trip (resume path) ======
+# === equip_binding carrier load/serialize round-trip (resume path) ======
 # ``_load_equip_binding_for_rehydration`` (pipeline.py) + the serialize-save have
 # zero coverage while rig_binding/roster_binding both have loader tests. Mirrors
 # ``test_rifle_rig_retarget.test_r3_rehydrate_*``: a well-formed row restored

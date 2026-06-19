@@ -2938,7 +2938,7 @@ function SceneRuntime:resolveEquipPrefabId(fieldName)
 end
 
 -- Bounded wait (seconds) for a respawned Character's hand limb to be parented
--- before the re-equip gives up (P1). Generous enough to absorb the normal
+-- before the re-equip gives up. Generous enough to absorb the normal
 -- one-/two-frame R15 limb-parenting delay without an unbounded stall.
 local EQUIP_HAND_WAIT_TIMEOUT = 5
 
@@ -2956,7 +2956,7 @@ function SceneRuntime:_resolveRightHand(character)
 	return nil
 end
 
--- Respawn-tolerant hand resolver (P1: CharacterAdded fires BEFORE the R15 limbs
+-- Respawn-tolerant hand resolver (CharacterAdded fires BEFORE the R15 limbs
 -- are parented, so a one-shot ``FindFirstChild`` no-ops on respawn). A BOUNDED
 -- POLL that checks BOTH limb names every tick and returns whichever appears
 -- first, so:
