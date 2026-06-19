@@ -1297,7 +1297,7 @@ _EQUIP_CLIENT_INJECTION_FRAGMENT: str = (
 # handler needs ``engine`` (Plan + clonePrefabTemplate in scope). Spliced AFTER
 # ``local engine = SceneRuntime.new(services, Plan)`` so ``engine`` is bound.
 #
-# CONNECT-BEFORE-PARENT (round-1 codex P1): Roblox does NOT buffer OnServerEvent
+# CONNECT-BEFORE-PARENT: Roblox does NOT buffer OnServerEvent
 # for listeners connected AFTER a FireServer lands, so the ordering is strictly
 # create -> OnServerEvent:Connect -> THEN .Parent = RS. The client's
 # WaitForChild("EquipWeapon") cannot resolve (so cannot FireServer) until the
@@ -1311,7 +1311,7 @@ _EQUIP_SERVER_HANDLER_FRAGMENT: str = '''\
 -- here (not GameServerManager) because the handler needs Plan + clonePrefabTemplate.
 local equipWeaponRemote = Instance.new("RemoteEvent")
 equipWeaponRemote.Name = "__EQUIP_REMOTE_NAME__"          -- == EQUIP_REMOTE_NAME (Phase 1 constant)
--- NB (round-1 P1): do NOT parent to RS yet -- connect the handler FIRST (below).
+-- NB: do NOT parent to RS yet -- connect the handler FIRST (below).
 equipWeaponRemote.OnServerEvent:Connect(function(player, fieldName)
     -- 1. Validate the client-sent arg (untrusted): non-empty short identifier.
     if type(fieldName) ~= "string" or fieldName == "" or #fieldName > 64
@@ -1321,7 +1321,7 @@ equipWeaponRemote.OnServerEvent:Connect(function(player, fieldName)
     -- 2. Resolve the requesting player's Character (D7: the OnServerEvent arg).
     local character = player.Character
     if not character then return end
-    -- 3. field name -> prefab_id via the conversion-time, scriptId-scoped map (D13).
+    -- 3. field name -> prefab_id via the conversion-time field-name map (D13b).
     local prefabId = engine:resolveEquipPrefabId(fieldName)
     if not prefabId then return end
     -- 4./5. clone + weld under the Character (server-owned -> auto-replicates).
@@ -1331,8 +1331,8 @@ equipWeaponRemote.OnServerEvent:Connect(function(player, fieldName)
     end
 end)
 -- THE handler is now connected -> only NOW make the remote reachable to clients
--- (round-1 codex P1: closes the connect/parent race; the client WaitForChild
--- cannot resolve, so cannot FireServer, until the listener is live).
+-- (closes the connect/parent race; the client WaitForChild cannot resolve, so
+-- cannot FireServer, until the listener is live).
 equipWeaponRemote.Parent = RS
 -- 6. Re-equip on respawn: a NEW Character has no welded weapon, so re-run the
 --    last successful equip (remembered per-Player in step 5).

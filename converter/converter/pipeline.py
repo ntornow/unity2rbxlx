@@ -60,7 +60,7 @@ log = logging.getLogger(__name__)
 # joins the equip-emitting scripts (keyed by ``equip_binding``) with those rows
 # to build the flat ``{field_name: prefab_id}`` map (D13b), failing CLOSED on a
 # same-field-name-different-prefab collision across equip scripts (the gate that
-# makes the flat map safe — the codex "AVOID (B): silent misbinding" objection).
+# makes the flat map safe — without it a same-named field could silently misbind).
 # ---------------------------------------------------------------------------
 
 
@@ -222,7 +222,9 @@ def _script_id_for_source_path(
         return ""
     try:
         guid = guid_for_path(Path(source_path))
-    except Exception:
+    except (AttributeError, KeyError, TypeError):
+        # Expected missing-index shapes (the index lacks the path / a stub method
+        # signature mismatch) -> abstain. Anything else surfaces.
         return ""
     return guid if isinstance(guid, str) and guid else ""
 

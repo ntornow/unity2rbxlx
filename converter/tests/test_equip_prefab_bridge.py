@@ -395,3 +395,103 @@ class TestPlanRoundTrip:
         plan_source = generate_scene_runtime_plan_module(rehydrated).source
         assert "equip_prefabs" in plan_source
         assert _RIFLE_PREFAB_ID in plan_source
+
+
+# ---------------------------------------------------------------------------
+# Criterion 10 (live) — the REAL ``Pipeline.transpile_scripts`` generic path
+# CALLS ``build_equip_prefabs_bridge`` and stores ``ctx.scene_runtime
+# ["equip_prefabs"]``. The TestBridgeInMemory tests prove the helper in
+# ISOLATION; this proves the pipeline method actually invokes it + stashes the
+# result. Deleting the ``build_equip_prefabs_bridge`` call from
+# ``transpile_scripts`` makes this RED (the unit tests above stay green —
+# "unit-test-proves-the-unit-not-that-the-pipeline-calls-it").
+# ---------------------------------------------------------------------------
+
+class TestPipelineCallsBridge:
+
+    def test_transpile_scripts_generic_populates_equip_prefabs(
+        self, tmp_path, monkeypatch,
+    ):
+        import unity.script_analyzer as analyzer_mod
+        import converter.contract_pipeline as cp_mod
+        from converter.code_transpiler import TranspilationResult
+        from converter.pipeline import Pipeline
+
+        # Minimal Unity project so the Pipeline constructor's _find_unity_root
+        # accepts the path; the .cs is the equip script the bridge joins on.
+        proj = tmp_path / "project"
+        (proj / "Assets").mkdir(parents=True)
+        cs_path = proj / "Assets" / "Player.cs"
+        cs_path.write_text(
+            "using UnityEngine;\n"
+            "public class Player : MonoBehaviour {\n"
+            "  public GameObject riflePrefab;\n"
+            "}\n"
+        )
+
+        # The transpiled equip script carrying the lowering's ``equip_binding``
+        # carrier (as ``transpile_with_contract`` would have stamped it).
+        transpiled = TranspiledScript(
+            source_path=str(cs_path),
+            output_filename="Player.luau",
+            csharp_source="",
+            luau_source="",
+            strategy="ai",
+            confidence=1.0,
+            equip_binding={
+                "prefab": "riflePrefab",
+                "method": "GetRifle",
+                "remote": "equipWeaponRemote",
+                "present": True,
+            },
+        )
+
+        # ScriptInfo stand-in so analyze_all_scripts returns a non-empty list
+        # (else transpile_scripts early-returns before the generic branch).
+        class _SI:
+            def __init__(self, path):
+                self.path = path
+                self.class_name = "Player"
+                self.referenced_types: list[str] = []
+                self.suggested_type = "ModuleScript"
+
+        monkeypatch.setattr(
+            analyzer_mod, "analyze_all_scripts",
+            lambda _root: [_SI(cs_path)],
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_transpile_with_contract(**kwargs):
+            # Record that the REAL pipeline reached the generic branch and
+            # threaded the guid_index through to the bridge.
+            captured["guid_index"] = kwargs.get("guid_index")
+            return cp_mod.ContractPipelineResult(
+                transpilation=TranspilationResult(
+                    scripts=[transpiled], total_transpiled=1, total_ai=1,
+                ),
+                runtime_bearing_paths=frozenset({cs_path}),
+            )
+
+        monkeypatch.setattr(
+            cp_mod, "transpile_with_contract", _fake_transpile_with_contract,
+        )
+
+        pipeline = Pipeline(proj)
+        pipeline.ctx.scene_runtime_mode = "generic"
+        # Seed the planner-produced reference rows the bridge joins against.
+        sr = _scene_runtime_with_ref()
+        pipeline.ctx.scene_runtime["scenes"] = sr["scenes"]
+        pipeline.ctx.scene_runtime["prefabs"] = sr["prefabs"]
+        pipeline.state.guid_index = _guid_index({str(cs_path): _PLAYER_SCRIPT_ID})
+
+        pipeline.transpile_scripts()
+
+        # The REAL method called build_equip_prefabs_bridge + stashed the result.
+        equip_prefabs = pipeline.ctx.scene_runtime.get("equip_prefabs")
+        assert equip_prefabs == {"riflePrefab": _RIFLE_PREFAB_ID}, (
+            "Pipeline.transpile_scripts (generic) did not populate "
+            "ctx.scene_runtime['equip_prefabs'] — the build_equip_prefabs_bridge "
+            "call was not invoked on the real pipeline path."
+        )
+        assert captured["guid_index"] is pipeline.state.guid_index

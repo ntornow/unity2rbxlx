@@ -574,6 +574,46 @@ def test_c9_multi_site_fails_closed() -> None:
     assert s.equip_binding.get("multi_site") is True
 
 
+def test_c9_multi_obligation_fails_closed() -> None:
+    # D8 abstain-on-ambiguity: a single script with TWO distinct equip
+    # obligations (two camera-mounted weapon slots, two prefab fields) cannot
+    # be disambiguated to one request. The lowering must edit NOTHING and stamp
+    # present=False + multi_obligation=True. FAILS against the pre-fix
+    # ``fact = obligations[0]`` behavior (which lowered the first slot silently).
+    src = (
+        "function Player:GetRifle()\n"
+        "    local a = self.host.instantiatePrefab(self.riflePrefab, slot)\n"
+        "    self.gotRifle = true\n"
+        "end\n"
+        "function Player:GetPistol()\n"
+        "    local b = self.host.instantiatePrefab(self.pistolPrefab, slot2)\n"
+        "    self.gotPistol = true\n"
+        "end\n"
+        "return Player\n"
+    )
+    two_obligation_map = {"/proj/Player.cs": ChildRefScript(
+        facts=(), getchild_total=2, resolved_total=2,
+        rig_facts=(
+            RigRootedRetargetFact(
+                field_name="weaponSlot", child_name="WeaponSlot",
+                cam_receiver="cam", equip_method="GetRifle",
+                prefab_field="riflePrefab"),
+            RigRootedRetargetFact(
+                field_name="weaponSlot2", child_name="WeaponSlot2",
+                cam_receiver="cam", equip_method="GetPistol",
+                prefab_field="pistolPrefab"),
+        ),
+    )}
+    s = _Script(src)
+    n = lower_camera_mount_equip([s], two_obligation_map)  # type: ignore[arg-type]
+    assert n == 0
+    assert s.luau_source == src  # edit NOTHING (no request spliced)
+    assert "FireServer" not in s.luau_source
+    assert s.equip_binding is not None
+    assert s.equip_binding["present"] is False
+    assert s.equip_binding.get("multi_obligation") is True
+
+
 # === Criterion 7 — IDEMPOTENCY ==============================================
 
 

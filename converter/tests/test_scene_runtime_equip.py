@@ -146,29 +146,6 @@ local function mockInst(name, className)
         self._lateArrivals = self._lateArrivals or {}
         self._lateArrivals[part.Name] = {part = part, tick = atTick}
     end
-    -- Mock WaitForChild: returns a present child immediately. A child can be
-    -- registered to "arrive late" via ``inst._pendingChildren[name] = part`` --
-    -- the first WaitForChild for that name parents it (modelling the limb landing
-    -- a frame later) and returns it. A name with no present/pending child and a
-    -- finite timeout returns nil AFTER advancing ``_tick`` by the timeout's worth
-    -- of frames -- modelling the REAL blocking stall (the round-3 fix that did
-    -- ``WaitForChild("RightHand", 5)`` first burned this full stall on every R6
-    -- respawn, which the R6 test detects via ``_tick``).
-    function inst:WaitForChild(n, timeout)
-        local existing = self:FindFirstChild(n)
-        if existing then return existing end
-        local pending = self._pendingChildren and self._pendingChildren[n]
-        if pending then
-            self._pendingChildren[n] = nil
-            pending.Parent = self
-            table.insert(self._childList, pending)
-            return pending
-        end
-        if timeout then
-            _tick = _tick + math.floor(timeout * 60)
-        end
-        return nil
-    end
     function inst:GetDescendants()
         return self._descendants
     end
@@ -552,14 +529,12 @@ class TestRightHandFallback:
 class TestReequipOnRespawn:
 
     def test_reequip_r6_resolves_immediately_no_timeout_stall(self):
-        # P1 (round 4): an R6 avatar has "Right Arm" and NEVER grows a
-        # "RightHand". The round-3 fix did WaitForChild("RightHand", 5) FIRST,
-        # so every R6 respawn stalled the FULL 5s before falling back to
-        # "Right Arm" -- unarmed for 5s every respawn. The bounded POLL must
-        # check BOTH names each tick and resolve on the FIRST iteration when
-        # "Right Arm" is already present (no yield consumed). FAILS against the
-        # round-3 WaitForChild("RightHand")-first code (which advances the tick
-        # counter the full timeout before resolving "Right Arm").
+        # P1: an R6 avatar has "Right Arm" and NEVER grows a "RightHand". A
+        # WaitForChild("RightHand", 5)-first resolver would stall the FULL 5s on
+        # every R6 respawn (unarmed for 5s) before falling back to "Right Arm".
+        # The bounded POLL must check BOTH names each tick and resolve on the
+        # FIRST iteration when "Right Arm" is already present (no yield consumed);
+        # the assertion detects a stall via the ``_tick`` counter.
         _assert_ok(textwrap.dedent("""\
             local player = {}
             local character = mockInst("Character", "Model")

@@ -98,9 +98,19 @@ def lower_camera_mount_equip(
         obligations = _equip_obligations_for(script, child_ref_map)
         if not obligations:
             continue
-        # One carrier per script; the single dict holds one obligation. >1 distinct
-        # obligation cannot happen (the producer abstains on ambiguity), but guard
-        # it anyway — take the first and fail closed if there were somehow more.
+        # D8 abstain-on-ambiguity (mirrors the ``multi_site`` fail-close below): a
+        # single script with >1 distinct equip obligation (e.g. two camera-mounted
+        # weapon slots / two prefab fields) cannot be disambiguated to ONE request,
+        # so edit NOTHING and stamp a fail-closed carrier -> the verifier fires.
+        if len(obligations) > 1:
+            script.equip_binding = {
+                "prefab": "",
+                "method": "",
+                "remote": EQUIP_REMOTE_SERVICE,
+                "present": False,
+                "multi_obligation": True,
+            }
+            continue
         fact = obligations[0]
         prefab = fact.prefab_field
         method = fact.equip_method
@@ -112,8 +122,8 @@ def lower_camera_mount_equip(
             changed = True
         elif present and new_source == original:
             # Idempotent re-run: the request is already present (own-emit marker
-            # recognized). Keep the source; do NOT count as modified.
-            script.luau_source = original
+            # recognized). Source is unchanged; do NOT count as modified.
+            pass
         else:
             # Either nothing to discharge / fail-closed sub-flag set, OR the rewrite
             # produced unparseable Luau -> restore the pre-edit source. The carrier
