@@ -49,7 +49,7 @@ _MAX_SCRIPT_BYTES = 4 * 1024 * 1024  # 4 MB
 _LUAU_INF_CLAMP: float = 1e38
 
 # Bare Luau identifier (used for Enum-member tails).
-_LUAU_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LUAU_IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _finite_num(v: float) -> float:
@@ -69,7 +69,7 @@ def _finite_num(v: float) -> float:
 def _luau_ident(s: str, default: str) -> str:
     """Validate *s* as a bare Luau identifier (Enum-member tails).
 
-    Returns *s* iff it matches ^[A-Za-z_][A-Za-z0-9_]*$, else *default* (the
+    Returns *s* iff it matches \\A[A-Za-z_][A-Za-z0-9_]*\\Z, else *default* (the
     site's existing fallback). Generic — a ``;``/space/quote/dot in the field
     falls back to the safe default, neutralizing injection (DP7)."""
     return s if _LUAU_IDENT_RE.match(s) else default

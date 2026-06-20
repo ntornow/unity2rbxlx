@@ -282,10 +282,26 @@ def test_udim2_offset_int_finitize_no_crash(v):
         "",
         "1startsdigit",
         "]==]",
+        # Trailing/embedded newline must NOT slip through: Python `$` matches
+        # before a trailing `\n`, so `^...$` + re.match leaked these. `\Z`-anchored
+        # fullmatch rejects them.
+        "Vertical\n",
+        "a\nb",
+        "a\r",
+        "Vertical\r",
     ],
 )
 def test_luau_ident_injection_falls_back(evil):
     assert _luau_ident(evil, "SAFE") == "SAFE"
+
+
+def test_luau_ident_trailing_newline_falls_back():
+    # Regression: `^[A-Za-z_][A-Za-z0-9_]*$` + re.match accepted "Vertical\n"
+    # because `$` matches before a trailing newline. `\Z` anchoring rejects it.
+    assert _luau_ident("Vertical\n", "X") == "X"
+    assert _luau_ident("a\nb", "X") == "X"
+    assert _luau_ident("a\r", "X") == "X"
+    assert _luau_ident("Vertical", "X") == "Vertical"
 
 
 @pytest.mark.parametrize("ok", ["Horizontal", "Vertical", "Left", "Top", "Overlay", "_x", "a1_b"])
