@@ -210,6 +210,256 @@ def _find_lazy_singleton_field(decommented: str, class_name: str) -> str:
                 return field_name
     return ""
 
+
+# ---------------------------------------------------------------------------
+# Clear-intent container detector (gap#4 — sound UI child-suppression signal).
+#
+# Replaces the UNSOUND "controller references any asset/prefab => delete its UI
+# host's authored children" gate (which destroys real UI) with a SOUND one:
+# detect, in the upfront C# analysis, a controller method that PROVABLY
+# CLEARS-THEN-POPULATES a serialized container field — the canonical
+# ``foreach (Transform c in container) Destroy(c.gameObject);`` followed by
+# ``Instantiate(prefab, container)``. ONLY such provably-cleared containers have
+# their static UI children suppressed. Bias HARD to abstain: over-detection
+# destroys UI, so any ambiguity → emit nothing.
+# ---------------------------------------------------------------------------
+
+# A C# method declaration head: ``<ret-type> <Name>(<params>)`` immediately
+# preceding a ``{`` body. Matched at class-body brace-depth 1 only (see
+# ``_iter_method_bodies``). The return type / name / param list are not
+# captured — we only need the body span that follows.
+_RE_METHOD_HEAD = re.compile(
+    r"[A-Za-z_][\w.<>\[\],\s]*?"   # return type (possibly generic/qualified)
+    r"\b[A-Za-z_]\w*\s*"          # method name
+    r"\([^;{}]*\)\s*"             # parameter list (no ; { } inside)
+    r"\{",                         # opening brace of the body
+)
+
+# A bare C# field identifier — the container candidate ``C``.
+_RE_BARE_IDENT = re.compile(r"^[A-Za-z_]\w*$")
+
+# An instantiate/reparent INTO a container field ``C`` (``C`` is the LAST arg of
+# ``Instantiate``, the receiver of ``InstantiateAsync``, or the arg of
+# ``SetParent``). We capture the container token and validate it is a bare field
+# identifier (not ``transform``/``this``/a member chain). Built per-scan because
+# the canonical-clear gate needs the matched spawn's position.
+_RE_SPAWN_INTO = re.compile(
+    r"\bInstantiate\s*\(\s*[^;]*?,\s*([A-Za-z_][\w.]*)\s*\)"   # Instantiate(prefab, C)
+    r"|([A-Za-z_][\w.]*)\s*\.\s*InstantiateAsync\s*\("          # C.InstantiateAsync(...)
+    r"|\.\s*SetParent\s*\(\s*([A-Za-z_][\w.]*)",                # x.SetParent(C ...)
+)
+
+# A canonical FULL clear of a container ``C``: ``foreach (Transform <v> in C)
+# Destroy(<v>...)``, or a ``C...DestroyChildren()`` call. The foreach must
+# iterate EVERY child (a bare ``Transform <v> in C`` — no ``.Where``/filter on
+# the source) and the loop body destroys the iteration variable. Anything else
+# (range ``for``, index/tag/component/``if``-filtered destroy) does NOT match,
+# so the gate abstains.
+def _re_foreach_clear(container: str) -> re.Pattern[str]:
+    c = re.escape(container)
+    return re.compile(
+        rf"\bforeach\s*\(\s*Transform\s+([A-Za-z_]\w*)\s+in\s+{c}\s*\)",
+    )
+
+
+def _class_body_for(decommented: str, class_name: str) -> str | None:
+    """Return the brace-delimited body (excluding braces) of ``class
+    <class_name>``, or ``None``. ``decommented`` is comment/string-stripped."""
+    if not class_name:
+        return None
+    m = re.search(rf"\bclass\s+{re.escape(class_name)}\b", decommented)
+    if m is None:
+        return None
+    span = _matching_brace_span(decommented, m.end())
+    if span is None:
+        return None
+    return decommented[span[0] + 1 : span[1]]
+
+
+def _iter_method_bodies(class_body: str) -> list[str]:
+    """Return the brace-delimited bodies (INCLUDING braces) of every top-level
+    method declared directly in ``class_body`` (brace-depth 1). Nested types or
+    accessor blocks are skipped by only matching method heads that sit at the
+    class's own depth. ``class_body`` is the source BETWEEN the class braces,
+    de-commented."""
+    bodies: list[str] = []
+    pos = 0
+    n = len(class_body)
+    while pos < n:
+        m = _RE_METHOD_HEAD.search(class_body, pos)
+        if m is None:
+            break
+        # The matched ``{`` is the last char of the match.
+        brace_idx = m.end() - 1
+        span = _matching_brace_span(class_body, brace_idx)
+        if span is None:
+            break
+        bodies.append(class_body[span[0] : span[1] + 1])
+        pos = span[1] + 1
+    return bodies
+
+
+def _depth_at(body: str, idx: int) -> int:
+    """Brace-nesting depth at offset ``idx`` within ``body`` (``body`` starts at
+    its own opening brace, so the statements directly in the method sit at
+    depth 1)."""
+    depth = 0
+    for ch in body[:idx]:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    return depth
+
+
+def _has_nested_callable(body: str) -> bool:
+    """True when the method body contains a nested callable — a lambda
+    (``=>``) or a local function — whose presence could move the spawn/clear
+    into a deferred scope we can't reason about. Bias to abstain."""
+    inner = body
+    return "=>" in inner
+
+
+def _detect_in_body(body: str) -> frozenset[str]:
+    """Return the container field names this ONE method body provably clears-
+    then-populates. ``body`` includes its surrounding braces, de-commented.
+    Empty on any ambiguity."""
+    if _has_nested_callable(body):
+        return frozenset()
+
+    # Collect every spawn-into-C site: (container_token, match_start).
+    spawns: list[tuple[str, int]] = []
+    for sm in _RE_SPAWN_INTO.finditer(body):
+        token = sm.group(1) or sm.group(2) or sm.group(3) or ""
+        spawns.append((token, sm.start()))
+    if not spawns:
+        return frozenset()
+
+    emitted: set[str] = set()
+    # Candidate containers are the bare-field-identifier spawn targets.
+    candidates = {
+        tok for tok, _ in spawns if _RE_BARE_IDENT.match(tok)
+    }
+    for container in candidates:
+        if container in ("transform", "this"):
+            continue
+        clear = _re_foreach_clear(container).search(body)
+        destroy_children = re.search(
+            rf"\b{re.escape(container)}\b[\w.]*\.\s*DestroyChildren\s*\(",
+            body,
+        )
+        # (b) FULL clear: require the canonical foreach-Destroy OR DestroyChildren.
+        clear_start: int | None = None
+        if clear is not None:
+            # The foreach must Destroy the iteration variable over the WHOLE loop
+            # — match the loop body and require a Destroy(<v>...) of the itervar
+            # with no per-child filter (if/tag/component/index) inside.
+            iter_var = clear.group(1)
+            loop_span = _matching_brace_span(body, clear.end())
+            if loop_span is None:
+                # Single-statement foreach body (no braces): take up to the next ;.
+                semi = body.find(";", clear.end())
+                if semi == -1:
+                    continue
+                loop_body = body[clear.end():semi + 1]
+            else:
+                loop_body = body[loop_span[0]:loop_span[1] + 1]
+            if not _foreach_body_is_full_destroy(loop_body, iter_var):
+                continue
+            clear_start = clear.start()
+        elif destroy_children is not None:
+            clear_start = destroy_children.start()
+        else:
+            continue
+
+        # (a) EXACT spawn into THIS container, after the clear.
+        spawn_positions = [s for c, s in spawns if c == container]
+        spawn_after = [s for s in spawn_positions if s > clear_start]
+        if not spawn_after:
+            continue
+        matched_spawn = min(spawn_after)
+
+        # (d) DOMINANCE: no spawn into C BEFORE the clear.
+        if any(s < clear_start for s in spawn_positions):
+            continue
+
+        # (c) UNCONDITIONAL: the clear and matched spawn at the SAME brace
+        # depth, with no control-flow keyword wrapping ONLY the clear. We
+        # require depth(clear) == depth(spawn) AND that the span between the
+        # method's depth-1 baseline and the clear introduces no guard that does
+        # not also enclose the spawn.
+        clear_depth = _depth_at(body, clear_start)
+        spawn_depth = _depth_at(body, matched_spawn)
+        if clear_depth != spawn_depth:
+            continue
+        if clear_depth != 1:
+            # Either nested inside a block (guard / loop) — abstain unless the
+            # spawn shares the EXACT same enclosing block. Conservatively
+            # abstain on any depth>1 clear: a guarded clear is exactly the
+            # asymmetry case to avoid.
+            continue
+        emitted.add(container)
+    return frozenset(emitted)
+
+
+def _foreach_body_is_full_destroy(loop_body: str, iter_var: str) -> bool:
+    """True when a ``foreach`` loop body UNCONDITIONALLY destroys the iteration
+    variable for every child — ``Destroy(<v>...)`` / ``Destroy(<v>.gameObject)``
+    — with NO per-child filter (``if``/index/tag/component) and no other
+    statement. ``loop_body`` may or may not include braces."""
+    inner = loop_body.strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    inner = inner.strip()
+    # A per-child guard (``if (...) Destroy``) is a partial/filtered clear → abstain.
+    if re.search(r"\bif\b|\bcontinue\b|\bbreak\b", inner):
+        return False
+    statements = [s.strip() for s in inner.split(";") if s.strip()]
+    if len(statements) != 1:
+        return False
+    stmt = statements[0]
+    # ``Destroy(<iter_var>...)`` — the iteration variable (optionally
+    # ``.gameObject``) is the destroy target.
+    v = re.escape(iter_var)
+    return bool(
+        re.fullmatch(rf"Destroy\s*\(\s*{v}(?:\s*\.\s*gameObject)?\s*\)", stmt)
+    )
+
+
+def detect_cleared_containers(source: str, class_name: str) -> frozenset[str]:
+    """Return the set of serialized container FIELD NAMES that ``class_name``
+    provably clears-then-populates (the canonical clear-all-then-instantiate
+    shape) within a SINGLE method body. Empty on ANY uncertainty — over-detection
+    destroys UI, so the function is biased hard to abstain.
+
+    Gates (ALL must hold for one method body, else abstain):
+      (a) EXACT — the method instantiates into a bare field ``C``
+          (``Instantiate(..., C)`` / ``C.InstantiateAsync(...)`` /
+          ``...SetParent(C...)``) AND clears that SAME field ``C``.
+      (b) FULL clear — ONLY the canonical ``foreach (Transform v in C)
+          Destroy(v...)`` or ``C...DestroyChildren()``. A range ``for``, an
+          index/tag/component/``if``-per-child filter, or any non-``foreach``-
+          over-``C`` form ABSTAINS.
+      (c) UNCONDITIONAL — the matched clear and matched spawn at the SAME
+          brace-nesting depth, with no ``if/while/switch/?:/try`` wrapping ONLY
+          the clear.
+      (d) DOMINANCE — at that depth NO spawn into ``C`` appears BEFORE the
+          matched clear; the matched spawn is the first spawn into ``C`` after
+          the clear.
+
+    Nested method / lambda / coroutine split / ``transform``/``this``-self
+    target / any ambiguity → abstain (the container is NOT emitted).
+    """
+    decommented = _strip_comments_and_strings(source)
+    class_body = _class_body_for(decommented, class_name)
+    if class_body is None:
+        return frozenset()
+    emitted: set[str] = set()
+    for body in _iter_method_bodies(class_body):
+        emitted |= _detect_in_body(body)
+    return frozenset(emitted)
+
+
 # GLOBAL scene-lookup generics whose type argument is NOT a dependency
 # edge: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING instance of
 # T, so the finder creates no structural relationship and no ``require()``
@@ -267,6 +517,14 @@ class ScriptInfo:
     # Keys on the SHAPE, never a class-name literal; the boot-safety gate
     # (§1.1a) lives in ``converter.lazy_singleton_seed``, not here.
     lazy_singleton_field: str = ""
+    # The serialized container FIELD NAMES this class provably clears-then-
+    # populates (the canonical clear-all-then-Instantiate shape) within a single
+    # method (gap#4). Drives the SOUND UI child-suppression signal: only a
+    # provably-cleared container has its static authored children dropped (the
+    # runtime re-populates it). Empty unless the exact shape is matched — biased
+    # hard to abstain (over-detection destroys UI). Keys on the C# SOURCE shape,
+    # never the AI-emitted Luau.
+    cleared_container_fields: frozenset[str] = field(default_factory=frozenset)
 
 
 def analyze_script(script_path: str | Path) -> ScriptInfo:
@@ -333,6 +591,15 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     # shape. Keys on the SHAPE off the de-commented source, never a literal.
     info.lazy_singleton_field = _find_lazy_singleton_field(
         decommented, info.class_name,
+    )
+
+    # Extract the provably-cleared container field names (gap#4). Empty unless
+    # the class clears-then-populates a serialized container in one method via
+    # the canonical foreach-Destroy + Instantiate shape. Drives the sound UI
+    # child-suppression signal. ``detect_cleared_containers`` re-strips the
+    # source itself (it needs the raw text for class-body brace matching).
+    info.cleared_container_fields = detect_cleared_containers(
+        source, info.class_name,
     )
 
     # Extract type references (field types, method parameter types, etc.)

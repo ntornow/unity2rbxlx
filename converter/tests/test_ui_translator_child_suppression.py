@@ -1,28 +1,27 @@
-"""PR3c carve-out 2 — generic-only serialized-field child suppression in ui_translator.
+"""gap#4 — SOUND clear-intent child suppression in ui_translator.
 
-Pinned by ``converter/docs/design/scene-runtime-contract.md`` Piece 4
-("asset/prefab serialized-field child suppression"). Under generic the
-host runtime owns instantiation of prefab content + asset wiring on UI
-controllers via ``host.instantiatePrefab``; emitting the static child
-tree as well would double-stamp the tree (runtime adds its copy; static
-copy never goes away).
+Under generic, a UI host's authored children are suppressed iff a runtime-
+bearing controller on it PROVABLY clears-then-populates a serialized container
+field (the upfront-C# ``cleared_container_fields`` signal) whose authored target
+IS that subtree. Merely REFERENCING an asset or prefab NO LONGER triggers
+suppression — that gate was unsound and destroyed real authored UI (gap#4). The
+runtime re-populates the cleared container, so emitting the static authored
+children as well would double-stamp.
 
 Coverage:
-- Under ``--scene-runtime=generic``, a Canvas containing a UI
-  GameObject that hosts a runtime-bearing controller with a serialized
-  field pointing at a prefab gets no static descendants under that
-  element. The element's ``_SceneRuntimeId`` is the binding the runtime
-  uses to populate it.
-- The same input under ``--scene-runtime=legacy`` keeps the static
-  descendants intact (byte-unchanged emit).
-- A non-runtime-bearing controller with the same shape does NOT
-  trigger suppression — the carve-out is keyed on the planner's
-  ``runtime_bearing`` verdict.
-- The helper ``_collect_ui_child_suppression_ids`` returns the empty
-  set on missing / partial planner artifacts so legacy never sees
-  spurious suppression.
-- Snapshot: the legacy emit is identical regardless of whether a
-  populated planner artifact is threaded through.
+- Under ``--scene-runtime=generic``, a Canvas whose UI GameObject hosts a
+  runtime-bearing controller that clears-then-populates a serialized container
+  field (resolved to that GO) gets no static descendants under it. The
+  element's ``_SceneRuntimeId`` is the binding the runtime uses to repopulate.
+- The same input under ``--scene-runtime=legacy`` keeps the static descendants
+  intact (byte-unchanged emit).
+- An asset-ref-WITHOUT-clear controller does NOT trigger suppression (the gap#4
+  fix — authored UI is preserved).
+- A non-runtime-bearing controller does NOT trigger suppression.
+- The helper ``_collect_ui_child_suppression_ids`` returns the empty set on
+  missing / partial planner artifacts so legacy never sees spurious suppression.
+- Snapshot: the legacy emit is identical regardless of whether a populated
+  planner artifact is threaded through.
 """
 from __future__ import annotations
 
@@ -137,13 +136,17 @@ class TestCollectUiChildSuppressionIds:
         assert _collect_ui_child_suppression_ids(None) == frozenset()
         assert _collect_ui_child_suppression_ids({}) == frozenset()
 
-    def test_runtime_bearing_mb_with_prefab_ref_marks_host_go(self):
+    def test_runtime_bearing_cleared_container_marks_resolved_go(self):
+        """A runtime-bearing controller that PROVABLY clears-then-populates
+        ``containerTransform`` (a serialized field resolving to host GO 200 via
+        a gameobject reference row) suppresses that GO's static children."""
         artifact = {
             "modules": {
                 "InventoryController": {
                     "stem": "InventoryController",
                     "class_name": "InventoryController",
                     "runtime_bearing": True,
+                    "cleared_container_fields": ["containerTransform"],
                 },
             },
             "scenes": {
@@ -161,11 +164,11 @@ class TestCollectUiChildSuppressionIds:
                     "references": [
                         {
                             "from": f"{SCENE_PATH.as_posix()}:2002",
-                            "field": "itemPrefab",
+                            "field": "containerTransform",
                             "index": None,
-                            "target_kind": "prefab",
-                            "target_ref": "guidpath:Assets/Prefabs/Item.prefab",
-                            "target_is_ui": False,
+                            "target_kind": "gameobject",
+                            "target_ref": f"{SCENE_PATH.as_posix()}:200",
+                            "target_is_ui": True,
                         },
                     ],
                     "lifecycle_order": [],
@@ -176,17 +179,61 @@ class TestCollectUiChildSuppressionIds:
             f"{SCENE_PATH.as_posix()}:200",
         })
 
+    def test_asset_ref_without_clear_keeps_children(self):
+        """gap#4 fix: a runtime-bearing controller that REFERENCES an asset (or
+        prefab) but does NOT provably clear-then-populate a container has NO
+        cleared field — its authored UI children MUST be preserved. This is the
+        class of UI the old asset-ref gate destroyed."""
+        artifact = {
+            "modules": {
+                "SettingsPopup": {
+                    "stem": "SettingsPopup",
+                    "class_name": "SettingsPopup",
+                    "runtime_bearing": True,
+                    # References a mixer asset, never clears a container.
+                    "cleared_container_fields": [],
+                },
+            },
+            "scenes": {
+                str(SCENE_PATH): {
+                    "instances": [
+                        {
+                            "instance_id": f"{SCENE_PATH.as_posix()}:2002",
+                            "script_id": "SettingsPopup",
+                            "game_object_id": f"{SCENE_PATH.as_posix()}:200",
+                            "active": True,
+                            "enabled": True,
+                            "config": {},
+                        },
+                    ],
+                    "references": [
+                        {
+                            "from": f"{SCENE_PATH.as_posix()}:2002",
+                            "field": "audioMixer",
+                            "index": None,
+                            "target_kind": "asset",
+                            "target_ref": "mixerguid",
+                            "target_is_ui": False,
+                        },
+                    ],
+                    "lifecycle_order": [],
+                },
+            },
+        }
+        assert _collect_ui_child_suppression_ids(artifact) == frozenset()
+
     def test_non_runtime_bearing_mb_does_not_trigger(self):
         """The carve-out gates on ``runtime_bearing`` — a module the
         planner never marked runtime-bearing (e.g. a helper class
         bound at edit time but not running on a MonoBehaviour) must
-        not trigger suppression."""
+        not trigger suppression even with a cleared container."""
         artifact = {
             "modules": {
                 "OldController": {
                     "stem": "OldController",
                     "class_name": "OldController",
                     "runtime_bearing": False,
+                    "cleared_container_fields": ["containerTransform"],
                 },
             },
             "scenes": {
@@ -204,11 +251,11 @@ class TestCollectUiChildSuppressionIds:
                     "references": [
                         {
                             "from": f"{SCENE_PATH.as_posix()}:2002",
-                            "field": "itemPrefab",
+                            "field": "containerTransform",
                             "index": None,
-                            "target_kind": "prefab",
-                            "target_ref": "guidpath:Assets/Prefabs/Item.prefab",
-                            "target_is_ui": False,
+                            "target_kind": "gameobject",
+                            "target_ref": f"{SCENE_PATH.as_posix()}:200",
+                            "target_is_ui": True,
                         },
                     ],
                     "lifecycle_order": [],
@@ -239,6 +286,9 @@ class TestCollectUiChildSuppressionIds:
                     "class_name": "ConflictedController",
                     "runtime_bearing": True,
                     "domain": "legacy",  # PR3b fail-closed verdict.
+                    # A cleared container that WOULD resolve+trigger — the domain
+                    # guard must still suppress the carve-out.
+                    "cleared_container_fields": ["containerTransform"],
                 },
             },
             "scenes": {
@@ -256,11 +306,11 @@ class TestCollectUiChildSuppressionIds:
                     "references": [
                         {
                             "from": f"{SCENE_PATH.as_posix()}:2002",
-                            "field": "itemPrefab",
+                            "field": "containerTransform",
                             "index": None,
-                            "target_kind": "prefab",
-                            "target_ref": "guidpath:Assets/Prefabs/Item.prefab",
-                            "target_is_ui": False,
+                            "target_kind": "gameobject",
+                            "target_ref": f"{SCENE_PATH.as_posix()}:200",
+                            "target_is_ui": True,
                         },
                     ],
                     "lifecycle_order": [],
@@ -269,13 +319,17 @@ class TestCollectUiChildSuppressionIds:
         }
         assert _collect_ui_child_suppression_ids(artifact) == frozenset()
 
-    def test_asset_ref_also_triggers_when_runtime_bearing(self):
+    def test_component_ref_cleared_container_resolves_owning_go(self):
+        """A cleared field resolving through a ``component`` reference (the
+        container Transform serialized as a peer-component) resolves to the
+        peer's owning GameObject id."""
         artifact = {
             "modules": {
-                "AssetController": {
-                    "stem": "AssetController",
-                    "class_name": "AssetController",
+                "Ctrl": {
+                    "stem": "Ctrl",
+                    "class_name": "Ctrl",
                     "runtime_bearing": True,
+                    "cleared_container_fields": ["content"],
                 },
             },
             "scenes": {
@@ -283,8 +337,17 @@ class TestCollectUiChildSuppressionIds:
                     "instances": [
                         {
                             "instance_id": f"{SCENE_PATH.as_posix()}:5",
-                            "script_id": "AssetController",
+                            "script_id": "Ctrl",
                             "game_object_id": f"{SCENE_PATH.as_posix()}:4",
+                            "active": True,
+                            "enabled": True,
+                            "config": {},
+                        },
+                        # The container's peer component instance, owned by GO 7.
+                        {
+                            "instance_id": f"{SCENE_PATH.as_posix()}:8",
+                            "script_id": "ContentPanel",
+                            "game_object_id": f"{SCENE_PATH.as_posix()}:7",
                             "active": True,
                             "enabled": True,
                             "config": {},
@@ -293,11 +356,11 @@ class TestCollectUiChildSuppressionIds:
                     "references": [
                         {
                             "from": f"{SCENE_PATH.as_posix()}:5",
-                            "field": "spriteAsset",
+                            "field": "content",
                             "index": None,
-                            "target_kind": "asset",
-                            "target_ref": "abc123guid",
-                            "target_is_ui": False,
+                            "target_kind": "component",
+                            "target_ref": f"{SCENE_PATH.as_posix()}:8",
+                            "target_is_ui": True,
                         },
                     ],
                     "lifecycle_order": [],
@@ -305,18 +368,19 @@ class TestCollectUiChildSuppressionIds:
             },
         }
         assert _collect_ui_child_suppression_ids(artifact) == frozenset({
-            f"{SCENE_PATH.as_posix()}:4",
+            f"{SCENE_PATH.as_posix()}:7",
         })
 
-    def test_gameobject_ref_does_not_trigger(self):
-        """Carve-out is ONLY for cross-asset / prefab refs. Local
-        gameobject/component refs are wired by the host without
-        instantiation, so the static emit must stay."""
+    def test_ref_field_not_a_cleared_container_does_not_trigger(self):
+        """A gameobject/component ref whose ``field`` is NOT one of the
+        controller's cleared-container fields must NOT trigger suppression —
+        only provably-cleared containers are dropped."""
         artifact = {
             "modules": {
                 "Ctrl": {
                     "stem": "Ctrl", "class_name": "Ctrl",
                     "runtime_bearing": True,
+                    "cleared_container_fields": ["containerTransform"],
                 },
             },
             "scenes": {
@@ -334,7 +398,7 @@ class TestCollectUiChildSuppressionIds:
                     "references": [
                         {
                             "from": f"{SCENE_PATH.as_posix()}:5",
-                            "field": "targetGo",
+                            "field": "targetGo",  # NOT the cleared field.
                             "index": None,
                             "target_kind": "gameobject",
                             "target_ref": f"{SCENE_PATH.as_posix()}:10",
@@ -463,7 +527,9 @@ def _build_scene(tmp_path: Path, canvas_root: SceneNode) -> ParsedScene:
 
 def _full_suppression_artifact() -> dict[str, object]:
     """A planner artifact that marks ControllerHost (file_id=200) as
-    runtime-bearing + asset/prefab-bearing. Matches the canvas built by
+    runtime-bearing and PROVABLY clears-then-populates ``containerTransform``,
+    a serialized field resolving (via a gameobject reference row) to the host GO
+    200. Matches the canvas built by
     ``_canvas_with_controller_and_static_descendants``."""
     return {
         "modules": {
@@ -471,6 +537,7 @@ def _full_suppression_artifact() -> dict[str, object]:
                 "stem": "InventoryController",
                 "class_name": "InventoryController",
                 "runtime_bearing": True,
+                "cleared_container_fields": ["containerTransform"],
             },
         },
         "scenes": {
@@ -488,11 +555,11 @@ def _full_suppression_artifact() -> dict[str, object]:
                 "references": [
                     {
                         "from": f"{SCENE_PATH.as_posix()}:2002",
-                        "field": "itemPrefab",
+                        "field": "containerTransform",
                         "index": None,
-                        "target_kind": "prefab",
-                        "target_ref": "guidpath:Assets/Prefabs/Item.prefab",
-                        "target_is_ui": False,
+                        "target_kind": "gameobject",
+                        "target_ref": f"{SCENE_PATH.as_posix()}:200",
+                        "target_is_ui": True,
                     },
                 ],
                 "lifecycle_order": [],
