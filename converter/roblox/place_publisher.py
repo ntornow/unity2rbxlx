@@ -149,10 +149,11 @@ def _build_collision_fidelity_fixup_script(targets: list[dict]) -> str:
     later MeshParts with concave fidelity never got recooked.
     """
     import json as _json
+    from roblox.luau_place_builder import _long_bracket
     payload = _json.dumps(targets)
     return f"""
 local AssetService = game:GetService("AssetService")
-local TARGETS = game:GetService("HttpService"):JSONDecode([==[{payload}]==])
+local TARGETS = game:GetService("HttpService"):JSONDecode({_long_bracket(payload)})
 local fixed, failed = 0, 0
 local function resolve(path)
     local node = workspace
