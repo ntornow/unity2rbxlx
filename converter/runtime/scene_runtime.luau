@@ -2357,6 +2357,9 @@ function SceneRuntime:applyImpulse(part, force)
 	-- first descendant BasePart. Abstain only when NO BasePart resolves (a body-less GameObject has
 	-- nothing to launch). Once resolved, the existing assembly/mass logic below finds the stamp.
 	if not _isBasePart(part) then
+		-- A malformed/wrong-typed arg (no GetDescendants) SOFT-RETURNS — preserving the prior
+		-- "bad part arg is a safe no-op" contract. Each Instance method below is also guarded at its
+		-- use site so a partial Instance-like value never hard-errors.
 		if type(part.GetDescendants) ~= "function" then
 			return
 		end
@@ -2368,10 +2371,10 @@ function SceneRuntime:applyImpulse(part, force)
 			end
 		end
 		if body == nil then
-			local pp = part:IsA("Model") and part.PrimaryPart
+			local pp = type(part.IsA) == "function" and part:IsA("Model") and part.PrimaryPart
 			if pp and _isBasePart(pp) then
 				body = pp
-			else
+			elseif type(part.FindFirstChildWhichIsA) == "function" then
 				body = part:FindFirstChildWhichIsA("BasePart", true)
 			end
 		end

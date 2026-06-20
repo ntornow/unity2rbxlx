@@ -142,7 +142,7 @@ class TestApplyImpulse:
         assert "PRIM_v=214.26" in out, out
 
     def test_model_with_no_basepart_abstains(self):
-        # Abstain only when NO BasePart resolves (a body-less GameObject) — a safe no-op, no error.
+        # Behavioral: a body-less Model (no BasePart at all) is a safe no-op, no error.
         rc, out, err = _run_scenario(_MOCK + """
         local model = {}
         function model:IsA(c) return c == "Model" end
@@ -154,6 +154,19 @@ class TestApplyImpulse:
         """)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "ABSTAIN_OK" in out, out
+
+    def test_partial_instance_table_soft_returns_no_hard_error(self):
+        # SAFETY (slice-review P2): a malformed Instance-like table that exposes GetDescendants but
+        # is MISSING IsA / FindFirstChildWhichIsA must SOFT-RETURN, not hard-error — preserving the
+        # prior "bad part arg is a safe no-op" contract.
+        rc, out, err = _run_scenario(_MOCK + """
+        local partial = {}
+        function partial:GetDescendants() return { } end  -- has GetDescendants, but no IsA / FFCWIA
+        SceneRuntime:applyImpulse(partial, 60)
+        print("PARTIAL_SAFE")
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "PARTIAL_SAFE" in out, out
 
     def test_host_wrapper_dotted_and_colon_dispatch(self):
         # The self.host.applyImpulse wrapper routes both dotted and colon call forms to the engine.
