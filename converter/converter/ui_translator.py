@@ -589,7 +589,12 @@ def _convert_ui_element(
                     if isinstance(call, dict):
                         method = call.get("m_MethodName", "")
                         call_state = int(call.get("m_CallState", 0))
-                        if method and call_state >= 2:  # RuntimeOnly or EditorAndRuntime
+                        # Unity UnityEventCallState: Off=0, EditorAndRuntime=1,
+                        # RuntimeOnly=2. BOTH EditorAndRuntime(1) and RuntimeOnly(2)
+                        # invoke at runtime; only Off(0) is disabled. Accept >= 1 so
+                        # EditorAndRuntime buttons are not silently dropped; an Off
+                        # listener is deliberately disabled (correctly NOT unsupported).
+                        if method and call_state >= 1:
                             target_ref = call.get("m_Target", {})
                             target_id = target_ref.get("fileID", "") if isinstance(target_ref, dict) else ""
                             mode = _coerce_int(call.get("m_Mode", 1))
@@ -722,7 +727,9 @@ def _emit_click_bindings(
 ) -> None:
     """Emit one ``ClickBinding`` per dispatchable onClick call; record the rest.
 
-    For each parsed onClick call (already gated on ``m_CallState >= 2``):
+    For each parsed onClick call (already gated on ``m_CallState >= 1`` --
+    EditorAndRuntime(1) and RuntimeOnly(2) both fire at runtime; Off(0) is
+    skipped upstream as a deliberately-disabled listener, NOT unsupported):
       * A static-argument call (``m_Mode >= 2``) is recorded as unsupported.
       * An unresolvable target (``target_file_id`` of ``0`` / not in the owner
         index, or a Button element that wasn't SRI-stamped) is recorded as

@@ -5278,15 +5278,21 @@ script.Disabled = true
             check = str(row.get("check", ""))
             contract_by_check[check] = contract_by_check.get(check, 0) + 1
 
-        # Summarize the unsupported onClick bindings stashed on scene_runtime by
-        # convert_scene (operator-only; never shipped to the host plan).
+        # Summarize the unsupported onClick bindings carried on the converted
+        # place by convert_scene (operator-only; never shipped to the host plan).
+        # Read from ``rbx_place`` (not ``scene_runtime``) so the diagnostic
+        # surfaces in ALL modes -- generic AND legacy -- because a converted
+        # button that can't be wired must always be visible even when the
+        # scene-runtime host is absent.
         from converter.report_generator import (
             UnsupportedOnClickIssue, UnsupportedOnClickSummary,
         )
-        unsupported_clicks = cast(
-            "list[dict[str, object]]",
-            self.ctx.scene_runtime.get("unsupported_onclick_bindings", []),
-        )
+        unsupported_clicks: list[dict[str, object]] = []
+        if self.state.rbx_place is not None:
+            unsupported_clicks = cast(
+                "list[dict[str, object]]",
+                self.state.rbx_place.unsupported_onclick_bindings,
+            )
         click_reason_counts: dict[str, int] = {}
         click_issues: list[UnsupportedOnClickIssue] = []
         for row in unsupported_clicks:

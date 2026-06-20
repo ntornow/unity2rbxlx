@@ -245,6 +245,52 @@ class TestPipelineIntegration:
         assert report.components.converted == 295
         assert report.output.parts_written == 295
 
+    def test_unsupported_onclick_surfaces_in_legacy_mode(self, tmp_path):
+        """FIX 2 (mode-independent fail-loud): unsupported onClick bindings must
+        surface in conversion_report.json even when ``scene_runtime`` is absent
+        (legacy mode). The report builder reads them off ``rbx_place``, NOT off
+        ``ctx.scene_runtime`` -- a converted button that can't be wired must
+        always be visible to the operator, host or no host.
+
+        Drives the REAL ``_build_conversion_report`` with a legacy-mode ctx
+        (``scene_runtime`` left at its empty default, ``scene_runtime_mode`` =
+        "legacy") so the diagnostic depends only on the place, not the host.
+        """
+        from converter.pipeline import Pipeline
+        from core.conversion_context import ConversionContext
+        from core.roblox_types import RbxPlace
+
+        project = tmp_path / "proj"
+        (project / "Assets").mkdir(parents=True)
+        pipeline = Pipeline(
+            unity_project_path=project, output_dir=tmp_path / "out", skip_upload=True,
+        )
+        # Legacy mode: scene_runtime is the empty default dict, NOT populated.
+        pipeline.ctx = ConversionContext(scene_runtime_mode="legacy")
+        assert pipeline.ctx.scene_runtime_mode == "legacy"
+        assert pipeline.ctx.scene_runtime.get("unsupported_onclick_bindings") is None
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.rbx_place.unsupported_onclick_bindings = [
+            {
+                "button_sri": "Assets/Scenes/main.unity:9",
+                "target_file_id": "77",
+                "method": "ServerOnly",
+                "reason": "domain_server",
+                "call_index": 0,
+            },
+        ]
+
+        report = pipeline._build_conversion_report(
+            tmp_path / "place.rbxlx", {"parts_written": 0, "scripts_written": 0},
+            tmp_path / "report.json",
+        )
+        summary = report.unsupported_onclick_bindings
+        assert summary.total == 1
+        assert summary.counts_by_reason == {"domain_server": 1}
+        assert summary.issues[0].method == "ServerOnly"
+        assert summary.issues[0].reason == "domain_server"
+        assert summary.issues[0].button_sri == "Assets/Scenes/main.unity:9"
+
     def test_script_summary_reflects_transpilation_result(self, tmp_path):
         """When ``state.transpilation_result`` is populated, the report's
         ``scripts`` block must surface ai/rule-based/flagged counts and

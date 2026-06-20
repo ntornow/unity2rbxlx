@@ -1272,6 +1272,50 @@ class TestClickBindingEmit:
         assert clicks == []
         assert unsupported[0]["reason"] == "unresolved_target"
 
+    def test_editor_and_runtime_call_state_emits(self):
+        """FIX 1: Unity UnityEventCallState is Off=0, EditorAndRuntime=1,
+        RuntimeOnly=2. BOTH EditorAndRuntime(1) and RuntimeOnly(2) invoke at
+        runtime, so an EditorAndRuntime(1) client-domain button MUST emit a
+        ClickBinding. RED against the pre-fix ``call_state >= 2`` gate, which
+        silently dropped EditorAndRuntime listeners (they shipped dead and never
+        reached the unsupported report).
+        """
+        owner = {"869760749": "869760744"}
+        domain = {"869760749": "client"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="500", target_fid="869760749", method="StartGame",
+            mode=1, call_state=1,   # EditorAndRuntime
+        )
+        self._convert(
+            node, owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert len(clicks) == 1, (clicks, unsupported)
+        assert clicks[0]["method"] == "StartGame"
+        assert unsupported == []
+
+    def test_off_call_state_neither_emits_nor_unsupported(self):
+        """FIX 1: an Off(0) listener is deliberately disabled in Unity -- it
+        does NOT invoke at runtime, so it correctly emits NO ClickBinding AND is
+        NOT recorded as unsupported (a disabled listener is not a binding this
+        version 'cannot honor', it's one the author turned off)."""
+        owner = {"77": "70"}
+        domain = {"77": "client"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="9", target_fid="77", method="Disabled",
+            mode=1, call_state=0,   # Off
+        )
+        self._convert(
+            node, owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported == []
+
     def test_multi_call_preserves_order_and_call_index(self):
         """Two onClick calls -> two rows, call_index 0 and 1 in order."""
         owner = {"10": "100", "20": "200"}
@@ -1383,3 +1427,119 @@ class TestClickBindingEmit:
         static_arg = [u for u in unsupported if u["reason"] == "static_argument"]
         # The About/BackButton SetActive(bool) onClicks are mode 6 -> static-arg.
         assert any(u["method"] == "SetActive" for u in static_arg), unsupported
+
+
+class TestClickBindingProductionDomainWiring:
+    """FIX 3 (production domain classification): the domain feeding the onClick
+    gate must be COMPUTED from the real classified ``scene_runtime["modules"]``
+    map, not hand-seeded into ``build_component_domain_index``.
+
+    The hand-seeded ``TestClickBindingEmit`` tests pass a domain dict straight
+    in, which is tautological w.r.t. the scene_converter projection that wires a
+    classified module's ``domain`` into the gate. This drives the REAL
+    ``convert_scene`` projection (``scene_runtime["modules"][<guid>]["domain"]``
+    -> ``module_domains`` -> ``build_component_domain_index`` -> the gate ->
+    ``scene_runtime["ui_click_bindings"]``) so the domain is produced from the
+    modules map exactly as production builds it. (Fully end-to-end through the
+    storage classifier is impractical in a unit test -- it needs the whole
+    transpile/classify pipeline -- so we feed the modules map in its classified
+    shape and assert the projection, NOT the click row's domain, is computed.)
+    """
+
+    def _scene(self, *, project_root, target_guid):
+        from pathlib import Path
+        # GameObject owning the target component (m_Script = target_guid).
+        target_go = SceneNode(
+            name="LoadoutState", file_id="700", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="710",
+                properties={"m_Script": {"guid": target_guid, "fileID": "11500000"}},
+            )],
+            children=[], parent_file_id=None,
+        )
+        # Button GameObject whose onClick targets component 710 / method StartGame.
+        button_go = SceneNode(
+            name="StartButton", file_id="800", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="810",
+                properties={"m_OnClick": {"m_PersistentCalls": {"m_Calls": [{
+                    "m_MethodName": "StartGame", "m_CallState": 2, "m_Mode": 1,
+                    "m_Target": {"fileID": "710"},
+                }]}}},
+            )],
+            children=[], parent_file_id="900",
+        )
+        canvas = SceneNode(
+            name="Canvas", file_id="900", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="Canvas", file_id="910", properties={"m_Enabled": 1},
+            )],
+            children=[button_go], parent_file_id=None,
+        )
+        from core.unity_types import ParsedScene
+        return ParsedScene(
+            scene_path=Path(project_root) / "Assets" / "Scenes" / "Main.unity",
+            roots=[canvas, target_go],
+        )
+
+    def test_domain_index_computed_from_classified_modules_map(self, tmp_path):
+        """A client-classified module in ``scene_runtime["modules"]`` drives a
+        ClickBinding through the gate -- the domain is read from the modules map
+        by convert_scene's projection, NOT seeded into the domain index."""
+        from converter.scene_converter import convert_scene
+
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        target_guid = "abc123def456abc123def456abc12345"
+        parsed = self._scene(project_root=project_root, target_guid=target_guid)
+
+        # The classified modules map, in the shape PR3b's classifier emits:
+        # module GUID -> {"domain": ...}. This is the ONLY domain input; the
+        # scene_converter projection must lift it into the gate.
+        scene_runtime: dict = {
+            "modules": {target_guid: {"domain": "client"}},
+        }
+        convert_scene(
+            parsed_scene=parsed,
+            unity_project_root=project_root,
+            scene_runtime=scene_runtime,
+            scene_runtime_mode="generic",
+        )
+
+        rows = scene_runtime.get("ui_click_bindings")
+        assert isinstance(rows, list) and len(rows) == 1, scene_runtime
+        row = rows[0]
+        assert row["method"] == "StartGame"
+        # Owner-resolved target SRI: component 710 is owned by GO 700.
+        ns = "Assets/Scenes/Main.unity"
+        assert row["target_sri"] == f"{ns}:700"
+        assert row["target_component_id"] == f"{ns}:710"
+        # The binding only emits because the projection computed domain==client
+        # from the modules map (a server/excluded/absent module would NOT emit).
+
+    def test_server_classified_module_not_wired_from_modules_map(self, tmp_path):
+        """The mirror: a module classified ``server`` in the modules map yields
+        NO ClickBinding (computed domain gates it out) and surfaces as an
+        unsupported binding on the returned place -- proving the projection,
+        not a seeded value, drives the fail-loud path."""
+        from converter.scene_converter import convert_scene
+
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        target_guid = "fff000fff000fff000fff000fff00012"
+        parsed = self._scene(project_root=project_root, target_guid=target_guid)
+
+        scene_runtime: dict = {
+            "modules": {target_guid: {"domain": "server"}},
+        }
+        place = convert_scene(
+            parsed_scene=parsed,
+            unity_project_root=project_root,
+            scene_runtime=scene_runtime,
+            scene_runtime_mode="generic",
+        )
+        assert not scene_runtime.get("ui_click_bindings"), scene_runtime
+        unsupported = place.unsupported_onclick_bindings
+        assert len(unsupported) == 1
+        assert unsupported[0]["reason"] == "domain_server"
+        assert unsupported[0]["method"] == "StartGame"

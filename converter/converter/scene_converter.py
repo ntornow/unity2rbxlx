@@ -1678,9 +1678,10 @@ def convert_scene(
         toggle_bindings: list[ToggleBinding] = []
         # By-ref accumulators for Button onClick wiring (mirrors the toggle
         # round-trip). ``click_bindings`` -> ``scene_runtime["ui_click_bindings"]``
-        # (host-bound); ``unsupported_click_bindings`` ->
-        # ``scene_runtime["unsupported_onclick_bindings"]`` (operator-only,
-        # surfaced in the conversion report, NEVER shipped to the host).
+        # (host-bound; legitimately requires the host). ``unsupported_click_bindings``
+        # -> ``place.unsupported_onclick_bindings`` (operator-only, surfaced in the
+        # conversion report in ALL modes -- generic AND legacy -- NEVER shipped to
+        # the host plan).
         click_bindings: list[ClickBinding] = []
         unsupported_click_bindings: list[UnsupportedClickBinding] = []
         place.screen_guis = convert_canvas(
@@ -1708,14 +1709,17 @@ def convert_scene(
                 existing_clicks.extend(click_bindings)
             else:
                 scene_runtime["ui_click_bindings"] = list(click_bindings)
-        if scene_runtime is not None and unsupported_click_bindings:
-            existing_unsupported = scene_runtime.get("unsupported_onclick_bindings")
-            if isinstance(existing_unsupported, list):
-                existing_unsupported.extend(unsupported_click_bindings)
-            else:
-                scene_runtime["unsupported_onclick_bindings"] = list(
-                    unsupported_click_bindings
-                )
+        if unsupported_click_bindings:
+            # Operator-facing fail-loud diagnostic. Carried on the RETURNED
+            # place (not gated on ``scene_runtime``) so the conversion report
+            # surfaces it in ALL modes -- generic AND legacy -- because a
+            # converted button that can't be wired must always be visible even
+            # when the scene-runtime host is absent. ``click_bindings`` legitimately
+            # require the host and stay host-gated above; the unsupported list
+            # must NOT be. NEVER shipped to the host plan (operator-only).
+            place.unsupported_onclick_bindings.extend(
+                dict(row) for row in unsupported_click_bindings
+            )
             for row in unsupported_click_bindings:
                 log.warning(
                     "[onclick] unsupported binding: button %s -> %s (reason=%s); "

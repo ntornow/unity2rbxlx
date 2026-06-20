@@ -555,3 +555,15 @@ class RbxPlace:
     # SmoothGrid). Replaces a module-level global in scene_converter that
     # was being read after convert_scene returned.
     terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Operator-facing diagnostic: Button onClick calls this version cannot
+    # honor (server/excluded/unresolved target, static-argument call). Carried
+    # on the place so the conversion report surfaces them in ALL modes (generic
+    # AND legacy), independent of whether a scene-runtime host is present --
+    # a converted button that can't be wired must always be visible. Each row
+    # row is a ``ui_translator.UnsupportedClickBinding`` (str fields + an int
+    # ``call_index``), kept as a plain dict here so ``core`` does not import the
+    # ``converter`` TypedDict (layering). NEVER shipped to the host plan
+    # (operator-only).
+    unsupported_onclick_bindings: list[dict[str, object]] = field(
+        default_factory=list
+    )
