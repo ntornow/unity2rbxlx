@@ -682,6 +682,18 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # Same allowlist requirement as ``equip_prefabs`` — elided if absent; an absent
     # prefab_id entry is a runtime no-op (scale 1.0).
     "equip_scales",
+    # Phase 1 consumable prototype materialization: per-DB seed records the boot
+    # shim replays to materialize a consumable-style SO's array of in-prefab
+    # component refs into component instances. LOAD-BEARING — without the
+    # allowlist entry the recomputed key is elided from the emitted plan and the
+    # shim sees ``{}`` (the OnEnable crash this phase fixes persists).
+    "consumable_db_seeds",
+    # Phase 2 lazy-singleton boot-instantiation: per-class seed records the boot
+    # shim replays to construct + Awake one instance of each lazily-created
+    # singleton MonoBehaviour before any consumer uses it. LOAD-BEARING — without
+    # the allowlist entry the recomputed key is elided from the emitted plan and
+    # the shim sees ``{}`` (the singleton never awakes; getInstance() stays nil).
+    "lazy_singletons",
 )
 
 
@@ -1068,6 +1080,8 @@ local services = {
 
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
+SceneRuntime.seedConsumableDatabases(Plan, services)
+SceneRuntime.seedLazySingletons(Plan, services, engine, "client")
 engine:start("client")
 '''
 
@@ -1269,6 +1283,8 @@ local services = {
 
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
+SceneRuntime.seedConsumableDatabases(Plan, services)
+SceneRuntime.seedLazySingletons(Plan, services, engine, "server")
 __EQUIP_SERVER_HANDLER__
 engine:start("server")
 '''

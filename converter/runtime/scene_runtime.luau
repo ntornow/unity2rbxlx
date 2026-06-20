@@ -210,6 +210,262 @@ function SceneRuntime.seedAddressableDatabases(plan, services)
 end
 
 -- ---------------------------------------------------------------------
+-- Consumable database seeding (Phase 1 prototype materialization)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim, sibling to ``seedAddressableDatabases``. For
+-- each database in ``plan.consumable_db_seeds`` it MATERIALIZES the database's
+-- design-time array of in-prefab component prototypes into live component
+-- instances and ASSIGNS them onto the DB's declared array field, BEFORE the
+-- consumer's once-only ``Load()`` drain runs. Each seed is:
+--   ``{ db_module_path, array_field, elements = { {class_stem, prefab_id,
+--      module_path, ctor_config = {...}, post_fields = {...}}, ... } }``
+-- where ``ctor_config`` and ``post_fields`` are REAL Luau TABLES rendered by the
+-- plan encoder (no ``loadstring`` — disabled on the Roblox client). The build-
+-- time resolver already coerced serialized bools (``canBeSpawned: 0`` -> ``false``)
+-- and resolved asset refs to ids, so the shim consumes the tables verbatim.
+--
+-- Per element: require the subclass module (``module_path`` resolved at BUILD
+-- time with the planner's collision-exclusion contract — no runtime stem scan),
+-- construct ``<Subclass>.new(ctor_config)`` (the typed ``.new`` reads the scalar
+-- fields, e.g. ``duration`` / ``canBeSpawned``), then assign ONLY the asset-ref
+-- ``post_fields`` (``icon`` / ``ActivatedParticleReference``) onto the instance
+-- POST-construction (``Consumable.new`` drops them, so this is the only path that
+-- carries them) and set ``.gameObject`` to the element's prefab id (the host
+-- resolves prefab ids on instantiate). NOTHING else is copied onto the instance.
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- and BEFORE ``engine:start`` — the array MUST hold materialized objects before
+-- the consumer's once-only ``Load()`` builds its dict (else ``Load()`` iterates
+-- prefab-id strings and crashes calling a method on a string).
+--
+-- Per-DB-instance once-guard: ``db._consumablesSeeded`` short-circuits a second
+-- invocation (both entrypoints / a resume / a retry) so post-``Load()`` state is
+-- never re-materialized or clobbered. Unlike ``seedAddressableDatabases`` (which
+-- APPENDS and relies on the consumer drain), this shim ASSIGNS a FRESH array, so
+-- it carries its OWN explicit guard. Generic no-op on an empty plan.
+function SceneRuntime.seedConsumableDatabases(plan, services)
+	assert(type(plan) == "table", "seedConsumableDatabases: plan required")
+	assert(type(services) == "table", "seedConsumableDatabases: services required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.consumable_db_seeds or {}
+	for _, seed in ipairs(seeds) do
+		local db = resolveModule(nil, seed.db_module_path)
+		if type(db) ~= "table" then
+			warn("[consumable-seed] database module did not resolve to a table: "
+				.. tostring(seed.db_module_path))
+		elseif db._consumablesSeeded then
+			-- Once-guard: already materialized by an earlier entrypoint /
+			-- resume; never re-materialize or clobber post-``Load()`` state.
+		else
+			local arrayField = seed.array_field
+			if type(arrayField) ~= "string" or arrayField == "" then
+				warn("[consumable-seed] seed missing array_field on "
+					.. tostring(seed.db_module_path))
+			else
+				-- Build a FRESH array (assign, not append). Even a zero-element
+				-- seed assigns ``{}`` so ``Load()`` builds an empty dict rather
+				-- than iterating a stale string array (INVARIANT: after seeding,
+				-- the field holds ONLY instances, or is empty — never strings).
+				local materialized = {}
+				for _, element in ipairs(seed.elements or {}) do
+					-- The subclass module path is resolved at BUILD time (with the
+					-- planner's collision-exclusion contract) and carried on the
+					-- element — no runtime stem scan.
+					local modulePath = element.module_path
+					local Cls = (type(modulePath) == "string" and modulePath ~= "")
+						and resolveModule(nil, modulePath) or nil
+					if type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+						warn("[consumable-seed] subclass module did not resolve "
+							.. "to a constructable class: "
+							.. tostring(modulePath or element.class_stem)
+							.. "; dropping element")
+					else
+						-- ``ctor_config`` / ``post_fields`` are REAL Luau tables in
+						-- the plan (no loadstring). Pass scalars THROUGH ``.new``;
+						-- assign ONLY the asset-ref ``post_fields`` afterwards.
+						-- Guard ``.new`` in pcall (mirror ``instantiateComponent``): a
+						-- throwing transpiled constructor must DROP only that element +
+						-- warn, never crash the whole boot shim (and every later DB
+						-- seed) — same fail-closed contract as the non-table cases.
+						local ctorConfig = element.ctor_config or {}
+						local ok, c = pcall(Cls.new, ctorConfig)
+						if not ok then
+							warn("[consumable-seed] " .. tostring(element.class_stem)
+								.. ".new threw: " .. tostring(c) .. "; dropping element")
+						elseif type(c) ~= "table" then
+							warn("[consumable-seed] " .. tostring(element.class_stem)
+								.. ".new did not return an instance; dropping element")
+						else
+							-- Asset-ref fields (icon / ActivatedParticleReference)
+							-- are dropped by ``Consumable.new`` (host-injected), so
+							-- this is the ONLY path that carries them onto the
+							-- instance. NO blanket copyback of ctor_config — that
+							-- would clobber the ctor's bool/normalization work.
+							local postFields = element.post_fields
+							if type(postFields) == "table" then
+								for k, v in pairs(postFields) do
+									c[k] = v
+								end
+							end
+							-- The host resolves the prefab id on instantiate.
+							c.gameObject = element.prefab_id
+							table.insert(materialized, c)
+						end
+					end
+				end
+				db[arrayField] = materialized
+				db._consumablesSeeded = true
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
+-- Lazy-singleton boot-instantiation (Phase 2, gap #2)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim, sibling to ``seedConsumableDatabases``. Some
+-- Unity ``MonoBehaviour``s lazily self-instantiate through a static
+-- ``Instance`` getter (``new GameObject(...) + AddComponent<Self>()``) and
+-- cache themselves in a static backing field, then expose
+-- ``getInstance()``/``StartStaticCoroutine`` off that field. The generic host
+-- has no scene/prefab placement for them, so the field stays ``nil`` and every
+-- static call is a no-op (e.g. ``CoroutineHandler.m_Instance`` nil ->
+-- ``StartStaticCoroutine`` dead). This shim constructs + Awakes EXACTLY ONE
+-- instance of each such singleton at boot — before any consumer uses it — so
+-- the converter-synthesized ``Awake`` runs ``<backing_field> = self`` and the
+-- field is live.
+--
+-- Each ``plan.lazy_singletons`` seed is the build-time record (design-phase2
+-- §1.2):
+--   ``{ module_path, class_stem, domain, script_guid, backing_field }``
+-- The shim is class-agnostic — it loops the plan and uses the generic
+-- ``engine:addComponent`` + ``Cls[seed.backing_field]`` reflection. Nothing is
+-- keyed on a literal class name or field name.
+--
+-- Unlike the other two seed shims, this one needs the LIVE engine to construct
+-- + Awake the instance, so the entrypoint passes the constructed ``engine`` in.
+-- ``domainFilter`` (``"client"``/``"server"``) restricts seeding to the
+-- entrypoint's side; ``nil`` (harness) seeds every seed — mirroring
+-- ``engine:start``'s filter. A ``"helper"`` seed loads in BOTH VMs (a shared
+-- ReplicatedStorage utility), so it is constructed on EITHER side regardless of
+-- ``domainFilter``; the per-VM idempotency guard (2) prevents a double-construct
+-- within a single VM.
+--
+-- Per seed:
+--   1. Resolve the module by ``script_guid`` (the GUID-keyed ``plan.modules``
+--      key ``_buildComponent`` looks up). Warn + skip on a non-table / no
+--      ``.new`` (fail-soft, mirroring ``seedConsumableDatabases``).
+--   2. IDEMPOTENCY GUARD: if ``Cls[seed.backing_field] ~= nil`` an instance is
+--      already cached (a scene-placed instance Awoke, or a prior shim call /
+--      entrypoint), so SKIP — the singleton contract is "exactly one
+--      instance". The guard reads the CARRIED ``backing_field`` (name varies
+--      across projects: ``m_Instance``/``_instance``/``s_Instance``), never a
+--      hardcoded literal.
+--   3. Otherwise construct via ``engine:addComponent(go, seed.script_guid,
+--      {})`` against a synthetic host-container id — that fires the lifecycle
+--      (Awake -> OnEnable -> deferred Start) synchronously through Awake, so
+--      the synthesized ``Awake`` caches ``<backing_field> = self`` and
+--      ``getInstance()`` is live for every later consumer.
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- + the other seeds and BEFORE ``engine:start`` — so the backing field is live
+-- before any scene/prefab Awake/OnEnable/Start (or the deferred Start tick)
+-- calls ``getInstance()``/``StartStaticCoroutine``. Generic no-op on an empty plan.
+function SceneRuntime.seedLazySingletons(plan, services, engine, domainFilter)
+	assert(type(plan) == "table", "seedLazySingletons: plan required")
+	assert(type(services) == "table", "seedLazySingletons: services required")
+	assert(type(engine) == "table", "seedLazySingletons: engine required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.lazy_singletons or {}
+	for _, seed in ipairs(seeds) do
+		-- Side filter: skip a seed whose classified domain is not this
+		-- entrypoint's side. ``nil`` filter (harness) seeds everything. A
+		-- ``"helper"`` seed loads in BOTH VMs, so it is constructed on either
+		-- side regardless of the filter (the per-VM idempotency guard prevents
+		-- a double-construct within a VM).
+		if domainFilter ~= nil
+		   and seed.domain ~= "helper"
+		   and seed.domain ~= domainFilter then
+			-- not this side
+		else
+			-- (1) Resolve the singleton module by its GUID-keyed module path.
+			-- ``resolveModule`` may THROW on an unresolvable module (not just
+			-- return nil), so pcall it — a throwing resolver must warn + skip
+			-- this seed, never crash boot.
+			local ok, Cls = pcall(resolveModule, seed.script_guid, seed.module_path)
+			if not ok then
+				warn("[lazy-singleton] resolveModule errored for "
+					.. tostring(seed.module_path or seed.class_stem)
+					.. " (guid " .. tostring(seed.script_guid) .. "): "
+					.. tostring(Cls) .. "; skipping seed")
+			elseif type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+				warn("[lazy-singleton] module did not resolve to a constructable "
+					.. "class: " .. tostring(seed.module_path or seed.class_stem)
+					.. "; skipping seed")
+			else
+				local backingField = seed.backing_field
+				if type(backingField) ~= "string" or backingField == "" then
+					warn("[lazy-singleton] seed missing backing_field on "
+						.. tostring(seed.module_path or seed.class_stem)
+						.. "; skipping seed")
+				elseif Cls[backingField] ~= nil then
+					-- (2) Idempotency guard: an instance is already cached (a
+					-- scene-placed instance Awoke, or a prior shim call). The
+					-- singleton is live; do NOT double-construct.
+				else
+					-- (3) Construct + Awake one instance. The synthetic host
+					-- container id is the faithful analog of Unity's bare
+					-- ``new GameObject(...)`` (a non-rendered, host-owned
+					-- container). ``addComponent`` accepts a string ``go`` as
+					-- the goId directly, so no Instance creation is needed; the
+					-- id is stable + unique per class. ``addComponent`` ->
+					-- ``_buildComponent`` looks up ``plan.modules[script_guid]``
+					-- (GUID-keyed), constructs ``Cls.new``, injects the host
+					-- surface, then runs Awake (which caches
+					-- ``Cls[backing_field] = self``). ``_buildComponent`` wraps
+					-- ``.new`` in pcall, so a throwing constructor drops just
+					-- this singleton + warns, never crashing boot.
+					local hostId = "_lazysingleton:" .. tostring(seed.class_stem)
+					-- ``_buildComponent`` indexes ``plan.modules[script_guid]``
+					-- (GUID-keyed) — a stale/missing GUID would explode inside
+					-- it before any warn path. Check presence first, then pcall
+					-- the construct so a throwing build (or any addComponent
+					-- error) warns + skips THIS seed, never crashing boot.
+					local plan_modules = plan.modules or {}
+					if plan_modules[seed.script_guid] == nil then
+						warn("[lazy-singleton] script_guid not present in "
+							.. "plan.modules: " .. tostring(seed.script_guid)
+							.. " (" .. tostring(seed.class_stem)
+							.. "); skipping seed")
+					else
+						local buildOk, buildErr =
+							pcall(engine.addComponent, engine, hostId, seed.script_guid, {})
+						if not buildOk then
+							warn("[lazy-singleton] addComponent errored for "
+								.. tostring(seed.class_stem) .. " (guid "
+								.. tostring(seed.script_guid) .. "): "
+								.. tostring(buildErr) .. "; skipping seed")
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Constructor
 -- ---------------------------------------------------------------------
 

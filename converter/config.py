@@ -170,7 +170,7 @@ ROBLOX_CREATOR_TYPE: str = "User"
 # ---------------------------------------------------------------------------
 
 MESH_DECIMATION_ENABLED: bool = True
-MESH_ROBLOX_MAX_FACES: int = 10_000
+MESH_ROBLOX_MAX_FACES: int = 20_000  # Roblox per-mesh triangle cap (20,000 since the 2021 mesh-import limit raise)
 MESH_TARGET_FACES: int = 8_000
 MESH_QUALITY_FLOOR: float = 0.6
 

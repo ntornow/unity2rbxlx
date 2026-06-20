@@ -915,7 +915,7 @@ def _walk_scene(
             if c.component_type in _CHARACTER_CONTROLLER_TYPES:
                 cc_go_fids.add(go_fid)
 
-    def _visit(node: SceneNode) -> None:
+    def _visit(node: SceneNode, ancestor_inactive: bool = False) -> None:
         for comp in node.components:
             if comp.component_type != "MonoBehaviour":
                 continue
@@ -925,6 +925,39 @@ def _walk_scene(
             runtime_bearing.add(script_id)
             if node.file_id in cc_go_fids:
                 character_controller_scripts.add(script_id)
+            # Gap #3 — never-placed dormant-holder descendant suppression.
+            # ``scene_converter`` prunes an inactive GameObject's children
+            # in EVERY mode: legacy prunes the whole subtree, and generic
+            # emits the inactive node as a CHILDLESS dormant holder
+            # (``_emit_dormant_holder`` deliberately does not recurse). So a
+            # MonoBehaviour whose host has any INACTIVE ANCESTOR is never
+            # placed in the workspace — emitting its instance row would bind
+            # the host runtime to a GameObject ``workspaceFind`` can never
+            # resolve (``self.gameObject = nil`` → ``connectGameObjectTrigger
+            # Signal: no touch part on nil``). Suppress the dangling row, its
+            # references, and its lifecycle entry. The host node's OWN
+            # ``active`` flag does NOT suppress: an inactive-but-referenced
+            # node still gets its dormant holder, so its own MonoBehaviour
+            # rows resolve to that holder. ``runtime_bearing`` is recorded
+            # above regardless, so the module still emits (the class may also
+            # run on a runtime-instantiated rig). Keyed purely on the
+            # deterministic ``m_IsActive`` ancestor-chain fact.
+            #
+            # UI carve-out (cross-slice boundary with the ui_translator
+            # gap #4 fix): a host UNDER A CANVAS is NOT suppressed even when
+            # an ancestor is inactive. The UI producer-side fix emits the
+            # inactive UI subtree's ``_SceneRuntimeId``-stamped HOST CLONE
+            # into PlayerGui, and the runtime binds the component to that
+            # landed clone via the deferred ``awaitUiHost(sceneRuntimeId)``
+            # path — which is DRIVEN by this planner instance row (the host
+            # build loop calls ``awaitUiHost`` only for ``instance_owner_is_ui``
+            # rows). Suppressing the row here would delete the very deferred
+            # host row that fix depends on (D-P4-4 declared planner-side UI
+            # suppression WRONG — "kills SetActive-driven popups"). Gap #3 is
+            # a scene/world dormant-holder descendant whose host the converter
+            # never places, so it stays suppressed; UI hosts keep their row.
+            if ancestor_inactive and node.file_id not in ui_go_fids:
+                continue
             enabled_raw = comp.properties.get("m_Enabled", 1)
             enabled = bool(enabled_raw) if isinstance(enabled_raw, (int, bool)) else True
 
@@ -963,8 +996,12 @@ def _walk_scene(
             instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)
+        # A node that is itself inactive becomes a (childless) dormant
+        # holder; everything below it is never placed, so its descendants'
+        # rows are suppressed via the propagated flag.
+        child_ancestor_inactive = ancestor_inactive or not node.active
         for child in node.children:
-            _visit(child)
+            _visit(child, child_ancestor_inactive)
 
     for root in scene.roots:
         _visit(root)

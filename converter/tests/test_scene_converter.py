@@ -2128,3 +2128,99 @@ class TestUnityMassStamp:
         # Stamp moved to the inner mesh part; outer Model no longer carries it.
         assert inner.attributes.get("_UnityMass") == 1.0
         assert "_UnityMass" not in part.attributes
+
+
+class TestDormantHolderDescendantNoDanglingRow:
+    """Gap #3 cross-file contract (slice 4.2): when an inactive holder is
+    emitted dormant (childless) by ``convert_scene`` under generic mode, the
+    ``scene_runtime`` planner must NOT have emitted a component row for a
+    MonoBehaviour on one of that holder's never-placed descendants — otherwise
+    the host runtime binds the trigger to a GameObject ``workspaceFind`` can
+    never resolve (``connectGameObjectTriggerSignal: no touch part on nil``).
+
+    Runs the REAL planner + REAL converter together so the producer (dormant
+    holder placed childless) and the consumer (no dangling row) are proven to
+    agree on the integrated path.
+    """
+
+    def test_no_row_for_active_child_under_inactive_parent(self, tmp_path):
+        from core.unity_types import ComponentData, ParsedScene, SceneNode
+        from converter.scene_converter import convert_scene
+        from converter.scene_runtime_planner import plan_scene_runtime
+
+        # Script for the descendant MonoBehaviour (the "trigger" binder).
+        scripts = tmp_path / "Assets" / "Scripts"
+        scripts.mkdir(parents=True)
+        cs = scripts / "CharacterCollider.cs"
+        cs.write_text("public class CharacterCollider : MonoBehaviour { }")
+        guid = "a" * 32
+        from core.unity_types import GuidEntry, GuidIndex
+        idx = GuidIndex(project_root=tmp_path)
+        idx.guid_to_entry[guid] = GuidEntry(
+            guid=guid, asset_path=cs,
+            relative_path=cs.relative_to(tmp_path), kind="script",
+        )
+        idx.path_to_guid[cs.resolve()] = guid
+
+        # CharacterSlot (active) hosts the MonoBehaviour; its parent PlayerPivot
+        # is inactive. PlayerPivot becomes a childless dormant holder, so
+        # CharacterSlot is never placed.
+        slot = SceneNode(
+            name="CharacterSlot", file_id="CharacterSlot", active=True,
+            layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="200",
+                properties={
+                    "m_Script": {"fileID": "11500000", "guid": guid, "type": 3},
+                    "m_GameObject": {"fileID": "CharacterSlot"},
+                    "m_Enabled": 1,
+                },
+            )],
+            children=[], parent_file_id="PlayerPivot",
+        )
+        pivot = SceneNode(
+            name="PlayerPivot", file_id="PlayerPivot", active=False,
+            layer=0, tag="Untagged", components=[], children=[slot],
+            parent_file_id=None,
+        )
+        scene_file = tmp_path / "Assets" / "Scenes" / "Main.unity"
+        scene_file.parent.mkdir(parents=True, exist_ok=True)
+        scene_file.touch()
+        scene = ParsedScene(
+            scene_path=scene_file, roots=[pivot],
+            all_nodes={"PlayerPivot": pivot, "CharacterSlot": slot},
+        )
+
+        # REAL planner artifact.
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        ns = "Assets/Scenes/Main.unity"
+        block = artifact["scenes"][ns]
+        # Consumer side: no dangling row bound to the never-placed CharacterSlot.
+        slot_id = f"{ns}:CharacterSlot"
+        assert all(i["game_object_id"] != slot_id for i in block["instances"]), (
+            "planner must not emit a component row for a MonoBehaviour whose "
+            "host is a descendant of a never-placed dormant holder"
+        )
+
+        # Producer side: CharacterSlot is never placed in the workspace
+        # (PlayerPivot's subtree is pruned / dormant-holder non-recursed),
+        # so no part with that name exists — symmetric with the suppressed row.
+        place = convert_scene(
+            parsed_scene=scene, unity_project_root=tmp_path,
+            scene_runtime=dict(artifact), scene_runtime_mode="generic",
+        )
+
+        def _all_parts(parts):
+            out = list(parts)
+            for p in parts:
+                out.extend(_all_parts(p.children))
+            return out
+
+        names = {p.name for p in _all_parts(place.workspace_parts)}
+        assert "CharacterSlot" not in names, (
+            "the active child of an inactive parent must never be placed "
+            "(its parent's subtree is pruned / dormant-holder non-recursed)"
+        )

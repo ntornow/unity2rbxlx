@@ -3602,3 +3602,372 @@ diff would re-audit already-finalized clean phase-1 code (review-churn). Scope t
 code lenses to the NEW work since the converged v3 finalize: a3451a4..364699d (the phase-2 delta);
 whole-run read context retained for aggregate awareness. The terminal review-finalize-2.md still
 binds the full featureBranch tip 364699d (ship-gate R==tip holds).
+
+## ---- /drive run mesh-fidelity-20260619T232452 (promoted 2026-06-19T16:22:45Z) ----
+
+# Decisions — mesh-fidelity-20260619T232452
+
+## PLAN-stage design choices
+
+- **`MESH_ROBLOX_MAX_FACES = 20_000`** — documented Roblox per-mesh triangle limit since ~2021. Classification: Mechanical (matches platform spec the task cites).
+- **Clamp semantics `min(max(target, floor), cap)`** — quality floor may raise the target; the hard cap always wins so output never exceeds what Roblox accepts. `MESH_TARGET_FACES = 8_000` left unchanged (only the cap was stale). Classification: Mechanical.
+- **Quarantine at the single invariant site (`pipeline.py:2820–2851`)** — on an embedded-mesh key resolving to ≠1 sub-mesh, drop it from freshly-parsed `mesh_hierarchies` + `mesh_native_sizes` before merge, and append to `ctx.asset_upload_errors`. Keep the existing `log.warning` as the diagnostic. Classification: Taste (chose single-source-of-truth quarantine over a separate pass).
+- **No `scene_converter.py` change** — its face-decal/no-mesh fallback already fires on key-absence from the hierarchy tables (read-confirmed in `_resolve_mesh_geometry`/`_resolve_sub_mesh`), so upstream quarantine is sufficient. Classification: Taste (avoid redundant downstream gate).
+
+## Single phase
+- One phase, one slice. Both fixes are independent, disjoint-file, ≲25 logic SLOC total → no fan-out and no staged-risk seam. Classification: Mechanical (default-to-one-phase).
+
+
+## Design review r1 (2026-06-19) — BLOCKING: bug-2 binding gate is uploaded_assets, not hierarchy tables
+Classification: Mechanical (root-caused against real code by the Claude voice; codex text-only missed it).
+Revise design: bug-2 quarantine must also drop the key from `uploaded_assets` (the table _resolve_mesh_id
+reads), detailed design to verify the mesh-less node reaches the face-decal/no-geometry path. Fold MINORs:
+(1) note bug-1 decimation path is currently unwired (latent fix + test pin; don't claim real-output change);
+(2) also pop the quarantined key from the merged/ctx dicts, not just the pre-merge fresh dicts.
+
+## Revised decisions (post-r1, against real code under converter/converter/)
+
+- **Bug-2 quarantine mechanism (REVISED)** — at the invariant site (`pipeline.py:2820–2851`), drop the
+  offending embedded key from THREE table sets and append to `ctx.asset_upload_errors`:
+  (1) `mesh_hierarchies` + `mesh_native_sizes`, (2) `ctx.uploaded_assets` (the MeshId binding gate read by
+  `_resolve_mesh_id` at `scene_converter.py:2892–2896`), (3) the MERGED/`ctx` dicts, not just the pre-merge
+  fresh dicts (merge is `{**existing, **fresh}` → a prior-rerun `ctx` key survives a pre-merge-only drop).
+  Same `f"{rel}#{file_id}"` key shape in both tables (`pipeline.py:2014`), recognised by `is_embedded_mesh_key`.
+  Classification: Mechanical (binding-gate root-caused against real code; the round-1 "hierarchy-tables-only,
+  no scene_converter change" claim was FALSE — size-only, MeshId still bound to leaked geometry).
+
+- **Verified end-state — NO `scene_converter.py` change needed** — with the key absent from `uploaded_assets`
+  AND `mesh_hierarchies`, `_resolve_mesh_id` returns `None` via membership-guarded `in` checks (no KeyError):
+  `_resolve_sub_mesh`→None, embedded-candidate lookup misses, `.prefab` path is not an `uploaded_assets` key.
+  `part.mesh_id` is never set (`scene_converter.py:1889`); sizing falls to `_compute_mesh_size_from_fbx_bbox`
+  (reads FBX, not the tables) / unity-scale fallback → MeshPart with no MeshId = existing colored-part /
+  face-decal fallback, crash-free. Classification: Taste (skip a redundant downstream guard the trace proves
+  unnecessary). If the trace had shown a KeyError, the fallback was a `scene_converter` guard on
+  `asset_upload_errors`; it is not needed.
+
+- **Bug-1 is a LATENT fix (MINOR folded)** — `decimate_mesh`/`needs_decimation` have NO production callers
+  (grep-confirmed; test-only references). Meshes upload raw, Open Cloud decimates server-side. Cap bump
+  (20_000) + clamp are correct and test-pinned, but the design/PR must NOT claim they change real conversion
+  output today. Classification: Mechanical (latent correctness + spec-accuracy).
+
+## Stage-1 autoplan skipped (proportionality)
+Classification: Taste. Ran the dual-voice design review (the load-bearing P1 gate — it caught + fixed a
+real BLOCKING). Skipped the full gstack autoplan (CEO/Design/Eng/DX) as disproportionate for a ~30-SLOC
+internal mesh-pipeline correctness fix with no product/UX surface. Per OPERATING.md right-size-at-design.
+
+## Phase-1 DETAILED-DESIGN choices (2026-06-19, against real code @ eb8f452)
+- **File layout (verified):** `config.py` is at `converter/config.py` (NOT `converter/converter/`); constants at lines 173–175. Clamp line is `mesh_processor.py:168`. Quarantine site `pipeline.py`, ctx-merge at 2847–2851 (log.warning loop 2830–2841). `_resolve_mesh_id` 2882–2933, embedded lookup 2917–2921. Classification: Mechanical.
+- **Bug-2 extracted as a pure module-level helper `_quarantine_bad_embedded_meshes(mesh_hierarchies, mesh_native_sizes, uploaded_assets, upload_errors)`** — mutates in place, returns quarantined keys, called once right after the ctx merge (post-merge). Single source of truth at the invariant site (honors locked "no second pass"); makes the quarantine unit-testable without the Open Cloud resolve round-trip. log.warning diagnostic kept. Classification: Taste.
+- **Quarantine operates on `self.ctx.*` (merged dicts), pops all three slash directions of the embedded key from `uploaded_assets`** (mirrors `_embedded_key_candidates`), discovers offending keys via `mesh_hierarchies.items()` + `is_embedded_mesh_key` with `len(subs) != 1` (covers 0 and ≥2). Satisfies the post-merge + slash-variant pins. Classification: Mechanical.
+- **Bug-1 existing tests survive the bump** — `test_mesh_processor_decimation.py` passes `max_faces=10_000` as an explicit arg, not the default constant; no test asserts the default value. Update the stale module docstring ("currently 21,844 faces" → 20_000). Classification: Taste.
+- **Single slice confirmed at detailed design** — disjoint files, no fan-out / staged-risk, ~25–30 SLOC; the bug-2 helper + its single call site stay in one review unit (shared contract). Classification: Mechanical.
+
+## Phase-1 integration review — proportionate (single-slice)
+Classification: Taste. phaseInt is a clean FF of the already-dual-voice-reviewed slice (identical content).
+Recorded CONVERGED on the integration suite (4014 passed, no-Any) + the slice dual-voice pass rather than
+burning a duplicate full review round on byte-identical code. Per OPERATING.md right-size-at-design.
+
+## Finalize r1 — bug-1 was deeper than framed: decimation was entirely non-functional (positional arg)
+Classification: Mechanical (empirically root-caused). decimate_mesh passed the face count positionally to
+trimesh's simplify_quadric_decimation(percent=…, face_count=…) → ValueError → except → un-decimated original.
+So bug-1 is NOT merely a stale-constant/clamp latent fix: whenever a decimation backend IS present the path
+was broken (no decimation, oversized meshes shipped). Fixed with face_count= keyword; output now strictly
+bounded by the (clamped) cap. decimate_mesh still has no production caller today (impact latent until wired),
+but the fix makes the path actually correct. Surface this corrected framing at Gate B.
+
+## Verify stage skipped (no UI/URL; real-upload check low-yield)
+Classification: Taste. The change is converter-internal (no UI/URL surface to qa-only/browse). The Gate-A
+deferred 20k real-upload acceptance check is now low-yield (decimate_mesh has no production caller + no
+decimation backend in-env, so a live conversion wouldn't exercise the clamp). Documented as a followup;
+verification rests on the unit suite (4016 passed) + the strict <=cap real-path tests (active with a backend).
+
+
+# Decisions — trash-dash-phase2 run
+
+## Phase 3 — ThemeDatabase SO-seed population (gap #5a)
+
+- **D-P3-1.** Fix the dict-store SO-DB by **rewriting the transpiled `LoadDatabase`**
+  (consumer-lowering, Option A), NOT by extending the list-store seed+shim
+  (`_build_theme_seed_plan` / `seedAddressableDatabases`). The store the consumer reads
+  (`GetThemeData` → `themeDataList[type]`) is a **closure-private LOCAL upvalue** in the
+  transpiled output, unreachable by any external shim — so the DB module itself must own
+  its own keyed write. Endorsed by codex (xhigh) over options B (shim-into-public-setter)
+  and C (generalize drain-bind to keyed-local stores). Direct precedent:
+  `converter/converter/roster_consumer_lowering.py` already does exactly this region-rewrite
+  for the prefab `<GameObject>` roster analogue. **Classification: converter-architecture.**
+
+- **D-P3-2.** Key the lowering on the deterministic `LoadAssetsAsync<SOType>("<label>")` C#
+  ownership + the SO-seed surface (`resolve_scriptable_object_addressables`), never the
+  AI-output fingerprint or a per-game string. Fail-closed (`SoDbUnresolved` →
+  `FailClosed(kind="so_db_unresolved")`) when the rewrite TARGET cannot be located in the
+  AI output. Named blind spot: the trigger is upstream-deterministic, but the rewrite
+  target lives in non-deterministic AI output, so target-location failure fails loud, not
+  guesses. **Classification: converter-generality.**
+
+- **D-P3-3.** Leave the list-store seed/shim path (`_build_theme_seed_plan`,
+  `seedAddressableDatabases`) intact for genuine list-store DBs; the new lowering
+  supersedes it ONLY for the keyed-dictionary SO-store shape. The gate-(b) regex fix
+  (`_CS_METHOD_HEADER` control-keyword exclusion) benefits BOTH paths. **Classification:
+  converter-architecture.**
+
+- **D-P3-4 (phasedesign3 BLOCKING 1).** Place the SO-DB consumer-lowering in
+  `pipeline.py`'s `write_output`, as a NEW method `_lower_so_db_consumers` SIBLING of
+  `_build_theme_seed_plan` (call site right after it, pipeline.py:7236-7242), NOT in
+  `contract_pipeline.transpile_with_contract` next to the roster call. Reason: the SO surface
+  needs `so_map` (emitted-SO GUIDs from `_build_scriptable_object_module_map`), which does not
+  exist until `write_output`; `transpile_with_contract` runs earlier (from `transpile_scripts`)
+  and reads ONLY the plan-time-persisted prefab `by_label`. `_build_theme_seed_plan` is the one
+  place `so_map`, `so_addr` (`resolve_scriptable_object_addressables`), the placed luau source
+  (`source_by_name` ← `rbx_place.scripts[*].source`), and the per-module C#
+  (`_find_cs_source_for_module`) all coexist, and it runs before the plan/entrypoints emit, so
+  mutating `RbxScript.source` there reaches the emitted output. **`contract_pipeline.py` is no
+  longer touched by this phase.** Verified against the detached Phase-1&2 worktree
+  `…/wt/design3` (`transpile_with_contract` reads `by_label` only; `_build_theme_seed_plan` at
+  pipeline.py:7372 has all four inputs in scope). Classification: **converter-architecture.**
+
+- **D-P3-5 (phasedesign3 BLOCKING 2).** ENFORCE roster/SO-DB disjointness (a shared label can
+  appear in BOTH the prefab `by_label` and the SO `by_label` — prefab narrowing drops SO *guids*,
+  not the label *key*), with TWO deterministic guards in the NEW module + the new orchestration
+  (NO edit to `roster_consumer_lowering.py`): (b) `find_so_db_consumers` BINDS `<T>` from
+  `LoadAssetsAsync<T>(...)` and produces a fact ONLY when the label's SO-surface guids resolve
+  to ≥1 emitted SO module — a `<GameObject>` load abstains; and (a) the SO finder abstains on any
+  `source_path` the roster lowering already claimed this run (`roster_claimed_paths`), preventing
+  a double-rewrite even in the pathological both-resolve case. The pre-existing roster-finder
+  `<T>` gap is GUARDED-AROUND here, not fixed (fixing it edits roster code + re-reviews the live
+  CharacterDatabase path — deferred to the filed followup). Keyed on the deterministic
+  `<T>`/SO-map/claimed-set facts, never a per-game string. Classification: **converter-generality.**
+
+## Slice 3.1 implementation notes (clarification, no design deviation)
+- **D-P3-4 (clarify §3f layers).** Confirmed empirically: layer (b) (`<T>`/SO-surface
+  gate) only distinguishes the roster vs SO DB when their labels resolve to DISJOINT
+  guids (the GameObject label's guids are prefab guids absent from the SO map). For a
+  TRULY-shared label (one label genuinely tagging an SO that both DBs load), both loads
+  resolve to the same SO guids and layer (b) claims BOTH — exactly the pathological case
+  the design names; layer (a) `roster_claimed_paths` is the enforcing guard there. This
+  matches design §3f intent ("could in principle satisfy both finders … layer (a) prevents
+  the roster finder's pre-existing gap from causing a double-rewrite"). Tests encode both.
+- **Lowering details:** the path resolver is INLINED into the rewritten `LoadDatabase`
+  (no module-level `local function` helper) so the region locator's state-decl walk-back
+  stays byte-stable across re-runs (idempotence). The keyed accessor (`GetThemeData`) is
+  LOCATED as the public method that is neither getter nor the load method; getters are
+  located by the state-local they return (nil-init -> dict getter, bool-init -> loaded).
+- **roster_claimed_paths re-derivation:** read-only via `find_roster_consumers` over the
+  off-disk prefab-narrowed `by_label` in the write_output window (touches no roster code).
+
+## Phase 3 HARDEN pass (drive-harden, 2026-06-18)
+- **P2-1 (lens 1) — ACTED: added pipeline-orchestration coverage.** The diff unit-tested
+  only the pure `so_db_consumer_lowering` functions + the gate-b regex; the production
+  `Pipeline._lower_so_db_consumers` orchestration (real input derivation: parse_addressables
+  → resolve_scriptable_object_addressables; per-module `.cs` re-read + `_derive_cs_load_ownership`
+  → `load_method_by_path`; the read-only `find_roster_consumers` re-derivation →
+  `roster_claimed_paths`; the fail-closed re-raise) was UNEXERCISED. Added
+  `TestLowerSoDbConsumersOrchestration` (5 tests) to `tests/test_theme_seed_plan.py`,
+  reusing the existing real `_make_project`/`_pipeline_with_state` harness. Drives the real
+  method end-to-end on the keyed-dict Luau shape. Verified the orchestration test FAILS if the
+  gate-b regex regresses (`load_method='if'` → `SoDbUnresolved`), so it is a genuine regression
+  guard, not green-for-wrong-reason. Classification: **converter-architecture (test coverage)**.
+  - Discovered while spiking: the orchestration keys `csharp_by_path` by `RbxScript.source_path`,
+    which production stamps at pipeline.py:3334 (`source_path=ts.output_filename`). The existing
+    `_pipeline_with_state` harness did NOT set it, so a naive reuse silently no-ops. The new
+    `_lower_pipeline` helper sets `source_path` to mirror production; a `test_orchestration_noop_without_source_path`
+    documents+guards that keying contract so the positive test can't pass for the wrong reason.
+- **P2-2 (lens 2) — CLASSIFIED filed-followup, NOT an in-scope bug.** `roster_claimed_paths`
+  cannot under-approximate relative to what the SO finder can act on: BOTH `find_roster_consumers`
+  and `find_so_db_consumers` iterate the SAME `csharp_by_path` (keyed by `source_path`), so a
+  module whose C# is unresolvable in the write_output window is invisible to BOTH finders — the
+  SO finder cannot rewrite a module the roster re-derivation didn't see. The only residual is the
+  pre-existing roster `<T>` gap (already filed; the §3f layer-(b)-is-tautological residual already
+  filed in followups.md round 2). No fix in this phase: a real fix touches `roster_consumer_lowering.py`
+  (scope expansion). Classification: **filed-followup, no current-input impact**.
+
+## Harden phase 3 — adjudication
+- **D-P3-6.** Overruled codex's harden lens-2 P1 (roster_claimed_paths under-approximation) as a
+  false-positive at the real integrated path: pipeline.py:7621-7654 passes ONE csharp_by_path to both
+  find_roster_consumers and find_so_db_consumers, so a module invisible to the roster re-derivation
+  (C# unresolvable → skipped from the dict) is equally invisible to the SO finder → cannot be
+  mis-routed/double-rewritten. Confirmed lens-1 P1 (orchestration test gap) and fixed it (5 tests).
+  Classification: **review-adjudication** (adversarial BLOCKING reproduced against the integrated
+  path, refuted, overruled WITH evidence — not silently dropped).
+
+## Phase 4 — gameplay spawn closure + residual bindings (detailed design, 2026-06-19)
+
+- **D-P4-1.** Gap #5 is THREE layers (re-diagnosed): L2 (theme prefab-id data) already works
+  post-Phase-3; L1 (5 `nil`+abort InstantiateAsync call sites in TrackManager.luau) and a
+  NEWLY-FOUND L0 (segment/obstacle prefabs never emitted as Templates — `addr_ids` only sources
+  AddressableAssetsData groups, not SO `.asset` AssetReference arrays; `prefab_packages.py:402`)
+  are both dead. L0 folded into this phase (slice 4.1) — L1 is unverifiable without it.
+  **Classification: converter-architecture.**
+- **D-P4-2.** L0 fix = a NEW SO-AssetReference prefab resolver in `addressables_resolver.py`
+  (symmetric with `resolve_scriptable_object_addressables`, but prefab-typed), unioned into
+  `addr_ids` at `pipeline._build_addressables_block`/`plan_scene_runtime` upstream of both
+  `select_emitted_prefab_ids` and `_generate_prefab_packages`, and fed to
+  `resolve_template_child_names`. Keyed on serialized `m_AssetGUID` + guid_index `.prefab`
+  classification — never a label/AI fingerprint. **Classification: converter-generality.**
+- **D-P4-3.** L1 fix = a coherence-pack-style call-site lowering (new
+  `spawn_call_site_lowering.py`, orchestrated in `write_output` like `_lower_so_db_consumers`):
+  identity-gated detection of `local v=nil`+`if v==nil then warn("Unable to load…") return end`
+  with an InstantiateAsync/LoadAssetAsync origin comment → rewrite to
+  `host.instantiatePrefab(<resolved prefab-id>, …)`. Fail-CLOSED + loud on shape/ref-resolution
+  miss (rewrite target in non-deterministic AI output — D-P3-2 precedent). Idempotent (twice-call
+  test). MUST key on the collision-resolved EMITTED template name, not the dangling registry
+  `template_name`. **Classification: converter-architecture.**
+- **D-P4-4.** Gaps #3 and #4 are the SAME defect class (planner emits a component/deferred row;
+  placement prunes the inactive host) in DISJOINT files → fan-out slices. #3 fix = producer-side
+  at `scene_converter._emit_dormant_holder` / planner (defer/resolve dormant-holder MonoBehaviour
+  descendants; prefer DEFER over eager placement to avoid duplicating the runtime rig). #4 fix =
+  producer-side at `ui_translator.py:394` (emit inactive UI subtree HIDDEN + keep recursing, so
+  the `_SceneRuntimeId` host clone lands; planner-side suppress is WRONG — kills SetActive-driven
+  popups). **Classification: converter-architecture.**
+- **D-P4-5.** Slices: 4.1 (L0+L1 spawn closure, foundation, no dep — keep L0+L1 together for the
+  shared prefab-id/Template-name contract); 4.2 (gap #3, fan-out, owns scene_converter/planner);
+  4.3 (gap #4, fan-out, owns ui_translator.py). 4.2 ∥ 4.3 disjoint from 4.1 and each other.
+  **Classification: decomposition (fan-out per design.md split commitment).**
+
+## Phase 4 — design review revisions (dual-voice FINDINGS, 2026-06-19)
+
+- **D-P4-6 (supersedes D-P4-3's detector premise — P1-1/P2-2).** The L1 detector is RE-ANCHORED
+  on the deterministic transpiler ORIGIN COMMENT (`Instantiate*`/`LoadAssetAsync<GameObject>`),
+  NOT a single `local v=nil`+warn-abort guard shape. Empirically against the REAL TrackManager.luau
+  the guard shape matches ONLY the segment site (484); the other rewritable sites diverge —
+  obstacle inverted `if obj~=nil` (547), consumable/premium bare `toUse=nil` reassign (599/612),
+  cloud `:Clone()` on a string (307). There are SIX origin sites (not five): the 6th is the
+  character site (168), which is already lowered to a scene-find degrade and EXCLUDED (no clonable
+  prefab). Five sites enter the rewrite set (segment/obstacle/consumable/premium/cloud).
+  **Classification: converter-generality (enumerate the real input space before locking the
+  abstraction).**
+- **D-P4-7 (P1-2).** The cloud site (`local obj = cloud:Clone()`, TrackManager.luau:307) is
+  BROKEN, not "works": C# `ThemeData.cloudPrefabs` is `GameObject[]` but the converter serializes
+  it as prefab-id STRINGS (themeData__86f154.luau), so `:Clone()` on a string errors at runtime.
+  It is folded INTO the L1 rewrite set (instantiate by prefab-id via `host.instantiatePrefab`),
+  not left as `:Clone()`. **Classification: converter-architecture.**
+- **D-P4-8 (corrects D-P4-2's write point — P1-3).** L0 must union the SO-prefab ids into the
+  PERSISTED `artifact["addressables"]` block (a new `so_prefab_ids` axis) BEFORE the freeze
+  `self.ctx.scene_runtime = dict(artifact)` (pipeline.py:1458), AND extend BOTH emit-gate consumer
+  loops (`pipeline.py:6500` and `:6752`) to read that axis. The emit gate re-walks the PERSISTED
+  block, NOT the local `addr_ids` (pipeline.py:1418) — unioning only into the local makes L0
+  half-work (names resolve via the :1438 name-pass, but Templates never emit). The local also gets
+  the union (for the name pass). **L1 target API: `self.host.instantiatePrefab(prefab_id, parent,
+  cframe)` (scene_runtime.luau:2846, dotted accessor :1067) — it resolves a `"<guid>:<path>"`
+  prefab-id string; NOT `PrefabSpawner.spawn(name, …)` (prefab_packages.py:79), which keys on the
+  bare Template NAME.** **Classification: converter-architecture.**
+- **D-P4-9 (P2-1).** The L0 SO walk is GATED on the emitted-SO `so_guids` set (mirror
+  `resolve_scriptable_object_addressables`, addressables_resolver.py:179-218 — positive evidence
+  an SO module was emitted), NOT a walk of every SO in the project. **Classification:
+  converter-generality.**
+- **D-P4-10 (slice structure re-justified, unchanged).** All five findings (P1-1/P1-2/P1-3/
+  P2-1/P2-2) land WITHIN slice 4.1; none introduces a new cross-slice contract. Structure stays
+  **4.1 (foundation) + 4.2 ∥ 4.3 (fan-out)** — 4.2/4.3 owns (scene_converter/planner;
+  ui_translator.py) remain disjoint from 4.1 and each other. **Classification: decomposition.**
+
+## Slice 4.1 implementation — consumable site DEFERRED (dual-voice deviation, 2026-06-19)
+
+- **D-P4-11 (deviation from AC2/AC6's literal 5-site set; consumable DEFERS).** The L1 lowering
+  rewrites FOUR of the five sites (segment/obstacle/premium/cloud); the **consumable site is
+  DETECTED but NOT rewritten** (fail-closed: skip + loud converter warning + filed followup).
+  Evidence (real materialized output): segment (`zone.prefabList[...]`), obstacle (`reference`
+  param), premium (`self.currentTheme.premiumCollectible` — materialized as a prefab-id STRING in
+  `themeData__*.luau:49`), and cloud (`cloud` from `cloudPrefabs`) all carry a PROVABLE prefab-id
+  STRING at the site. The **consumable** source `self.consumableDatabase.consumbales[picked]` is
+  accessed by the surrounding transpiled code as a STRUCT (`.canBeSpawned`, `.gameObject.Name`),
+  but the `Consumables` SO materialized `consumbales` as a bare prefab-id STRING list
+  (`Consumables.luau:7-11`) — the C# `ConsumableData {gameObject, canBeSpawned}` struct was
+  FLATTENED. So no prefab-id-string expression is provably available at that site, and the
+  surrounding code is already semantically broken (a separate SO-materialization mismatch, out of
+  this slice's scope). Force-rewriting would convert a loud, diagnosable mismatch into a SILENT
+  host-call mis-resolution. **Both review voices converged: codex (adversarial) — "DEFER: if the
+  recovered source is not provably a prefab-id string, rewriting mis-resolves; fail-closed is
+  correct"; design-Claude — "detect-but-skip with a loud warning + filed followup for the SO
+  flattening is the faithful reading of fail-closed-over-guess." The faithful reading of AC2/AC6 is
+  that the rewrite applies where the prefab-id-string contract holds.** Filed the consumable
+  SO-struct-flattening as the root-cause followup. **Classification: converter-generality
+  (fail-closed over guess on AI output; enumerate the real input space).**
+
+## Slice 4.2 — Gap #3 dormant-holder descendant trigger-nil (implement)
+- **Fix site: planner `_walk_scene` (producer), not `_emit_dormant_holder`.** `SceneNode.active = bool(m_IsActive)` is SELF-active. The bug host (CharacterSlot) is self-active under an inactive parent (PlayerPivot). scene_converter never places descendants of an inactive node in ANY mode (legacy prunes the subtree; generic emits a childless dormant holder — `_emit_dormant_holder` does not recurse). So the deterministic build fact is "host has an INACTIVE ANCESTOR" → suppress its instance row + references + lifecycle entry. Threaded a `ancestor_inactive` bool down `_visit`; propagate `ancestor_inactive or not node.active` to children.
+- **Self-inactive does NOT suppress.** An inactive-but-referenced node gets its own dormant holder, so its OWN MonoBehaviour rows resolve to it (preserves existing `test_disabled_monobehaviour_recorded_with_enabled_false`). Only DESCENDANTS of an inactive node are never-placed.
+- **`runtime_bearing.add` kept before the suppression `continue`** (per design "keep runtime_bearing so the module still emits"). `_build_modules_table` keys on set membership, not instance existence — verified no consumer requires an instance row per runtime_bearing script (codex Q2 confirmed). The class may also run on a runtime-instantiated rig.
+- **Prefab walk (`_walk_prefab`) left untouched.** `_convert_prefab_node` does NOT prune on `node.active` — inactive prefab descendants ARE emitted as parts. The dormant-holder non-recursion is scene-converter-specific, so the bug is scene-side only. Applying suppression to prefabs would over-suppress placed prefab content.
+- **Codex (gpt-5.4, xhigh) review of the approach: confirmed all 4 questions** (correct boundary; runtime_bearing-kept safe; apply all modes; no over-suppression of placed triggers). Log: codex-raw-4.2.log.
+
+## Slice 4.3 — Gap #4 inactive UI subtree emission (impl)
+- Implemented exactly the design §B Gap #4 spec: removed `ui_translator.py:394`
+  `if not node.active: return None`. The element is now created with the existing
+  `visible=node.active` (ui_translator.py:464) → an inactive node lands hidden
+  (`Visible=false`), its `_SceneRuntimeId` is stamped (:470), and child recursion
+  (:535) proceeds, so the 3 named deferred-component host clones (ConfirmPopup
+  1918594629, VisitUnityButton 1834564028, VisitGameChangerButton 375939466) land.
+  No new code path needed — `visible` was already wired to active; pruning was the
+  only blocker. Runtime `_applyPlannerFlagsAndTag` keeps the woken subtree inactive
+  until a script `SetActive(true)`s it (no visible-at-boot regression).
+- Tests: added `TestInactiveUiSubtreeEmission` (AC4 host-clone landing, AC8
+  emitted-not-pruned, hidden-not-visible E6, active-subtree-unchanged, nested
+  inactive-within-inactive, bug-guard). 4/5 new tests fail against the restored
+  pre-fix prune (verified); active-subtree-unchanged correctly passes pre-fix.
+  Full fast suite 4046 passed / 47 skipped; no-Any gate pass.
+
+## Slice 4.1 review fixes (2026-06-19) — 2 P1 + P2s
+
+- **P1-1 (cloud no-gate wrong-region rewrite):** `_locate_cloud` now gates the
+  `:Clone()` rewrite on a `-- …Instantiate(…` origin comment in the contiguous
+  comment block IMMEDIATELY above the `local v=expr:Clone()` shape
+  (`_instantiate_comment_above`: blank/comment lines may intervene; a code line ends
+  the block, so an unrelated earlier comment cannot leak down). REPRODUCED the
+  corruption pre-fix: real Pooler.luau (`local obj = original:Clone(); obj.Parent =
+  Workspace`, no comment) was rewritten; post-fix it is byte-identical. The other 4
+  real `:Clone()` modules (AllLaneObstacle/PatrollingObstacle/GameState/LoadoutState)
+  have no `.Parent=` on the next line so never matched, but Pooler did.
+- **P1-2 (game-specific keys):** obstacle re-keyed off `SpawnFromAssetReference` →
+  recovers the prefab-id STRUCTURALLY from the transpiler's `local _ = <param>`
+  discard (else the enclosing function's first param, guarded against binding `self`
+  for dot-form methods). Premium/consumable merged onto the shared
+  `Addressables.InstantiateAsync` marker + `<v>=nil`+warn-abort shape; split by
+  POSITIVE prefab-id evidence (`_extract_prefab_id_expr`: rewrite iff the warn
+  `tostring(<EXPR>.[Nn]ame)` exposes an <EXPR> NOT routed through `.gameObject`;
+  consumable's struct-flattened `…gameObject.Name` defers). Scans ALL InstantiateAsync
+  matches (consumable precedes premium in source order) — a `.search`-only approach
+  would have wrongly abstained premium.
+- **P2 uniform fail-soft:** segment/obstacle/instantiate-async/cloud all LOG on
+  origin-present-but-shape/expr-absent drift (cloud guarded so the idempotent re-run,
+  which has the comment but no live `:Clone()`, does not trip it).
+- **P2 green-for-wrong-reason:** extracted `prefab_packages.collect_addressable_prefab_ids`
+  (the SINGLE persisted-axis reader both pipeline emit-gate arms now call); the
+  persisted-axis test drives that REAL helper (proven RED when the helper drops the
+  so_prefab_ids read). Real-TrackManager coverage moved to vendored real-shape
+  fixtures (hermetic) + a `test_real_diag_outputs_when_present` cross-check that
+  skips loudly only when the diag tree is absent.
+- **P2 resolver typing:** `resolve_so_assetref_prefab_ids` param re-typed
+  `GuidIndexLike` (drop the `object`+`cast`); two pre-existing siblings keep their
+  `object`+cast (out of slice scope).
+- Codex re-review (corrected artifact): obstacle `self`-misbind → hardened
+  (fail-closed). Cloud "pooler inherits an Instantiate comment block" + premium "warn
+  via temp/helper" findings are FALSE-POSITIVES on the real path (real Pooler has no
+  Instantiate comment; real premium is literally `tostring(…name)`) — overruled with
+  evidence, filed as output-fingerprint blind-spot residual (no speculative code).
+
+## D-P4-6 (slice 4.2, phase-integration P1 fix)
+- **Decision:** Narrowed 4.2 gap #3 ancestor-inactive row suppression with a UI carve-out: `if ancestor_inactive and node.file_id not in ui_go_fids: continue` (scene_runtime_planner.py `_walk_scene._visit`). UI hosts (under a Canvas) under an inactive ancestor KEEP their planner instance row so the 4.3 ui_translator deferred host clone binds via `awaitUiHost` (driven by the `instance_owner_is_ui` row). Gap #3 scene/world dormant-holder descendants stay suppressed.
+- **Why:** un-gated suppression deleted the gap #4 deferred-UI-host rows (ConfirmPopup/OpenURL/missionPopup under inactive AboutPopup), re-introducing the planner-side UI suppression D-P4-4 declared WRONG and negating 4.3. `ui_go_fids = _scene_ui_go_fids(scene)` was already in `_visit` scope.
+- **Test:** `test_inactive_ancestor_ui_host_under_canvas_keeps_row` (Canvas→inactive AboutPopup→active OpenURL button) — proven RED against 922b27f (row==[]), green with fix. Gap #3 tests stay green.
+
+## Phase 4 HARDEN (drive-harden, 2026-06-19)
+
+- **BUG FIXED (P1) — spawn lowering premium/consumable warn paren over-close.**
+  `spawn_call_site_lowering._instantiate_async_outcomes` re-emitted the original
+  `warn(...)` by splicing the captured `warn` regex group (which ALREADY closes
+  `tostring(`+`string.format(`+`warn(` with three trailing `)`), then the replacement
+  template added a FOURTH `)` via `warn(string.format({warn})`. On the real
+  TrackManager.luau the premium rewrite produced `...premiumCollectible.name))))`
+  (1 open / 4 close on the warn-args line; module 264→267 opens but 268 closes) — a
+  Luau syntax error that fails the WHOLE TrackManager module to compile, killing all
+  spawning (live AC i-b). Fix: drop the trailing `)` from the replacement template
+  (the captured group already closes everything). Verified: real TrackManager now
+  267/267 balanced, 4 rewrites + 1 defer intact. Bug-guard `test_premium_rewrite_warn
+  _parens_balanced` added — FAILS pre-fix (`name))))` vs `name)))`), passes post-fix.
+  This was a green-test-for-wrong-reason: `test_premium_rewrite_recovers_prefab_id_expr`
+  only substring-checked "Unable to load collectable", never paren balance.
+- **AUDIT — clean elsewhere.** L0 SO-AssetReference resolver + persisted `so_prefab_ids`
+  axis + shared `collect_addressable_prefab_ids` reader: correct, well-tested (both
+  consumer arms use the shared helper). Gaps #3/#4 (planner ancestor-inactive
+  suppression + UI carve-out; ui_translator emit-hidden): correct, thorough tests incl.
+  the cross-slice UI-host carve-out asserting `instance_owner_is_ui`. Segment index
+  off-by-one (`+1`) correct; cloud passes the already-1-based value through.

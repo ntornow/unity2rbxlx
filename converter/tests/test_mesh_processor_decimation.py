@@ -1,6 +1,6 @@
 """Tests for mesh_processor.decimate_mesh, get_mesh_info, needs_decimation.
 
-A mesh whose face count exceeds the Roblox cap (currently 21,844 faces per
+A mesh whose face count exceeds the Roblox cap (currently 20,000 faces per
 mesh) silently fails upload. Decimation is the only path to ship those
 meshes; a regression that produces an oversized output, a degenerate
 mesh, or a mesh with inverted normals corrupts the converted scene.
@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import config
 from converter.mesh_processor import (
     decimate_mesh,
     get_mesh_info,
@@ -22,6 +23,77 @@ from converter.mesh_processor import (
 )
 
 trimesh = pytest.importorskip("trimesh")
+
+
+class TestRobloxFaceCap:
+    """Bug 1: the per-mesh face cap and the quality-floor clamp.
+
+    The floor (``MESH_QUALITY_FLOOR``) can raise the decimation target;
+    without a clamp it can push the target above what Roblox accepts.
+    """
+
+    def test_cap_constant_is_roblox_limit(self) -> None:
+        # AC 1: the documented Roblox per-mesh triangle cap is 20,000.
+        assert config.MESH_ROBLOX_MAX_FACES == 20_000
+        # Sibling constants are unchanged (locked decision).
+        assert config.MESH_TARGET_FACES == 8_000
+        assert config.MESH_QUALITY_FLOOR == 0.6
+
+    def test_floor_above_cap_clamps_to_cap(self) -> None:
+        # AC 2: when original*FLOOR exceeds the cap, the clamp pins to the cap.
+        # Mirrors the production expression min(max(target, floor), cap).
+        original_faces = 200_000  # 200k * 0.6 = 120k floored target, well over cap
+        target_faces = config.MESH_TARGET_FACES
+        floored = int(original_faces * config.MESH_QUALITY_FLOOR)
+        effective = min(max(target_faces, floored), config.MESH_ROBLOX_MAX_FACES)
+        assert floored > config.MESH_ROBLOX_MAX_FACES  # precondition: floor would overshoot
+        assert effective == config.MESH_ROBLOX_MAX_FACES
+
+    def test_floor_below_cap_leaves_floored_value(self) -> None:
+        # AC 3: ordinary case — floored target is under the cap, clamp is inert.
+        original_faces = 20_000  # 20k * 0.6 = 12k floored target, under the cap
+        target_faces = config.MESH_TARGET_FACES  # 8_000 < floored
+        floored = int(original_faces * config.MESH_QUALITY_FLOOR)
+        effective = min(max(target_faces, floored), config.MESH_ROBLOX_MAX_FACES)
+        assert floored < config.MESH_ROBLOX_MAX_FACES  # precondition
+        assert effective == floored == 12_000
+
+    def test_clamp_is_wired_into_production_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC 2 (regression guard, backend-INDEPENDENT): the clamp must actually
+        # be applied to the value decimate_mesh hands the backend, not just be a
+        # truth recomputed in the test. Spy on simplify_quadric_decimation to
+        # capture the target it receives -- no quadric backend needed (the spy
+        # raises to take the export-original fallback). Pre-fix code (max only,
+        # no min-cap) would pass the floored target (overshoots the cap) and
+        # FAIL this assertion; post-fix passes the cap.
+        import converter.mesh_processor as mp
+
+        sphere = _high_poly_sphere(2000)
+        original_faces = len(sphere.faces)
+        src = tmp_path / "clamp_wired.obj"
+        sphere.export(str(src))
+
+        cap = int(original_faces * 0.5)  # 50% < 60% floor -> floored overshoots cap
+        floored = int(original_faces * mp.MESH_QUALITY_FLOOR)
+        assert floored > cap  # precondition: floor would overshoot the cap
+        monkeypatch.setattr(mp, "MESH_ROBLOX_MAX_FACES", cap)
+
+        captured: dict[str, int] = {}
+
+        def _spy(self: "trimesh.Trimesh", face_count: int) -> "trimesh.Trimesh":
+            # Mirror the production keyword call simplify_quadric_decimation(
+            # face_count=...). A positional-only spy would mask a regression to
+            # the broken positional call (which binds to `percent` and raises).
+            captured["target"] = face_count
+            raise RuntimeError("backend disabled for spy")
+
+        monkeypatch.setattr(trimesh.Trimesh, "simplify_quadric_decimation", _spy)
+
+        # target tiny -> ratio below floor -> floor branch fires -> clamp to cap.
+        decimate_mesh(src, target_faces=10)
+        assert captured["target"] == cap  # clamped, not the floored overshoot
 
 
 def _high_poly_sphere(face_count: int) -> "trimesh.Trimesh":
@@ -169,6 +241,36 @@ class TestDecimateMeshWithBackend:
         decimated = trimesh.load(str(out), force="mesh")
 
         np.testing.assert_allclose(decimated.extents, original_extents, rtol=0.10)
+
+    def test_floor_clamp_caps_output_through_real_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC 2 (end-to-end): when the quality floor would raise the target
+        above the cap, decimate_mesh clamps the effective target to the cap so
+        the output never exceeds what Roblox accepts. Patches the cap small so a
+        modestly-sized mesh trips the floor>cap branch without a huge fixture."""
+        import converter.mesh_processor as mp
+
+        sphere = _high_poly_sphere(2000)
+        original_faces = len(sphere.faces)
+        src = tmp_path / "floor_clamp.obj"
+        sphere.export(str(src))
+
+        # Cap below the floored target so floor>cap and the clamp pins to cap.
+        cap = int(original_faces * 0.5)  # 50% < 60% floor -> floored target overshoots cap
+        monkeypatch.setattr(mp, "MESH_ROBLOX_MAX_FACES", cap)
+        floored = int(original_faces * mp.MESH_QUALITY_FLOOR)
+        assert floored > cap  # precondition: floor would overshoot the cap
+
+        # target tiny -> ratio below floor -> floor branch fires -> clamp to cap.
+        out = decimate_mesh(src, target_faces=10)
+        decimated = trimesh.load(str(out), force="mesh")
+        # The fast_simplification backend honors face_count exactly (it is a
+        # reduction, never adds faces), so the clamped request bounds the output
+        # strictly at the cap -- no overshoot slack. A positional-arg regression
+        # (which raises and exports the oversized original) fails this.
+        assert len(decimated.faces) <= cap
+        assert len(decimated.faces) < floored
 
     def test_no_inverted_normals_post_decimate(self, tmp_path: Path) -> None:
         """A decimated convex shape's face normals should still all point
