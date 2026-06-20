@@ -131,6 +131,46 @@ def test_luau_str_control_round_trip(s):
     assert _luau_decode(lit) == s
 
 
+@pytest.mark.parametrize(
+    "s",
+    [
+        "\t2",      # tab then '2'; non-padded "\92" would decode to chr(92)='\\'
+        "\x034",    # ETX then '4'; non-padded "\34" would decode to chr(34)='"'
+        "\x009",    # NUL then '9'; non-padded "\09"/"\0" merge cases
+        "\x010",    # SOH then '0'
+        "\x1f5",    # US (0x1f=31) then '5'; non-padded "\315" would over-read
+        "\x7f8",    # DEL then '8'
+        "a\tb\x033c",  # multiple control chars each followed by digits
+    ],
+)
+def test_luau_str_control_then_digit_no_merge(s):
+    """A control char immediately followed by an ASCII digit must NOT merge
+    into the greedy \\ddd escape — the escape is zero-padded to exactly 3
+    digits so Luau stops before the literal digit (criterion 5)."""
+    lit = _luau_str(s)
+    # Every emitted decimal escape consumes exactly 3 digits (\ddd) under
+    # greedy decoding, so a following literal digit can't merge in. Scan the
+    # body the way Luau does: at each backslash-digit, the escape is the next
+    # (up to) 3 digits — assert it's the full 3.
+    body = lit[1:-1]
+    i = 0
+    while i < len(body):
+        if body[i] == "\\":
+            nxt = body[i + 1]
+            if nxt.isdigit():
+                j = i + 1
+                while j < len(body) and body[j].isdigit() and (j - (i + 1)) < 3:
+                    j += 1
+                assert j - (i + 1) == 3, f"non-padded escape in {lit!r} at {i}"
+                i = j
+            else:
+                i += 2  # \\ or \"
+        else:
+            i += 1
+    # Byte-exact round-trip under greedy Luau decoding.
+    assert _luau_decode(lit) == s
+
+
 @pytest.mark.parametrize("s", ["Door", "PointLight", "rbxassetid://123", "a b c", "name42"])
 def test_luau_str_fast_path_byte_identity(s):
     # No special char -> f'"{s}"' UNCHANGED (criterion 1/11).

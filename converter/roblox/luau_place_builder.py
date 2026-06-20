@@ -132,7 +132,8 @@ def _luau_str(s: str) -> str:
     Fast path: a string with no ``\\``, ``"`` or control char (byte < 0x20 or
     == 0x7F) returns ``f'"{s}"'`` UNCHANGED (byte-identity). Otherwise the
     quoted path escapes ``\\`` -> ``\\\\``, ``"`` -> ``\\"``, and any byte
-    < 0x20 or == 0x7F as ``\\ddd`` (decimal). Newlines become ``\\n``/``\\r``.
+    < 0x20 or == 0x7F as ``\\ddd`` (zero-padded to 3 digits so a following
+    ASCII digit can't merge into the greedy decimal escape).
     Round-trips byte-exact under Luau string decoding; no long-bracket (it
     can't finitize control chars)."""
     needs_escape = False
@@ -151,7 +152,12 @@ def _luau_str(s: str) -> str:
         elif ch == '"':
             out.append('\\"')
         elif o < 0x20 or o == 0x7F:
-            out.append(f"\\{o:d}")
+            # Zero-pad to 3 digits: Luau \ddd decimal escapes read GREEDILY up
+            # to 3 digits, so a non-padded \9 immediately before an ASCII digit
+            # (e.g. "\t2" -> "\92") would merge and mis-decode. \ddd is
+            # unambiguous: Luau stops at 3 digits, so a following literal digit
+            # cannot merge into the escape.
+            out.append(f"\\{o:03d}")
         else:
             out.append(ch)
     out.append('"')

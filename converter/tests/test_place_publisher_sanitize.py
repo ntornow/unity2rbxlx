@@ -82,8 +82,9 @@ def test_hostile_light_type_is_quoted_with_control_escape():
     b = _LuauBuilder()
     _emit_light(b, light, "p")
     src = _render(b)
-    # Quoted, control char escaped to \0, no breakout.
-    assert 'Instance.new("Point\'); evil()--\\0")' in src
+    # Quoted, control char escaped to zero-padded \000 (\ddd is 3 digits so a
+    # following ASCII digit can't merge into the greedy escape), no breakout.
+    assert 'Instance.new("Point\'); evil()--\\000")' in src
     assert "\x00" not in src
 
 
