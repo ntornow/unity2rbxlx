@@ -11,6 +11,7 @@ Unity project and call the production ``_build_theme_seed_plan`` + the real
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from converter.autogen import (
     generate_scene_runtime_plan_module,
 )
 from converter.pipeline import (
+    _CS_LOAD_ASSETS_ASYNC,
+    _CS_METHOD_HEADER,
     Pipeline,
     _derive_appender_name,
     _derive_cs_load_ownership,
@@ -151,6 +154,105 @@ public class ThemeDatabase {
         load and is not derived as ownership."""
         cs = THEME_DB_CS.replace("LoadAssetsAsync<ThemeData>", "LoadAssetsAsync")
         assert _derive_cs_load_ownership(cs) is None
+
+
+# The REAL Trash-Dash ThemeDatabase.cs shape: a COMMENT precedes the control-flow
+# ``if (themeDataList == null) {`` inside the load method. The comment's trailing
+# word satisfies the OLD ``[\w.]+`` "return-type" slot so the OLD regex mis-captures
+# ``if`` as a method header (gate (b) — design-phase3 §1). The unit fixture above
+# (THEME_DB_CS) lacks the comment, so its ``if`` never matched and the bug went
+# undetected (a green-test-for-wrong-reason). This fixture has the comment.
+THEME_DB_CS_REAL_SHAPE = """\
+public class ThemeDatabase {
+    static protected Dictionary<string, ThemeData> themeDataList;
+    static public IEnumerator LoadDatabase() {
+        // If not null the dictionary was already loaded.
+        if (themeDataList == null) {
+            themeDataList = new Dictionary<string, ThemeData>();
+            yield return Addressables.LoadAssetsAsync<ThemeData>("themeData", op => {
+                if (!themeDataList.ContainsKey(op.themeName))
+                    themeDataList.Add(op.themeName, op);
+            });
+            m_Loaded = true;
+        }
+    }
+}
+"""
+
+
+class TestGateBMethodHeaderRegex:
+    """Gate (b) — a control-flow ``if (...) {`` preceded by a comment must NOT be
+    mis-captured as the enclosing method name; ``LoadDatabase`` must win."""
+
+    # The PRE-FIX regex (no control-keyword negative lookahead) — reconstructed
+    # here to prove the bug it had and that THIS fixture exercises it.
+    _OLD_HEADER = re.compile(
+        r"(?:public|private|protected|internal|static|virtual|override|async|\s)+"
+        r"[\w<>,.\[\]]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{"
+    )
+
+    def _old_enclosing(self, src, pos):
+        name = None
+        for hm in self._OLD_HEADER.finditer(src):
+            if hm.start() > pos:
+                break
+            name = hm.group("name")
+        return name
+
+    def test_old_regex_miscaptures_if(self):
+        """Documents the bug: the OLD regex derives ``if`` on the real shape."""
+        m = _CS_LOAD_ASSETS_ASYNC.search(THEME_DB_CS_REAL_SHAPE)
+        assert m is not None
+        assert self._old_enclosing(THEME_DB_CS_REAL_SHAPE, m.start()) == "if"
+
+    def test_new_regex_derives_loaddatabase(self):
+        """AC1: the FIXED derivation returns ``LoadDatabase`` on the real shape."""
+        own = _derive_cs_load_ownership(THEME_DB_CS_REAL_SHAPE)
+        assert own is not None
+        assert own.load_method_name == "LoadDatabase"
+        assert own.label == "themeData"
+        assert own.key_field == "themeName"
+
+    def test_new_regex_keeps_identifier_starting_with_keyword(self):
+        """``\\b`` anchoring: an identifier that merely STARTS with a control
+        keyword (``ifMatched`` / ``forEachItem``) is a real method, NOT excluded."""
+        src = (
+            "public class C {\n"
+            "  public void ifMatched(int x) { }\n"
+            "  public void forEachItem() { }\n"
+            "}\n"
+        )
+        names = [m.group("name") for m in _CS_METHOD_HEADER.finditer(src)]
+        assert "ifMatched" in names
+        assert "forEachItem" in names
+
+    def test_real_themedatabase_cs_on_disk(self):
+        """AC1 against the REAL on-disk Trash-Dash ThemeDatabase.cs (skipped when
+        the source tree is not present)."""
+        cs = Path(
+            "/Users/jiazou/workspace/trash-dash/Assets/Scripts/Themes/"
+            "ThemeDatabase.cs"
+        )
+        if not cs.exists():
+            pytest.skip("trash-dash source tree not present")
+        own = _derive_cs_load_ownership(cs.read_text(encoding="utf-8"))
+        assert own is not None
+        assert own.load_method_name == "LoadDatabase"
+        assert own.label == "themeData"
+        assert own.key_field == "themeName"
+
+    def test_real_characterdatabase_cs_load_method(self):
+        """AC2 (generality): CharacterDatabase.cs (a ``<GameObject>`` roster DB)
+        also derives ``LoadDatabase``, not ``if``."""
+        cs = Path(
+            "/Users/jiazou/workspace/trash-dash/Assets/Scripts/Characters/"
+            "CharacterDatabase.cs"
+        )
+        if not cs.exists():
+            pytest.skip("trash-dash source tree not present")
+        own = _derive_cs_load_ownership(cs.read_text(encoding="utf-8"))
+        assert own is not None
+        assert own.load_method_name == "LoadDatabase"
 
 
 # ---------------------------------------------------------------------------
@@ -665,3 +767,126 @@ class TestBuildThemeSeedPlanIntegration:
         pipe._build_theme_seed_plan(sr)
         seed = sr["addressable_db_seeds"][0]
         assert seed["key_field"] is None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestration: _lower_so_db_consumers (drive REAL wiring end-to-end)
+# ---------------------------------------------------------------------------
+# These drive the production write_output method on a real Pipeline against the
+# tmp Unity project — exercising the input derivation it owns (parse_addressables
+# -> resolve_scriptable_object_addressables; the per-module .cs re-read +
+# _derive_cs_load_ownership -> load_method_by_path; the read-only roster
+# re-derivation -> roster_claimed_paths) AND the fail-closed re-raise — NOT just
+# the pure module functions in test_so_db_consumer_lowering.py.
+
+# The REAL closure-private keyed-dict transpiled shape (a ``local <dict> = nil``
+# upvalue + a never-called ``addTheme`` closure; no ipairs/table.insert). This is
+# the shape the SO-DB lowering supersedes — distinct from the list-store
+# THEME_DB_LUAU above that the seed path drains.
+_KEYED_DICT_LUAU = """\
+local ThemeDatabase = {}
+local themeDataList = nil
+local m_Loaded = false
+function ThemeDatabase.dictionnary()
+	return themeDataList
+end
+function ThemeDatabase.loaded()
+	return m_Loaded
+end
+function ThemeDatabase.GetThemeData(type)
+	if themeDataList == nil then return nil end
+	return themeDataList[type]
+end
+function ThemeDatabase.LoadDatabase()
+	-- If not nil the dictionary was already loaded.
+	if themeDataList == nil then
+		themeDataList = {}
+		local function addTheme(op)
+			if op ~= nil then
+				themeDataList[op.themeName] = op
+			end
+		end
+		local _ = addTheme
+		m_Loaded = true
+	end
+end
+return ThemeDatabase
+"""
+
+
+def _lower_pipeline(tmp_path: Path, *, cs: str = THEME_DB_CS_REAL_SHAPE,
+                    db_luau: str = _KEYED_DICT_LUAU,
+                    source_path: str | None = "ThemeDatabase.luau"):
+    """Build a real Pipeline whose ThemeDatabase RbxScript carries the keyed-dict
+    body + a ``source_path`` (production stamps this at pipeline.py:3334), then run
+    the production orchestration. Returns (pipe, scene_runtime, db_script)."""
+    root = _make_project(tmp_path, cs=cs)
+    pipe = _pipeline_with_state(root, tmp_path)
+    pipe.state.rbx_place.scripts = [
+        RbxScript(name="ThemeDatabase", source=db_luau,
+                  script_type="ModuleScript", parent_path="ReplicatedStorage",
+                  source_path=source_path),
+    ]
+    sr = _scene_runtime_with_so_map()
+    pipe._lower_so_db_consumers(sr)
+    return pipe, sr, pipe.state.rbx_place.scripts[0]
+
+
+class TestLowerSoDbConsumersOrchestration:
+    def test_orchestration_lowers_keyed_dict_db(self, tmp_path):
+        """The production method derives the SO surface + C# ownership + facts and
+        rewrites the placed RbxScript.source to the canonical keyed-dict body that
+        requires both SO modules and writes ``_so_db_dict[so['themeName']]``."""
+        _, _, db = _lower_pipeline(tmp_path)
+        assert "ReplicatedStorage.ThemeData_Day" in db.source
+        assert "ReplicatedStorage.ThemeData_Night" in db.source
+        assert "_so_db_dict[_key] = so" in db.source
+        assert "so['themeName']" in db.source or 'so["themeName"]' in db.source
+        # getters re-emitted under their LOCATED game-specific names
+        assert "function ThemeDatabase.GetThemeData(type)" in db.source
+        assert "return _so_db_dict[type]" in db.source
+
+    def test_orchestration_noop_without_source_path(self, tmp_path):
+        """The orchestration keys csharp_by_path by RbxScript.source_path (the same
+        key the locator uses). A placed script with no source_path is skipped — so
+        the test_orchestration_lowers_keyed_dict_db pass above is attributable to the
+        production source_path keying, NOT a green-for-wrong-reason. (Production sets
+        source_path at pipeline.py:3334; this guards that contract.)"""
+        _, _, db = _lower_pipeline(tmp_path, source_path=None)
+        assert "_so_db_dict" not in db.source
+        assert db.source == _KEYED_DICT_LUAU
+
+    def test_orchestration_idempotent(self, tmp_path):
+        """Re-running the orchestration on its own lowered output is byte-identical
+        (edge 8) — the region walk-back absorbs the pass-owned state decls."""
+        pipe, sr, db = _lower_pipeline(tmp_path)
+        first = db.source
+        pipe._lower_so_db_consumers(sr)
+        assert db.source == first
+
+    def test_orchestration_fail_closed_on_unlocatable_body(self, tmp_path):
+        """A module whose C# is a located SO-DB consumer but whose transpiled body
+        lacks the C#-derived load method (AI emitted an unrecognizable shape) must
+        re-raise SoDbUnresolved through the orchestration (never a silent empty DB)."""
+        from converter.so_db_consumer_lowering import SoDbUnresolved
+        broken = _KEYED_DICT_LUAU.replace(
+            "function ThemeDatabase.LoadDatabase()",
+            "function ThemeDatabase.SomethingElse()",
+        )
+        with pytest.raises(SoDbUnresolved):
+            _lower_pipeline(tmp_path, db_luau=broken)
+
+    def test_orchestration_noop_on_non_db_module(self, tmp_path):
+        """A module whose C# issues no LoadAssetsAsync<T>(literal) yields no fact;
+        the orchestration leaves its source untouched."""
+        cs = "public class Foo { void Bar() {} }"
+        plain = "local Foo = {}\nreturn Foo\n"
+        root = _make_project(tmp_path, cs=cs)
+        pipe = _pipeline_with_state(root, tmp_path)
+        pipe.state.rbx_place.scripts = [
+            RbxScript(name="Foo", source=plain, script_type="ModuleScript",
+                      parent_path="ReplicatedStorage", source_path="Foo.luau"),
+        ]
+        sr = _scene_runtime_with_so_map()
+        pipe._lower_so_db_consumers(sr)
+        assert pipe.state.rbx_place.scripts[0].source == plain

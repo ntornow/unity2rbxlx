@@ -658,6 +658,18 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # at boot. LOAD-BEARING — without the allowlist entry the recomputed key is
     # elided from the emitted plan and the shim sees ``{}`` (dead registry).
     "addressable_db_seeds",
+    # Phase 1 consumable prototype materialization: per-DB seed records the boot
+    # shim replays to materialize a consumable-style SO's array of in-prefab
+    # component refs into component instances. LOAD-BEARING — without the
+    # allowlist entry the recomputed key is elided from the emitted plan and the
+    # shim sees ``{}`` (the OnEnable crash this phase fixes persists).
+    "consumable_db_seeds",
+    # Phase 2 lazy-singleton boot-instantiation: per-class seed records the boot
+    # shim replays to construct + Awake one instance of each lazily-created
+    # singleton MonoBehaviour before any consumer uses it. LOAD-BEARING — without
+    # the allowlist entry the recomputed key is elided from the emitted plan and
+    # the shim sees ``{}`` (the singleton never awakes; getInstance() stays nil).
+    "lazy_singletons",
 )
 
 
@@ -1037,6 +1049,8 @@ local services = {
 
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
+SceneRuntime.seedConsumableDatabases(Plan, services)
+SceneRuntime.seedLazySingletons(Plan, services, engine, "client")
 engine:start("client")
 '''
 
@@ -1238,6 +1252,8 @@ local services = {
 
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
+SceneRuntime.seedConsumableDatabases(Plan, services)
+SceneRuntime.seedLazySingletons(Plan, services, engine, "server")
 engine:start("server")
 '''
 

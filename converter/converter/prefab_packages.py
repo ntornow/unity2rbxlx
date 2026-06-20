@@ -180,6 +180,29 @@ def resolve_template_child_names(
     return resolved
 
 
+def collect_addressable_prefab_ids(addr_block: Mapping[str, object] | None) -> set[str]:
+    """Collect every prefab-id reachable from a persisted ``addressables`` block.
+
+    The single reader of the persisted block's three axes, shared by both pipeline
+    emit-gate consumers so they never diverge: ``by_address`` / ``by_label`` are
+    ``label -> [ids]`` dicts (read via ``.values()``); ``so_prefab_ids`` (L0 gap #5)
+    is a FLAT list of ids reachable from emitted-SO AssetReference fields (read
+    directly). Only ``str`` ids are kept; a missing / mistyped axis contributes none.
+    """
+    block = addr_block or {}
+    ids: set[str] = set()
+    for axis in ("by_address", "by_label"):
+        axis_val = block.get(axis)
+        if isinstance(axis_val, Mapping):
+            for vals in axis_val.values():
+                if isinstance(vals, (list, tuple, set)):
+                    ids.update(pid for pid in vals if isinstance(pid, str))
+    so_ids = block.get("so_prefab_ids")
+    if isinstance(so_ids, (list, tuple, set)):
+        ids.update(pid for pid in so_ids if isinstance(pid, str))
+    return ids
+
+
 def select_emitted_prefab_ids(
     prefab_library: PrefabLibrary | None,
     serialized_field_refs: dict[str, dict[str, str]] | None,
