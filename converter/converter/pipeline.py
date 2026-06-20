@@ -3294,6 +3294,29 @@ return table.concat(allData, "\\n")'''
             if isinstance(v, (list, tuple)) and len(v) == 3:
                 fbx_bounding_boxes[k] = tuple(v)
 
+        # Deterministic set of C# classes whose OnCollisionEnter/OnTriggerEnter
+        # handler destroys the GameObject itself (projectiles / contact-damage
+        # Rigidbodies). Drives the non-colliding-body conversion in
+        # scene_converter so such bodies don't physically shove the Roblox
+        # character — Unity's player is a CharacterController, never pushed by
+        # rigidbody collisions. Computed fresh here (cheap; ~one read per script)
+        # so it is populated even when resuming directly from the convert_scene
+        # phase with transpile skipped, mirroring the material-mapping re-run.
+        # Require BOTH signals: a hit-and-vanish contact handler AND a self-launch
+        # (AddForce/AddRelativeForce). The conjunction is the projectile
+        # signature — it excludes a "solid until it shatters" breakable platform /
+        # destructible crate (destroys-self-on-contact but never self-launched),
+        # which must KEEP its collision (adversarial review caught that false
+        # positive). Biased to abstain: a projectile launched externally (no
+        # self-force) is NOT flagged → it keeps colliding (a safe miss, never a
+        # walk-through-the-floor false positive).
+        from unity.script_analyzer import analyze_all_scripts
+        contact_noncolliding_classes = frozenset(
+            si.class_name
+            for si in analyze_all_scripts(self.unity_project_path)
+            if si.destroys_self_on_contact and si.self_launches and si.class_name
+        )
+
         self.state.rbx_place = convert_scene(
             parsed_scene=self.state.parsed_scene,
             guid_index=self.state.guid_index,
@@ -3305,6 +3328,7 @@ return table.concat(allData, "\\n")'''
             mesh_hierarchies=mesh_hierarchies,
             fbx_bounding_boxes=fbx_bounding_boxes,
             unity_project_root=self.unity_project_path,
+            contact_noncolliding_classes=contact_noncolliding_classes,
             # Thread the planner artifact + mode through so the generic-only
             # inactive-retention carve-out in ``_convert_node`` can see which
             # inactive GameObjects the host runtime needs to bind. Legacy mode

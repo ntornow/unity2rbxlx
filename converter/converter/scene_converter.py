@@ -192,6 +192,16 @@ class SceneConversionContext:
     # set under legacy mode → the prune branch is byte-identical to before.
     scene_runtime_referenced_ids: set[str] = field(default_factory=set)
 
+    # C# class names whose ``OnCollisionEnter``/``OnTriggerEnter`` handler
+    # destroys the GameObject itself (``script_analyzer.destroys_self_on_contact``)
+    # — hit-and-vanish contact bodies (projectiles / contact-damage Rigidbodies).
+    # A node carrying such a script AND a Rigidbody is converted non-colliding
+    # (``CanCollide=false`` + ``CanTouch=true``) so it doesn't physically shove
+    # the Roblox character the way Unity's CharacterController-based player would
+    # never be shoved. Empty set => the override never fires (legacy-safe). Keyed
+    # on the deterministic C# source shape, never a prefab-name literal.
+    contact_noncolliding_classes: frozenset[str] = field(default_factory=frozenset)
+
     # Outputs (accumulated during conversion, consumed before convert_scene returns)
     water_regions: list[RbxWaterRegion] = field(default_factory=list)
     unhandled_components: set[str] = field(default_factory=set)
@@ -1224,6 +1234,7 @@ def convert_scene(
     unity_project_root: Path | None = None,
     scene_runtime: dict[str, object] | None = None,
     scene_runtime_mode: str = "legacy",
+    contact_noncolliding_classes: frozenset[str] | None = None,
 ) -> RbxPlace:
     """Convert a parsed Unity scene to a Roblox place hierarchy.
 
@@ -1291,6 +1302,7 @@ def convert_scene(
             if scene_runtime_mode == "generic" and scene_runtime
             else set()
         ),
+        contact_noncolliding_classes=contact_noncolliding_classes or frozenset(),
     )
     if not _ctx().mesh_native_sizes:
         log.warning("No mesh native sizes available — mesh sizing will use FBX bounding box fallback. "
@@ -2792,6 +2804,34 @@ def _process_components(
         # Only override can_collide if rigidbody says so.
         if not can_collide:
             part.can_collide = can_collide
+        # Hit-and-vanish contact bodies (projectiles / contact-damage
+        # Rigidbodies — ``script_analyzer.destroys_self_on_contact``) must NOT
+        # physically collide. A faithfully-``CanCollide=true`` body shoves the
+        # Roblox Humanoid character, but Unity's player is a CharacterController,
+        # which is never pushed by rigidbody collisions — so the knockback is an
+        # unfaithful Roblox-physics artifact. Drop physical collision; keep
+        # ``CanTouch`` so the contact-damage ``Touched`` still fires (verified
+        # live: a fast non-colliding bullet still reliably fires ``.Touched`` —
+        # no tunneling). Dynamic bodies only (anchored/kinematic bodies don't
+        # launch and aren't the knockback source). Keyed on the deterministic C#
+        # class set (``_ScriptClass`` attrs ∩ flagged classes), never a
+        # prefab-name literal.
+        # Read the flagged set defensively: ``_process_components`` is callable
+        # without an active SceneConversionContext (isolated helper tests exercise
+        # the rigidbody path directly), so fall back to an empty set rather than
+        # forcing a context where this path never required one.
+        _flagged = (
+            _current_ctx.contact_noncolliding_classes
+            if _current_ctx is not None else frozenset()
+        )
+        if not anchored and _flagged:
+            node_classes = {
+                v for k, v in part.attributes.items()
+                if (k == "_ScriptClass" or k.startswith("_ScriptClass_"))
+            }
+            if node_classes & _flagged:
+                part.can_collide = False
+                part.can_touch = True
         if custom_phys is not None:
             part.custom_physical_properties = custom_phys
         # Store useGravity as attribute if disabled (scripts may need it)

@@ -326,3 +326,152 @@ class TestStaticEventEnumeration:
             tmp_path, "A", "public class A : MonoBehaviour { }",
         )
         assert info.static_events == []
+
+
+class TestDestroysSelfOnContact:
+    """``destroys_self_on_contact`` — the deterministic C# signal that a body is
+    a hit-and-vanish contact body (projectile / contact-damage Rigidbody), which
+    drives the non-colliding (CanCollide=false) conversion so it doesn't shove
+    the Roblox character (Unity's CharacterController player is never pushed by
+    rigidbody collisions)."""
+
+    def _info(self, tmp_path: Path, name: str, body: str):
+        cs = tmp_path / f"{name}.cs"
+        cs.write_text(body)
+        return analyze_script(cs)
+
+    def test_turretbullet_shape_oncollision_guarded_destroy(self, tmp_path: Path):
+        # OnCollisionEnter with a tag guard then Destroy(gameObject) — TurretBullet.
+        info = self._info(
+            tmp_path, "TurretBullet",
+            "public class TurretBullet : MonoBehaviour {\n"
+            "  void OnCollisionEnter(Collision other) {\n"
+            '    if (other.collider.tag == "Player") {\n'
+            '      other.collider.SendMessage("TakeDamage", 10);\n'
+            "      Destroy(gameObject);\n"
+            "    }\n"
+            "  }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is True
+
+    def test_planebullet_shape_oncollision_unconditional_destroy(self, tmp_path: Path):
+        # OnCollisionEnter that explodes + Destroy(gameObject) unconditionally — PlaneBullet.
+        info = self._info(
+            tmp_path, "PlaneBullet",
+            "public class PlaneBullet : MonoBehaviour {\n"
+            "  void OnCollisionEnter(Collision other) {\n"
+            "    Instantiate(explosion, transform.position, Quaternion.identity);\n"
+            "    Destroy(gameObject);\n"
+            "  }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is True
+
+    def test_this_gameobject_variant(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "B",
+            "public class B : MonoBehaviour {\n"
+            "  void OnTriggerEnter(Collider o) { Destroy(this.gameObject); }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is True
+
+    def test_mine_shape_destroy_in_separate_method_abstains(self, tmp_path: Path):
+        # Mine: OnTriggerEnter only Invokes; the Destroy lives in Explode(). The
+        # body does not destroy itself IN the contact handler -> abstain (and the
+        # Mine is already a trigger -> CanCollide=false anyway).
+        info = self._info(
+            tmp_path, "Mine",
+            "public class Mine : MonoBehaviour {\n"
+            '  void OnTriggerEnter(Collider o) { Invoke("Explode", 1f); }\n'
+            "  void Explode() { Destroy(gameObject); }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is False
+
+    def test_collision_handler_without_self_destroy_abstains(self, tmp_path: Path):
+        # A contact handler that reacts but persists (no self-destroy) must NOT
+        # be flagged — it is a legitimately-colliding body.
+        info = self._info(
+            tmp_path, "Bumper",
+            "public class Bumper : MonoBehaviour {\n"
+            "  void OnCollisionEnter(Collision o) { audioSource.Play(); }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is False
+
+    def test_destroy_self_outside_contact_handler_abstains(self, tmp_path: Path):
+        # Destroy(gameObject) in Update (timed despawn), no contact handler at
+        # all -> not a contact body.
+        info = self._info(
+            tmp_path, "Decay",
+            "public class Decay : MonoBehaviour {\n"
+            "  void Update() { if (t > 5f) Destroy(gameObject); }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is False
+
+    def test_destroy_other_object_in_handler_abstains(self, tmp_path: Path):
+        # Destroying a DIFFERENT object (a collectible the player picks up) is not
+        # self-destruction of THIS body -> not flagged.
+        info = self._info(
+            tmp_path, "Collector",
+            "public class Collector : MonoBehaviour {\n"
+            "  void OnCollisionEnter(Collision o) { Destroy(o.gameObject); }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is False
+
+    def test_default_false_no_hooks(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "Plain", "public class Plain : MonoBehaviour { }",
+        )
+        assert info.destroys_self_on_contact is False
+
+
+class TestSelfLaunchesProjectileGuard:
+    """``self_launches`` is the projectile discriminator paired with
+    ``destroys_self_on_contact`` to keep the non-colliding override OFF a
+    breakable platform / crate that is meant to stay solid until it shatters
+    (adversarial review false positive)."""
+
+    def _info(self, tmp_path: Path, name: str, body: str):
+        cs = tmp_path / f"{name}.cs"
+        cs.write_text(body)
+        return analyze_script(cs)
+
+    def test_bullet_self_launches(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "TurretBullet",
+            "public class TurretBullet : MonoBehaviour {\n"
+            "  void Start() { rb.AddRelativeForce(Vector3.forward * force, ForceMode.Impulse); }\n"
+            "  void OnCollisionEnter(Collision o) { Destroy(gameObject); }\n"
+            "}\n",
+        )
+        assert info.self_launches is True
+        assert info.destroys_self_on_contact is True
+
+    def test_breakable_platform_is_not_a_projectile(self, tmp_path: Path):
+        # The codex-found false positive: a non-kinematic body that is SOLID
+        # (player stands on it) until it shatters on contact. It destroys itself
+        # on contact but NEVER self-launches -> must NOT be flagged as a
+        # non-colliding projectile (else the player falls through it).
+        info = self._info(
+            tmp_path, "BreakablePlatform",
+            "public class BreakablePlatform : MonoBehaviour {\n"
+            "  void OnCollisionEnter(Collision c) {\n"
+            '    if (c.gameObject.CompareTag(\"Player\")) Destroy(gameObject);\n'
+            "  }\n"
+            "}\n",
+        )
+        assert info.destroys_self_on_contact is True   # it does destroy on contact
+        assert info.self_launches is False              # but it does NOT self-launch
+        # => the pipeline conjunction (both required) leaves it COLLIDING.
+
+    def test_plain_body_neither_signal(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "Plain", "public class Plain : MonoBehaviour { }",
+        )
+        assert info.self_launches is False
+        assert info.destroys_self_on_contact is False

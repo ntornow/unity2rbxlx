@@ -602,6 +602,69 @@ CLIENT_APIS = frozenset({
 })
 
 
+# A Unity contact handler head: ``OnCollisionEnter(...)`` or
+# ``OnTriggerEnter(...)`` followed by its opening brace. The brace span is
+# extracted by ``_matching_brace_span`` to get the handler body.
+_RE_CONTACT_HANDLER = re.compile(
+    r"\b(?:OnCollisionEnter|OnTriggerEnter)\s*\([^)]*\)\s*\{"
+)
+# ``Destroy(gameObject)`` / ``Destroy(this.gameObject)`` — the self-destroy call
+# that, inside a contact handler, marks a hit-and-vanish body. Survives
+# de-commenting (it is code, not a string literal — string contents are blanked
+# by ``_strip_comments_and_strings``, so a string-keyed signal would NOT survive).
+_RE_DESTROY_SELF = re.compile(r"\bDestroy\s*\(\s*(?:this\s*\.\s*)?gameObject\b")
+# ``AddForce`` / ``AddRelativeForce`` — a self-launch impulse. A PROJECTILE
+# launches itself under an initial force; a breakable platform / destructible
+# crate (which is meant to be physically solid until it shatters) does NOT. This
+# is the discriminator that keeps the non-colliding override OFF such "solid
+# until destroyed" bodies (adversarial review caught that false positive).
+_RE_SELF_LAUNCH = re.compile(r"\b(?:AddForce|AddRelativeForce)\s*\(")
+
+
+def _detect_destroys_self_on_contact(decommented: str, class_name: str) -> bool:
+    """True iff ``class_name`` has an ``OnCollisionEnter``/``OnTriggerEnter``
+    handler whose body calls ``Destroy(gameObject)`` — the canonical
+    hit-and-vanish *contact body* shape (Unity projectile / contact-damage
+    Rigidbody).
+
+    Why this drives a non-colliding (``CanCollide=false``) conversion: Unity's
+    player is a ``CharacterController``, which is NOT pushed by rigidbody
+    collisions; the Roblox Humanoid character IS a physics body, so a faithfully-
+    ``CanCollide=true`` projectile physically shoves it (the knockback bug). A
+    body that destroys ITSELF on contact is definitionally transient (it does not
+    persist to physically interact), so dropping its physical collision restores
+    Unity-faithful behavior while ``CanTouch`` keeps the damage ``Touched`` firing.
+
+    Deterministic upstream signal — keyed on the C# SOURCE shape, never the
+    AI-emitted Luau or a prefab-name literal. Biased to ABSTAIN: requires BOTH a
+    contact hook AND a self-destroy inside it; a collision handler that merely
+    reads/dispatches without destroying the body is not flagged. ``decommented``
+    is the comment/string-stripped source."""
+    body = _class_body_for(decommented, class_name)
+    if body is None:
+        return False
+    for m in _RE_CONTACT_HANDLER.finditer(body):
+        span = _matching_brace_span(body, m.end() - 1)
+        if span is None:
+            continue
+        handler = body[span[0] : span[1] + 1]
+        if _RE_DESTROY_SELF.search(handler):
+            return True
+    return False
+
+
+def _detect_self_launches(decommented: str, class_name: str) -> bool:
+    """True iff ``class_name``'s body calls ``AddForce``/``AddRelativeForce`` — a
+    self-launch impulse. The PROJECTILE discriminator that separates a
+    hit-and-vanish bullet (self-launched) from a breakable platform / crate that
+    is meant to stay physically solid until it shatters (never self-launched).
+    ``decommented`` is comment/string-stripped."""
+    body = _class_body_for(decommented, class_name)
+    if body is None:
+        return False
+    return _RE_SELF_LAUNCH.search(body) is not None
+
+
 @dataclass
 class ScriptInfo:
     """Extracted metadata from a C# script."""
@@ -637,6 +700,23 @@ class ScriptInfo:
     # hard to abstain (over-detection destroys UI). Keys on the C# SOURCE shape,
     # never the AI-emitted Luau.
     cleared_container_fields: frozenset[str] = field(default_factory=frozenset)
+    # True when the class has an OnCollisionEnter/OnTriggerEnter handler that
+    # destroys its own GameObject — a hit-and-vanish *contact body* (projectile /
+    # contact-damage Rigidbody). Drives the non-colliding-body conversion
+    # (CanCollide=false) so the body doesn't physically shove the Roblox
+    # character the way Unity's CharacterController-based player would never be
+    # shoved. Keys on the C# SOURCE shape, never the AI-emitted Luau.
+    #
+    # Load-bearing pairing with ``self_launches`` (below): the non-colliding
+    # override fires ONLY when BOTH are true, so a "solid until it shatters"
+    # breakable platform/crate (destroys-self-on-contact but never self-launched)
+    # keeps its collision. Adversarial review caught that false positive.
+    destroys_self_on_contact: bool = False
+    # True when the class self-launches via AddForce/AddRelativeForce — the
+    # PROJECTILE discriminator (a bullet launches itself; a breakable solid does
+    # not). Paired with ``destroys_self_on_contact`` to gate the non-colliding
+    # body conversion. Deterministic C# source signal, never the AI Luau.
+    self_launches: bool = False
 
 
 def analyze_script(script_path: str | Path) -> ScriptInfo:
@@ -713,6 +793,14 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     info.cleared_container_fields = detect_cleared_containers(
         source, info.class_name,
     )
+
+    # Detect the hit-and-vanish contact-body shape (OnCollisionEnter/
+    # OnTriggerEnter that Destroys its own gameObject). Drives the non-colliding
+    # (CanCollide=false) conversion for projectiles / contact-damage Rigidbodies.
+    info.destroys_self_on_contact = _detect_destroys_self_on_contact(
+        decommented, info.class_name,
+    )
+    info.self_launches = _detect_self_launches(decommented, info.class_name)
 
     # Extract type references (field types, method parameter types, etc.)
     # Matches PascalCase identifiers used as types in declarations

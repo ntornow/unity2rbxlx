@@ -2224,3 +2224,86 @@ class TestDormantHolderDescendantNoDanglingRow:
             "the active child of an inactive parent must never be placed "
             "(its parent's subtree is pruned / dormant-holder non-recursed)"
         )
+
+
+class TestContactNonCollidingOverride:
+    """A dynamic Rigidbody whose script is a hit-and-vanish contact body
+    (``contact_noncolliding_classes``) is converted ``CanCollide=false`` +
+    ``CanTouch=true`` so it doesn't physically shove the Roblox character.
+    Keyed on the deterministic C# class set, never a prefab-name literal."""
+
+    def _node(self, cs_guid):
+        # A bullet-shaped node: non-trigger SphereCollider + dynamic Rigidbody +
+        # a MonoBehaviour pointing at <class>.cs (resolved to _ScriptClass).
+        class ColliderComp:
+            component_type = "SphereCollider"
+            properties = {"m_IsTrigger": 0, "m_Radius": 0.5,
+                          "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class RigidbodyComp:
+            component_type = "Rigidbody"
+            properties = {"m_Mass": 1.0, "m_IsKinematic": 0}
+
+        class MonoComp:
+            component_type = "MonoBehaviour"
+            properties = {"m_Script": {"fileID": 11500000, "guid": cs_guid, "type": 3}}
+
+        class FakeNode:
+            name = "TurretBullet"
+            components = [ColliderComp(), RigidbodyComp(), MonoComp()]
+
+        return FakeNode()
+
+    def _guid_index(self):
+        from core.unity_types import GuidIndex, GuidEntry
+        guid = "cafebabe00112233cafebabe00112233"
+        gi = GuidIndex(project_root=Path("/nonexistent"))
+        gi.guid_to_entry[guid] = GuidEntry(
+            guid=guid,
+            asset_path=Path("/nonexistent/TurretBullet.cs"),
+            relative_path=Path("TurretBullet.cs"),
+            kind="script",
+        )
+        return gi, guid
+
+    def test_flagged_class_forces_noncolliding(self):
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+        gi, guid = self._guid_index()
+        part = RbxPart(name="TurretBullet")
+        with _scene_ctx(contact_noncolliding_classes=frozenset({"TurretBullet"})):
+            _process_components(self._node(guid), part, guid_index=gi)
+        # Non-trigger collider would normally yield CanCollide=true; the override
+        # flips it off and keeps CanTouch so the damage Touched still fires.
+        assert part.attributes.get("_ScriptClass") == "TurretBullet"
+        assert part.can_collide is False
+        assert part.can_touch is True
+
+    def test_unflagged_class_keeps_colliding(self):
+        # Same bullet-shaped node, but the class is NOT in the flagged set ->
+        # physical collider authority stands (CanCollide stays true). Proves the
+        # override is gated on the deterministic class set, not on "any
+        # Rigidbody+collider".
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+        gi, guid = self._guid_index()
+        part = RbxPart(name="TurretBullet")
+        with _scene_ctx(contact_noncolliding_classes=frozenset()):
+            _process_components(self._node(guid), part, guid_index=gi)
+        assert part.can_collide is True
+
+    def test_anchored_body_is_not_overridden(self):
+        # Kinematic (anchored) body with a flagged class: the override is scoped
+        # to dynamic bodies (anchored bodies neither launch nor impart knockback),
+        # so it must not fire.
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+        gi, guid = self._guid_index()
+        node = self._node(guid)
+        node.components[1].properties["m_IsKinematic"] = 1  # Rigidbody kinematic
+        part = RbxPart(name="TurretBullet")
+        with _scene_ctx(contact_noncolliding_classes=frozenset({"TurretBullet"})):
+            _process_components(node, part, guid_index=gi)
+        # Anchored: override skipped. (Anchored parts ignore velocity/collisions
+        # for knockback purposes anyway.)
+        assert part.anchored is True
