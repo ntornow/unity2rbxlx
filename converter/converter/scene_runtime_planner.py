@@ -130,6 +130,14 @@ class SceneRuntimeModule(TypedDict, total=False):
     # fail closed). Default-absent on pre-existing artifacts; consumers read it
     # with ``.get(..., False)`` (no invariant gates on it, so no backfill).
     has_character_controller: bool
+    # The serialized container FIELD NAMES this script provably clears-then-
+    # populates (gap#4 — from ``ScriptInfo.cleared_container_fields``). Drives
+    # the SOUND UI child-suppression signal: ``_collect_ui_child_suppression_ids``
+    # resolves each name to a scene GameObject id via the instance's
+    # serialized-Transform reference rows, and only those provably-cleared
+    # containers have their static authored children dropped. Empty unless the
+    # canonical clear-all-then-Instantiate shape is matched (bias to abstain).
+    cleared_container_fields: list[str]
     domain: str
     container: str
     module_path: str
@@ -1210,8 +1218,8 @@ def _build_modules_table(
     # local inheritance chain (analyze_script only records the immediate
     # base). e.g. ``Turret : Weapon`` + ``Weapon : MonoBehaviour`` ⇒ Turret
     # is a component even though its immediate base is ``Weapon``.
-    # guid -> (stem, class_name, base_class, has_lifecycle_hook)
-    analyzed: dict[str, tuple[str, str, str, bool]] = {}
+    # guid -> (stem, class_name, base_class, has_lifecycle_hook, cleared_fields)
+    analyzed: dict[str, tuple[str, str, str, bool, frozenset[str]]] = {}
     base_by_class: dict[str, str] = {}
     for script_guid, entry in cs_entries.items():
         if entry.asset_path.suffix != ".cs":
@@ -1219,12 +1227,14 @@ def _build_modules_table(
         info = analyze_script(entry.asset_path)
         analyzed[script_guid] = (
             entry.asset_path.stem, info.class_name, info.base_class,
-            bool(info.lifecycle_hooks),
+            bool(info.lifecycle_hooks), info.cleared_container_fields,
         )
         if info.class_name:
             base_by_class[info.class_name] = info.base_class
 
-    for script_guid, (stem, class_name, base_class, has_hook) in analyzed.items():
+    for script_guid, (
+        stem, class_name, base_class, has_hook, cleared_fields,
+    ) in analyzed.items():
         # A class is a component if either:
         #   (1) it extends a known Unity component base (directly or
         #       transitively via the project-local inheritance walk), OR
@@ -1260,6 +1270,10 @@ def _build_modules_table(
             "is_loader": bool(REPLICATED_FIRST_HINTS.search(stem)),
             "character_attached": False,
             "has_character_controller": script_guid in character_controller_scripts,
+            # gap#4: provably clears-then-populates these serialized container
+            # fields. Sorted for deterministic artifacts. Empty unless the
+            # canonical clear-all-then-Instantiate shape was matched.
+            "cleared_container_fields": sorted(cleared_fields),
         }
 
     # Scripts attached at runtime but absent from the guid index (e.g.,
@@ -1277,6 +1291,8 @@ def _build_modules_table(
                 "is_loader": False,
                 "character_attached": False,
                 "has_character_controller": script_id in character_controller_scripts,
+                # No .cs in the guid index → no source to analyze → abstain.
+                "cleared_container_fields": [],
             }
 
     return modules

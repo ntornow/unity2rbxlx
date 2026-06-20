@@ -4122,3 +4122,23 @@ P2: ONE slice (helper + call site + tests, all in scene_runtime.luau / its luau-
 
 --- Phase 2 harden (round 2) ---
 P2-HARDEN: setActive dispatch now accepts a userdata Instance arg (`elseif type(go) == "table" or type(go) == "userdata"`), and both `_resolveScreenGui` guards accept `"userdata"`. Real Roblox Instances are `type()=="userdata"`, not `"table"`; the three table-only guards silently no-op'd the ScreenGui toggle in production while the table-mock unit tests passed (green-for-wrong-reason). The setActive-dispatch line is PRE-EXISTING code just outside the slice's new lines, but it is the ROOT CAUSE of the flagged P1 — a userdata Instance fell to `else return` BEFORE the toggle block, so the toggle was unreachable for the common path (`setActive(self.canvas=realInstance, bool)`). Same bug class as the documented destroy fix at scene_runtime.luau ~2643 (`if t ~= "table" and t ~= "userdata" then return`). Scope-widening into adjacent pre-existing code permitted by the harden scope gate because the canvas toggle depends on it. Regression bite added via `newproxy(true)` userdata tests (Test A: dispatch+branch-1; Test B: branch-2). Classification: Mechanical.
+# Decisions — gap4-dynamic-dedup (Proposal E)
+
+## Context (from gap4-analysis-20260620/synthesis.md — codex-validated x2)
+- Static "delete authored children" gate is UNSOUND (no reliable static signal; destroys real UI).
+- Proposal E (dynamic): keep ALL authored UI + runtime observed-collision dedup. The destroyed-UI
+  class is ELIMINATED; residual is a SAFE-direction double-stamp (logged) in exotic indirection.
+## D0 — HARD CONSTRAINT: no coherence packs / post-transpile AI-output rewrites
+- Implement ONLY in the structural pipeline (scene_converter.py, ui_translator.py) + the hand-written
+  runtime (scene_runtime.luau). NOT script_coherence_packs.py, NOT spawn_call_site_lowering (the core
+  needs no change there — host.instantiatePrefab already receives prefab_id + parent). Prefer REMOVING
+  machinery (the destructive gate; the awaitUiHost deferred-clone if hosts always land statically).
+
+## D4 (user choice) — build a conservative same-method clear-detector at the upfront C# analysis phase
+- Replace the UNSOUND asset-ref suppression trigger with a SOUND one: detect (in script_analyzer.py, the
+  upfront whole-codebase C# analysis — NOT a coherence pack, NOT AI-output) a controller method that
+  Instantiates into a container AND clears that same container (Destroy-loop / Clear over its children)
+  BEFORE the instantiate, in the SAME method. Only those provably-cleared containers get their static
+  children suppressed. Bias to abstain: no same-method clear -> KEEP (safe). Feasible on existing infra
+  (script_analyzer _strip_comments + Instantiate|Destroy regex + _matching_brace_span; lazy_singleton
+  _method_body precedent). Classification: User-Challenge (explicit user direction).

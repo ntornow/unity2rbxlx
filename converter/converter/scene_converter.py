@@ -1015,26 +1015,35 @@ def _collect_ui_child_suppression_ids(
     scene_runtime: dict[str, object] | None,
 ) -> frozenset[str]:
     """Build the set of UI GameObject ids whose static child trees the
-    converter should drop under generic mode (PR3c carve-out 2).
+    converter should drop under generic mode (gap#4 — SOUND clear-intent gate).
 
-    A UI element's children are suppressed iff a runtime-bearing
-    MonoBehaviour mounted on the same GameObject owns a serialized field
-    referencing an asset or prefab. Under generic the host runtime owns
-    instantiation of that content via ``host.instantiatePrefab`` —
-    emitting the static descendants AS WELL would double-stamp the tree
-    (runtime adds its copy; static copy never gets removed).
+    A UI host's authored children are suppressed iff a runtime-bearing
+    controller mounted on it PROVABLY clears-then-populates a serialized
+    container field whose authored target is that very subtree. The signal is
+    the upfront C# analysis ``cleared_container_fields`` (the canonical
+    ``foreach (Transform c in container) Destroy(c.gameObject)`` +
+    ``Instantiate(prefab, container)`` shape); merely REFERENCING an asset or
+    prefab no longer triggers suppression (that was unsound — it destroyed real
+    UI). Under generic the host runtime re-populates the cleared container at
+    runtime, so emitting the static authored children AS WELL would double-stamp.
 
-    Algorithm:
-      1. Index each instance by ``instance_id → (script_id, game_object_id)``.
-      2. Walk references; for any row whose ``target_kind`` is ``asset`` or
-         ``prefab``, look up the source instance's module
-         (``modules[script_id]``) and check ``runtime_bearing == True``.
-      3. If so, add the source instance's ``game_object_id`` to the set.
+    Algorithm (per scene/prefab block):
+      1. Index each instance by ``instance_id`` → its ``(script_id,
+         game_object_id)``.
+      2. For each runtime-bearing controller instance, read its module's
+         ``cleared_container_fields``.
+      3. Resolve each cleared field NAME to a scene GameObject id via THAT
+         instance's serialized-Transform reference rows (``from`` ==
+         instance_id, ``field`` == cleared-field name, ``target_kind`` in
+         (``gameobject``, ``component``)). A ``gameobject`` ref's ``target_ref``
+         IS the owning GO id; a ``component`` ref's ``target_ref`` is a peer
+         instance_id resolved to its owning GO via the instance index.
+      4. A field that doesn't resolve to EXACTLY ONE GO is skipped (abstain).
 
-    A missing module row, missing ``runtime_bearing`` flag, or unknown
-    instance ref is silently skipped — under generic the planner is
-    authoritative; the carve-out fires only on confirmed signals. Empty
-    set under all uncertainty preserves the legacy static-emit path.
+    A missing module row, missing ``cleared_container_fields``, fail-closed
+    ``domain``, or an unresolved field is silently skipped — the carve-out
+    fires only on confirmed signals. Empty set under all uncertainty preserves
+    the legacy static-emit path.
     """
     if not scene_runtime:
         return frozenset()
@@ -1060,33 +1069,61 @@ def _collect_ui_child_suppression_ids(
             if isinstance(iid, str) and isinstance(sid, str) and isinstance(gid, str):
                 instance_lookup[iid] = (sid, gid)
 
+        # instance_id -> game_object_id (for resolving a ``component`` ref's
+        # owning GO).
+        go_of_instance = {
+            iid: gid for iid, (_sid, gid) in instance_lookup.items()
+        }
+
+        # Group reference rows by their source instance for O(1) per-instance
+        # field resolution.
+        refs_from: dict[str, list[dict[str, object]]] = {}
         for ref in block.get("references", []) or []:
             if not isinstance(ref, dict):
                 continue
-            tk = ref.get("target_kind")
-            if tk not in ("asset", "prefab"):
-                continue
             src = ref.get("from")
-            if not isinstance(src, str):
-                continue
-            lookup = instance_lookup.get(src)
-            if lookup is None:
-                continue
-            script_id, game_object_id = lookup
+            if isinstance(src, str):
+                refs_from.setdefault(src, []).append(ref)
+
+        for instance_id, (script_id, _gid) in instance_lookup.items():
             module_row = modules.get(script_id)
             if not isinstance(module_row, dict):
                 continue
             if not module_row.get("runtime_bearing"):
                 continue
-            # When the domain classifier has already run, exclude
-            # fail-closed modules: the host runtime never wires a module
-            # forced to ``domain="excluded"``, so the static UI subtree must
-            # persist. At ``convert_scene`` time the classifier usually
-            # hasn't run yet (order: ``convert_scene`` → ``_classify_storage``)
-            # so the field is absent and we fall back to ``runtime_bearing``.
+            # When the domain classifier has already run, exclude fail-closed
+            # modules: the host runtime never wires a module forced to
+            # ``domain="excluded"``/``"legacy"``, so the static UI subtree must
+            # persist. At ``convert_scene`` time the classifier usually hasn't
+            # run yet (order: ``convert_scene`` → ``_classify_storage``) so the
+            # field is absent and the gate is skipped here.
             if module_row.get("domain") in ("excluded", "legacy"):
                 continue
-            suppressed.add(game_object_id)
+            cleared = module_row.get("cleared_container_fields")
+            if not isinstance(cleared, list) or not cleared:
+                continue
+
+            instance_refs = refs_from.get(instance_id, [])
+            for field_name in cleared:
+                if not isinstance(field_name, str) or not field_name:
+                    continue
+                resolved_gos: set[str] = set()
+                for ref in instance_refs:
+                    if ref.get("field") != field_name:
+                        continue
+                    tk = ref.get("target_kind")
+                    tr = ref.get("target_ref")
+                    if not isinstance(tr, str) or not tr:
+                        continue
+                    if tk == "gameobject":
+                        resolved_gos.add(tr)
+                    elif tk == "component":
+                        owner = go_of_instance.get(tr)
+                        if isinstance(owner, str) and owner:
+                            resolved_gos.add(owner)
+                # Abstain unless the field resolves to EXACTLY ONE GO.
+                if len(resolved_gos) == 1:
+                    suppressed.add(next(iter(resolved_gos)))
 
     scenes = scene_runtime.get("scenes", {})
     if isinstance(scenes, dict):
