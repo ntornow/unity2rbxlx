@@ -302,6 +302,70 @@ def test_clear_only_no_spawn_abstains():
     assert detect_cleared_containers(src, "Ctrl") == frozenset()
 
 
+def test_nested_class_clear_not_attributed_to_outer():
+    """FIX 1 (depth-1 enforcement): a canonical clear+spawn declared in a
+    NESTED class inside the MonoBehaviour must NOT be attributed to the OUTER
+    class. ``_iter_method_bodies`` only returns methods at the class body's own
+    depth (0 within the between-braces source), so the nested method is
+    skipped → the outer class clears nothing → abstain.
+
+    Pre-fix this mis-attributed the nested method to the outer class and
+    spuriously emitted ``container`` — an unsound (UI-destroying) hit."""
+    src = _wrap("Outer", """
+    public Transform container;
+    public GameObject prefab;
+
+    class Inner {
+        public Transform container;
+        public GameObject prefab;
+        void Refresh() {
+            foreach (Transform c in container) Destroy(c.gameObject);
+            Instantiate(prefab, container);
+        }
+    }
+""")
+    assert detect_cleared_containers(src, "Outer") == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — unrelated lambda no longer blanket-abstains; depth gate stays sound.
+# ---------------------------------------------------------------------------
+
+def test_unrelated_lambda_still_emits():
+    """FIX 2 (drop blanket ``=>`` abstain): an UNRELATED lambda elsewhere in a
+    method that ALSO has a legit depth-1 clear+spawn no longer suppresses the
+    container. The depth gates keep soundness; an unrelated lambda does not
+    move the real clear/spawn out of depth 1."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    public System.Collections.Generic.List<Item> items;
+    void Refresh() {
+        items.ForEach(x => x.Init());
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+def test_lambda_containing_spawn_still_abstains_via_depth_gate():
+    """FIX 2 soundness: a clear+spawn that lives INSIDE a lambda body sits at
+    brace-depth > 1, so the ``clear_depth != 1`` gate abstains — even without
+    the removed blanket ``=>`` guard."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        Schedule(() => {
+            foreach (Transform c in container) Destroy(c.gameObject);
+            Instantiate(prefab, container);
+        });
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
 # ---------------------------------------------------------------------------
 # Wiring — analyze_script populates ScriptInfo.cleared_container_fields.
 # ---------------------------------------------------------------------------

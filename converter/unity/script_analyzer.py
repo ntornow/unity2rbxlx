@@ -296,6 +296,13 @@ def _iter_method_bodies(class_body: str) -> list[str]:
             break
         # The matched ``{`` is the last char of the match.
         brace_idx = m.end() - 1
+        # Only accept methods declared directly in ``class_body`` (depth 0 in
+        # this source, which is the span BETWEEN the class braces). A match at
+        # depth > 0 sits inside a nested type/accessor and would be
+        # mis-attributed to the outer class — skip it.
+        if _depth_at(class_body, brace_idx) != 0:
+            pos = brace_idx + 1
+            continue
         span = _matching_brace_span(class_body, brace_idx)
         if span is None:
             break
@@ -317,21 +324,10 @@ def _depth_at(body: str, idx: int) -> int:
     return depth
 
 
-def _has_nested_callable(body: str) -> bool:
-    """True when the method body contains a nested callable — a lambda
-    (``=>``) or a local function — whose presence could move the spawn/clear
-    into a deferred scope we can't reason about. Bias to abstain."""
-    inner = body
-    return "=>" in inner
-
-
 def _detect_in_body(body: str) -> frozenset[str]:
     """Return the container field names this ONE method body provably clears-
     then-populates. ``body`` includes its surrounding braces, de-commented.
     Empty on any ambiguity."""
-    if _has_nested_callable(body):
-        return frozenset()
-
     # Collect every spawn-into-C site: (container_token, match_start).
     spawns: list[tuple[str, int]] = []
     for sm in _RE_SPAWN_INTO.finditer(body):
