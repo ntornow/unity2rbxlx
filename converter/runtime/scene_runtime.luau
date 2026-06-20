@@ -2373,6 +2373,27 @@ function SceneRuntime:applyImpulse(part, force)
 	end
 end
 
+function SceneRuntime:_resolveScreenGui(go, goId)
+	-- Return the ScreenGui Instance owned by the toggled GO, or nil.
+	-- 1. ``go`` may ALREADY be the ScreenGui (client-resolved gameobject
+	--    ref, the common path) -- accept it directly when it IsA ScreenGui.
+	if type(go) == "table" and type(go.IsA) == "function" then
+		local okGui, isGui = pcall(function() return go:IsA("ScreenGui") end)
+		if okGui and isGui then return go end
+	end
+	if not goId then return nil end
+	-- 2. ``go`` was a string id (or a non-GUI GO whose SRI also tags a
+	--    GUI): one-shot resolve by the deterministic SRI. CLIENT
+	--    workspaceFind scans PlayerGui; SERVER workspaceFind scans
+	--    workspace only -> nil (no-op).
+	local found = self._services.workspaceFind and self._services.workspaceFind(goId) or nil
+	if found ~= nil and type(found) == "table" and type(found.IsA) == "function" then
+		local okGui, isGui = pcall(function() return found:IsA("ScreenGui") end)
+		if okGui and isGui then return found end
+	end
+	return nil
+end
+
 function SceneRuntime:setActive(go, bool)
 	-- R4-P1.2: split ``activeSelf`` (per-GO authored) from
 	-- ``activeInHierarchy`` (per-GO computed = self AND ancestor chain).
@@ -2519,6 +2540,20 @@ function SceneRuntime:setActive(go, bool)
 		if rootSelf == nil then rootSelf = true end
 		self._goActiveInHierarchy[goId] = rootSelf and toggledAncestorGate and true or false
 		applyComponentsAt(goId)
+	end
+
+	-- ScreenGui toggle: when the toggled GO OWNS a ScreenGui (its
+	-- _SceneRuntimeId stamps the ScreenGui), drive ``.Enabled`` so a Unity
+	-- ``canvas.gameObject.SetActive(b)`` state transition hides/shows the GUI.
+	-- Gated on the computed activeInHierarchy (an inactive ancestor keeps it
+	-- hidden, matching Unity activeInHierarchy). The cascade above does NOT
+	-- reach a PlayerGui ScreenGui (it walks the workspace subtree), so this is
+	-- an EXPLICIT cross-tree set, not a free cascade ride.
+	local gui = self:_resolveScreenGui(go, goId)
+	if gui ~= nil then
+		local hier = self._goActiveInHierarchy[goId]
+		if hier == nil then hier = true end
+		gui.Enabled = (bool and hier) and true or false
 	end
 
 	if #pendingStarts > 0 then
