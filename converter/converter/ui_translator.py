@@ -200,7 +200,8 @@ def _canvas_enabled(canvas_node: SceneNode) -> bool:
     canvas_m_enabled = True
     for comp in canvas_node.components:
         if comp.component_type == "Canvas":
-            canvas_m_enabled = int(comp.properties.get("m_Enabled", 1)) != 0
+            raw = comp.properties.get("m_Enabled", 1)
+            canvas_m_enabled = bool(raw) if isinstance(raw, (int, bool)) else True
             break
     return active and canvas_m_enabled
 

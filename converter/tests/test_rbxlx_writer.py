@@ -744,3 +744,24 @@ class TestScreenGuiEnabled:
             i for i, (tag, nm) in enumerate(names)
             if tag == "BinaryString" and nm == "AttributesSerialize")
         assert enabled_idx < attrs_idx, names
+
+    def test_ducktyped_without_enabled_omits_enabled(self, tmp_path):
+        """A duck-typed ScreenGui lacking `enabled` does NOT emit Enabled.
+
+        The writer guards with `hasattr(sg, "enabled")`, so a back-compat
+        object without the attr emits no `name="Enabled"` (Roblox default
+        true applies at load). A real RbxScreenGui DOES emit it. (AC#5)
+        """
+        from types import SimpleNamespace
+        from roblox.rbxlx_writer import write_rbxlx
+        duck = SimpleNamespace(name="DuckUI", elements=[], attributes={})
+        assert not hasattr(duck, "enabled")
+        out = tmp_path / "duck.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[duck]), out)
+        text = out.read_text()
+        assert 'name="Enabled"' not in text
+
+        real = RbxScreenGui(name="RealUI")
+        out2 = tmp_path / "real.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[real]), out2)
+        assert '<bool name="Enabled">true</bool>' in out2.read_text()

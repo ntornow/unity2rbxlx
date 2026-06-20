@@ -400,3 +400,17 @@ class TestEmitScreenGuiEnabled:
         assert "_SceneRuntimeId" in out
         assert out.index("g.Enabled") < out.index("SetAttribute")
         assert out.index("g.Enabled") < out.index("_SceneRuntimeId")
+
+    def test_ducktyped_without_enabled_defaults_true(self):
+        """A duck-typed gui lacking `enabled` -> g.Enabled=true.
+
+        The emitter reads `getattr(gui, "enabled", True)`, so a back-compat
+        object without the attr falls back to the Roblox default true. (AC#5)
+        """
+        from types import SimpleNamespace
+        duck = SimpleNamespace(name="DuckUI", reset_on_spawn=False,
+                               attributes={}, elements=[])
+        assert not hasattr(duck, "enabled")
+        out = self._emit(duck)
+        assert "g.Enabled=true" in out
+        assert "g.Enabled=false" not in out

@@ -726,6 +726,37 @@ class TestCanvasEnabled:
         assert _canvas_enabled(
             self._canvas_node(False, None, has_canvas_comp=False)) is False
 
+    @staticmethod
+    def _canvas_node_raw_m_enabled(active: bool, raw: object) -> SceneNode:
+        """Canvas node whose m_Enabled holds an arbitrary (possibly non-int)
+        value, so we can exercise present-but-None / non-numeric inputs that
+        the int-typed `_canvas_node` helper cannot express."""
+        comp = ComponentData("Canvas", "canvasComp", {"m_Enabled": raw})
+        return SceneNode(
+            name="Canvas", file_id="canvasFid", active=active, layer=0,
+            tag="Untagged", components=[comp], children=[], parent_file_id=None,
+        )
+
+    def test_present_none_m_enabled_defaults_true(self):
+        """m_Enabled present-but-None -> defaults True, no crash.
+
+        Pre-fix `int(None)` raised TypeError; the isinstance guard now
+        defaults a non-int/non-bool value to True. (AC#2)
+        """
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(
+            self._canvas_node_raw_m_enabled(True, None)) is True
+
+    def test_nonnumeric_string_m_enabled_defaults_true(self):
+        """m_Enabled present as a non-numeric string -> defaults True, no crash.
+
+        Pre-fix `int("true")` raised ValueError/TypeError; the isinstance
+        guard now defaults a non-int/non-bool value to True. (AC#2)
+        """
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(
+            self._canvas_node_raw_m_enabled(True, "true")) is True
+
     def test_default_synthetic_node_true(self):
         """A synthetic node (active default True, no Canvas) -> True. (AC#1)"""
         from converter.ui_translator import _canvas_enabled
