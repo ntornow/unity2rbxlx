@@ -253,6 +253,7 @@ class RbxScreenGui:
     name: str = "ScreenGui"
     elements: list[RbxUIElement] = field(default_factory=list)
     reset_on_spawn: bool = False
+    enabled: bool = True          # mirrors RbxUIElement.visible; default True = current behavior
     attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
 
 
