@@ -1899,6 +1899,8 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
         sg_item, sg_props = _make_item(starter_gui, "ScreenGui", getattr(sg, "name", "ScreenGui"))
         if hasattr(sg, "reset_on_spawn"):
             _add_bool(sg_props, "ResetOnSpawn", sg.reset_on_spawn)
+        if hasattr(sg, "enabled"):
+            _add_bool(sg_props, "Enabled", sg.enabled)
         # Serialize ScreenGui attributes (e.g. CanvasScaler reference resolution)
         sg_attrs = getattr(sg, "attributes", None) or {}
         if sg_attrs:

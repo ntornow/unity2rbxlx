@@ -4095,6 +4095,33 @@ on the SAME core correction. P1 findings folded into design.md revision:
   needed there. Classification: Taste.
 
 
+## /drive run screengui-state-visibility-20260620T115219 — decisions (2026-06-20T11:06:50Z)
+
+Two phases on a staged-risk seam (Static build-time Enabled foundation → Dynamic runtime toggle); disjoint Python/Luau surfaces, Phase 1 independently verifiable. Classification: Taste.
+New RbxScreenGui.enabled: bool = True field, mirroring how RbxUIElement.visible already flows + serializes; default True preserves current behavior. Classification: Mechanical.
+Resolve the owned ScreenGui via the existing _SceneRuntimeId stamp (already on the ScreenGui, already runtime-resolvable), never a new identity or canvas-name match — stays general-purpose. Classification: Mechanical.
+Preserve the existing setActive activeSelf/activeInHierarchy semantics (Unity-faithful, one source of truth) but reach the ScreenGui via an EXPLICIT client-side resolve, NOT a free cascade ride (supersedes the earlier "for free" framing; see the sharpened decision below). Classification: Taste.
+RESOLVED (empirical, was the Open Question): trash-dash authors non-initial canvases inactive in-scene (Loadout active=True; Game/GameOver/Leaderboard active=False, via scene_parser) — so Phase 1 alone fixes the reported boot-wall symptom; Phase 2 owns transitions only; phase ordering confirmed correct. Classification: Mechanical.
+Phase 2 reaches the ScreenGui via an EXPLICIT client-side _SceneRuntimeId cross-tree resolve (workspaceFind/awaitUiHost into PlayerGui), NOT a free cascade ride (the cascade walks the workspace subtree which excludes PlayerGui ScreenGuis; ScreenGui→PlayerGui resolution is client-only — scene_runtime.luau:3605); Phase-2 detailed design must establish the toggling-code script domain and constrain to client or note the per-player limitation. Classification: Taste.
+Phase-2 detailed design MUST verify the setActive RECEIVER against the REAL transpiled state scripts: the cross-reference canvas.gameObject.SetActive(...) form is AI-transpiler output (api_mappings maps only the self-form), so confirm the go argument resolves to the canvas's _SceneRuntimeId-stamped handle, anchored on deterministic upstream where feasible (project's known AI-output-fingerprint risk). Classification: Taste.
+
+--- Phase 1 detailed design ---
+P1: Read the Canvas component's m_Enabled at convert_canvas and implement full Unity AND semantics (enabled = canvas_node.active AND Canvas.m_Enabled) NOW — m_Enabled IS cleanly available (canvas_node.components in hand, "Canvas" component_type already matched at ui_translator.py:907, int(...get("m_Enabled",1)) read pattern established at scene_converter.py:3459); not deferred as a follow-on. Classification: Mechanical.
+P1: RbxScreenGui.enabled: bool = True placed after reset_on_spawn; default True is byte-compatible with all current keyword-construction callers, no positional break. Classification: Mechanical.
+P1: No try/except around the m_Enabled int() read — matches the codebase's existing unguarded reads of the same parser output (one convention; no speculative defensive code per project rule); malformed-scene handling, if ever needed, belongs at the parser. Classification: Taste.
+P1: Extract a pure _canvas_enabled(SceneNode) -> bool helper rather than inlining, for isolated unit testing of the AND-semantics matrix. Classification: Taste.
+P1: ONE slice — the enabled value is a single produced-then-consumed contract (type -> both writers -> converter); splitting would create the writer/reader-pair split the operating rules warn against. Classification: Mechanical.
+
+--- Phase 2 detailed design ---
+P2: Resolve the owned ScreenGui by the deterministic _SceneRuntimeId (go:IsA("ScreenGui") fast path, else workspaceFind(goId)), NOT a coherence pack or AI-output fingerprint — the setActive call is already deterministically emitted and self.canvas is wired by a DETERMINISTIC plan ref (target_kind=="gameobject", verified in real conversion_plan.json); runtime resolution reuses the existing PlayerGui-aware client workspaceFind. Classification: Mechanical.
+P2: Fold the toggle into setActive as an additive block + a _resolveScreenGui helper; no change to any existing setActive branch and no autogen.py change (every non-GUI GO -> helper returns nil -> normal cascade untouched; both client+server services tables already inject workspaceFind). Classification: Mechanical.
+P2: Gate gui.Enabled on (bool AND _goActiveInHierarchy[goId]) to preserve Unity activeInHierarchy — an inactive ancestor keeps the GUI hidden even on setActive(canvas,true); reuses the cascade's already-computed gate. Classification: Taste.
+P2: Common path needs only the synchronous resolve; the awaitUiHost boot-race deferral is an EDGE case deferred to followups, NOT added to the setActive hot path (transitions run post-boot when the PlayerGui clone exists; HUD canvases are ResetOnSpawn=false). Classification: Taste.
+P2: Server-domain toggle is an accepted safe no-op (server workspaceFind is workspace-only -> nil -> early return) because the canvas-toggling state scripts are client-domain (verified via the contract-verifier in conversion_context.json) and the toggle takes effect client-side per-player. Classification: Taste.
+P2: ONE slice (helper + call site + tests, all in scene_runtime.luau / its luau-harness test) — single cohesive runtime change, no fan-out, shared producer/consumer contract kept in one review. Classification: Mechanical.
+
+--- Phase 2 harden (round 2) ---
+P2-HARDEN: setActive dispatch now accepts a userdata Instance arg (`elseif type(go) == "table" or type(go) == "userdata"`), and both `_resolveScreenGui` guards accept `"userdata"`. Real Roblox Instances are `type()=="userdata"`, not `"table"`; the three table-only guards silently no-op'd the ScreenGui toggle in production while the table-mock unit tests passed (green-for-wrong-reason). The setActive-dispatch line is PRE-EXISTING code just outside the slice's new lines, but it is the ROOT CAUSE of the flagged P1 — a userdata Instance fell to `else return` BEFORE the toggle block, so the toggle was unreachable for the common path (`setActive(self.canvas=realInstance, bool)`). Same bug class as the documented destroy fix at scene_runtime.luau ~2643 (`if t ~= "table" and t ~= "userdata" then return`). Scope-widening into adjacent pre-existing code permitted by the harden scope gate because the canvas toggle depends on it. Regression bite added via `newproxy(true)` userdata tests (Test A: dispatch+branch-1; Test B: branch-2). Classification: Mechanical.
 # Decisions — gap4-dynamic-dedup (Proposal E)
 
 ## Context (from gap4-analysis-20260620/synthesis.md — codex-validated x2)

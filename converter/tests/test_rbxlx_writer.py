@@ -688,3 +688,80 @@ class TestRosterEmit:
         after = dict(place.replicated_templates[0].attributes)
         assert ROSTER_TAG_MARKER not in after
         assert before == after
+
+
+class TestScreenGuiEnabled:
+    """ScreenGui `Enabled` static contract serialization. (AC#3, AC#5)"""
+
+    @staticmethod
+    def _screen_gui_props(output: Path) -> ET.Element:
+        """Return the <Properties> element of the (single) ScreenGui item."""
+        root = ET.parse(output).getroot()
+        for item in root.iter("Item"):
+            if item.get("class") == "ScreenGui":
+                props = item.find("Properties")
+                assert props is not None
+                return props
+        raise AssertionError("no ScreenGui Item found")
+
+    def test_enabled_true_serialized(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        gui = RbxScreenGui(name="EnabledUI", enabled=True)
+        out = tmp_path / "t.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[gui]), out)
+        assert '<bool name="Enabled">true</bool>' in out.read_text()
+
+    def test_enabled_false_serialized(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        gui = RbxScreenGui(name="DisabledUI", enabled=False)
+        out = tmp_path / "t.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[gui]), out)
+        assert '<bool name="Enabled">false</bool>' in out.read_text()
+
+    def test_enabled_default_true_backcompat(self, tmp_path):
+        """A ScreenGui built without `enabled=` serializes Enabled=true. (AC#5)"""
+        from roblox.rbxlx_writer import write_rbxlx
+        gui = RbxScreenGui(name="DefaultUI")
+        out = tmp_path / "t.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[gui]), out)
+        assert '<bool name="Enabled">true</bool>' in out.read_text()
+
+    def test_enabled_before_attributes_serialize(self, tmp_path):
+        """Enabled is emitted before AttributesSerialize. (AC#3)"""
+        from roblox.rbxlx_writer import write_rbxlx
+        # Attributes present so AttributesSerialize is emitted.
+        gui = RbxScreenGui(name="OrderUI", enabled=False,
+                           attributes={"_SceneRuntimeId": "S:1"})
+        out = tmp_path / "t.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[gui]), out)
+        props = self._screen_gui_props(out)
+        children = list(props)
+        names = [(c.tag, c.get("name")) for c in children]
+        enabled_idx = next(
+            i for i, (tag, nm) in enumerate(names)
+            if tag == "bool" and nm == "Enabled")
+        attrs_idx = next(
+            i for i, (tag, nm) in enumerate(names)
+            if tag == "BinaryString" and nm == "AttributesSerialize")
+        assert enabled_idx < attrs_idx, names
+
+    def test_ducktyped_without_enabled_omits_enabled(self, tmp_path):
+        """A duck-typed ScreenGui lacking `enabled` does NOT emit Enabled.
+
+        The writer guards with `hasattr(sg, "enabled")`, so a back-compat
+        object without the attr emits no `name="Enabled"` (Roblox default
+        true applies at load). A real RbxScreenGui DOES emit it. (AC#5)
+        """
+        from types import SimpleNamespace
+        from roblox.rbxlx_writer import write_rbxlx
+        duck = SimpleNamespace(name="DuckUI", elements=[], attributes={})
+        assert not hasattr(duck, "enabled")
+        out = tmp_path / "duck.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[duck]), out)
+        text = out.read_text()
+        assert 'name="Enabled"' not in text
+
+        real = RbxScreenGui(name="RealUI")
+        out2 = tmp_path / "real.rbxlx"
+        write_rbxlx(RbxPlace(screen_guis=[real]), out2)
+        assert '<bool name="Enabled">true</bool>' in out2.read_text()

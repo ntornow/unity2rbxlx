@@ -178,6 +178,34 @@ def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
     return index
 
 
+def _canvas_enabled(canvas_node: SceneNode) -> bool:
+    """ScreenGui.Enabled approximates the Unity render gate (activeInHierarchy AND Canvas.enabled).
+
+    Unity renders a Canvas only when BOTH the GameObject is active in the hierarchy
+    AND the Canvas component is enabled. We approximate this with the Canvas
+    GameObject's OWN active-self (``canvas_node.active`` / the parsed ``m_IsActive``)
+    AND the Canvas component's ``m_Enabled``. Each missing input defaults to True so
+    absence never spuriously disables a canvas.
+
+    LIMITATION (active-self, not true activeInHierarchy): we use the Canvas node's own
+    ``m_IsActive``, NOT the full ancestor chain, so a Canvas authored active-self=True
+    under an INACTIVE ANCESTOR ships ``Enabled=true`` even though Unity would hide it.
+    This is intentional for now: ancestor active-state is not available at this call
+    site (``convert_canvas`` receives only the flat canvas-node list), it matches the
+    converter's existing element-level ``visible=node.active`` (active-self) model, and
+    it is a strict improvement over the prior all-``Enabled=true`` behavior. Threading
+    true activeInHierarchy through the caller is tracked as a follow-on.
+    """
+    active = bool(canvas_node.active)
+    canvas_m_enabled = True
+    for comp in canvas_node.components:
+        if comp.component_type == "Canvas":
+            raw = comp.properties.get("m_Enabled", 1)
+            canvas_m_enabled = bool(raw) if isinstance(raw, (int, bool)) else True
+            break
+    return active and canvas_m_enabled
+
+
 def convert_canvas(
     canvas_nodes: list[SceneNode],
     scene_namespace: str = "",
@@ -237,7 +265,10 @@ def convert_canvas(
     )
 
     for canvas_node in canvas_nodes:
-        screen_gui = RbxScreenGui(name=canvas_node.name)
+        screen_gui = RbxScreenGui(
+            name=canvas_node.name,
+            enabled=_canvas_enabled(canvas_node),
+        )
 
         # Extract CanvasScaler settings and store as attributes.
         _apply_canvas_scaler(screen_gui, canvas_node)

@@ -675,6 +675,224 @@ class TestToggleGraphicBinding:
         assert bindings[0]["graphic_sri"] == f"{self.NS}:250410364"
 
 
+class TestCanvasEnabled:
+    """`_canvas_enabled` AND-semantics + `convert_canvas` Enabled wiring.
+
+    Unity renders a Canvas only when BOTH the GameObject is active AND the
+    Canvas component is enabled (`m_Enabled`). The ScreenGui.Enabled contract
+    mirrors that AND. (AC#1, AC#2, AC#6)
+    """
+
+    NS = "TestScene"
+
+    @staticmethod
+    def _canvas_node(active: bool, m_enabled: int | None,
+                     has_canvas_comp: bool = True) -> SceneNode:
+        comps: list[ComponentData] = []
+        if has_canvas_comp:
+            props: dict[str, object] = (
+                {} if m_enabled is None else {"m_Enabled": m_enabled})
+            comps.append(ComponentData("Canvas", "canvasComp", props))
+        return SceneNode(
+            name="Canvas", file_id="canvasFid", active=active, layer=0,
+            tag="Untagged", components=comps, children=[], parent_file_id=None,
+        )
+
+    def test_active_and_enabled_true(self):
+        """active=True, m_Enabled=1 -> True. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(True, 1)) is True
+
+    def test_inactive_false(self):
+        """active=False short-circuits to False regardless of m_Enabled. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(False, 1)) is False
+
+    def test_active_but_canvas_disabled_false(self):
+        """active=True, m_Enabled=0 -> False (the AND). (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(True, 0)) is False
+
+    def test_missing_m_enabled_defaults_true(self):
+        """Canvas component present but no m_Enabled key -> defaults True. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(True, None)) is True
+
+    def test_no_canvas_component_active_only(self):
+        """No Canvas component -> gates on active alone, never spurious False. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(
+            self._canvas_node(True, None, has_canvas_comp=False)) is True
+        assert _canvas_enabled(
+            self._canvas_node(False, None, has_canvas_comp=False)) is False
+
+    @staticmethod
+    def _canvas_node_raw_m_enabled(active: bool, raw: object) -> SceneNode:
+        """Canvas node whose m_Enabled holds an arbitrary (possibly non-int)
+        value, so we can exercise present-but-None / non-numeric inputs that
+        the int-typed `_canvas_node` helper cannot express."""
+        comp = ComponentData("Canvas", "canvasComp", {"m_Enabled": raw})
+        return SceneNode(
+            name="Canvas", file_id="canvasFid", active=active, layer=0,
+            tag="Untagged", components=[comp], children=[], parent_file_id=None,
+        )
+
+    def test_present_none_m_enabled_defaults_true(self):
+        """m_Enabled present-but-None -> defaults True, no crash.
+
+        Pre-fix `int(None)` raised TypeError; the isinstance guard now
+        defaults a non-int/non-bool value to True. (AC#2)
+        """
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(
+            self._canvas_node_raw_m_enabled(True, None)) is True
+
+    def test_nonnumeric_string_m_enabled_defaults_true(self):
+        """m_Enabled present as a non-numeric string -> defaults True, no crash.
+
+        Pre-fix `int("true")` raised ValueError/TypeError; the isinstance
+        guard now defaults a non-int/non-bool value to True. (AC#2)
+        """
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(
+            self._canvas_node_raw_m_enabled(True, "true")) is True
+
+    def test_default_synthetic_node_true(self):
+        """A synthetic node (active default True, no Canvas) -> True. (AC#1)"""
+        from converter.ui_translator import _canvas_enabled
+        node = SceneNode(name="Canvas", file_id="f", active=True, layer=0,
+                         tag="Untagged")
+        assert _canvas_enabled(node) is True
+
+    def test_convert_canvas_sets_enabled(self):
+        """`convert_canvas` threads `_canvas_enabled` onto the ScreenGui. (AC#2)"""
+        from converter.ui_translator import convert_canvas
+        enabled = convert_canvas([self._canvas_node(True, 1)],
+                                 scene_namespace=self.NS)
+        disabled = convert_canvas([self._canvas_node(False, 1)],
+                                  scene_namespace=self.NS)
+        assert enabled[0].enabled is True
+        assert disabled[0].enabled is False
+
+    def test_trash_dash_scene_active_states(self):
+        """E2E: real trash-dash Main.unity -> Loadout enabled, the rest
+        disabled, via the real scene_parser + find_canvas_nodes +
+        convert_canvas. (AC#6)
+
+        Real-corpus only: skips (does NOT silently substitute synthetic data)
+        when the scene is absent, so the suite honestly reports whether the
+        real-corpus check ran. The synthetic AND-semantics matrix is covered
+        by the other tests in this class.
+        """
+        import pytest
+        from pathlib import Path
+        from converter.ui_translator import convert_canvas, find_canvas_nodes
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+        canvases = find_canvas_nodes(parsed.roots)
+        guis = convert_canvas(canvases, scene_namespace=self.NS)
+        by_name = {g.name: g.enabled for g in guis}
+        # The active boot canvas ships enabled; the rest ship disabled.
+        assert by_name.get("Loadout") is True, by_name
+        for n in ("Game", "GameOver", "Leaderboard"):
+            assert by_name.get(n) is False, by_name
+
+    def test_trash_dash_scene_enabled_serialized_full_chain(self, tmp_path):
+        """Full chain: real trash-dash Main.unity -> parse -> find_canvas_nodes
+        -> convert_canvas -> RbxPlace -> BOTH serializers, asserting each named
+        ScreenGui lands the correct `Enabled` value in the ACTUAL serialized
+        output. Completes AC#6's designed serialized-XML form (the parse-only
+        sibling above stops at the in-memory RbxScreenGui list).
+
+        Real-corpus only: skips (does NOT silently substitute synthetic data)
+        when the scene is absent, mirroring the AC#6 sibling.
+        """
+        import re
+        import xml.etree.ElementTree as ET
+        from pathlib import Path
+
+        import pytest
+
+        from converter.ui_translator import convert_canvas, find_canvas_nodes
+        from core.roblox_types import RbxPlace
+        from roblox.luau_place_builder import generate_place_luau
+        from roblox.rbxlx_writer import write_rbxlx
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+        canvases = find_canvas_nodes(parsed.roots)
+        guis = convert_canvas(canvases, scene_namespace=self.NS)
+        place = RbxPlace(screen_guis=guis)
+
+        # The four canvases of interest and their expected Enabled value.
+        expected = {
+            "Loadout": True,
+            "Game": False,
+            "GameOver": False,
+            "Leaderboard": False,
+        }
+
+        # --- rbxlx serialization: locate each ScreenGui Item by its Name
+        #     string property, then read its own Enabled bool (no global
+        #     substring -- that can't tell the canvases apart). ---
+        out = tmp_path / "place.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+
+        def _prop_text(props: ET.Element, tag: str, name: str) -> str | None:
+            for el in props.findall(tag):
+                if el.get("name") == name:
+                    return el.text
+            return None
+
+        enabled_by_name: dict[str, str | None] = {}
+        for item in root.iter("Item"):
+            if item.get("class") != "ScreenGui":
+                continue
+            props = item.find("Properties")
+            assert props is not None
+            sg_name = _prop_text(props, "string", "Name")
+            if sg_name in expected:
+                enabled_by_name[sg_name] = _prop_text(props, "bool", "Enabled")
+
+        for name, want in expected.items():
+            assert enabled_by_name.get(name) == ("true" if want else "false"), (
+                f"rbxlx ScreenGui {name!r} Enabled={enabled_by_name.get(name)!r}"
+            )
+
+        # --- luau serialization: each ScreenGui emits a `g.Name="<name>"`
+        #     immediately followed (within its own `do` block) by a
+        #     `g.Enabled=true/false`. Match each block and check the value. ---
+        luau = generate_place_luau(place)
+        block_re = re.compile(
+            r"g\.Name=\"(?P<name>[^\"]+)\".*?g\.Enabled=(?P<enabled>true|false)",
+            re.DOTALL,
+        )
+        luau_enabled: dict[str, str] = {}
+        for m in block_re.finditer(luau):
+            nm = m.group("name")
+            if nm in expected and nm not in luau_enabled:
+                luau_enabled[nm] = m.group("enabled")
+
+        for name, want in expected.items():
+            assert luau_enabled.get(name) == ("true" if want else "false"), (
+                f"luau ScreenGui {name!r} Enabled={luau_enabled.get(name)!r}"
+            )
+
+        # Robust cross-check: among the four canvases, exactly one is enabled.
+        canvas_enabled = [luau_enabled[n] for n in expected]
+        assert canvas_enabled.count("true") == 1, canvas_enabled
+        assert canvas_enabled.count("false") == 3, canvas_enabled
+
+
 class TestToggleIsOnAttrConvention:
     """Pin ``_TOGGLE_ISON_ATTR`` to the converter's Toggle-``isOn`` LOWERING
     CONVENTION, checked against EVERY converted-writer shape in the contract

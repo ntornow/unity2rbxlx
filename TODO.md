@@ -33,3 +33,24 @@
   to the output-boundary escaping work (out of this run's blast radius). Flagged independently
   by the phase-design and finalize audits. Fix in a separate change (define/import the writer,
   or remove the dead call) with a test that exercises the truthy-`pp_attrs` path.
+
+
+## /drive run screengui-state-visibility-20260620T115219 — architectural follow-ups (2026-06-20T11:02:29Z)
+
+- **converter/core/roblox_types.py:256, converter/converter/ui_translator.py:_canvas_enabled,
+  converter/runtime/scene_runtime.luau:setActive toggle** — Two independent Unity render gates
+  (`Canvas.enabled` / the component, and `GameObject.activeInHierarchy`) are collapsed into ONE
+  Roblox bit (`ScreenGui.Enabled`). Phase 1 correctly ANDs them at BUILD time, but the Phase-2
+  runtime toggle on `setActive` only knows the GameObject-active half, so a canvas authored with
+  `Canvas.m_Enabled == 0` (component-disabled) ships `Enabled=false` at boot yet is wrongly
+  re-enabled by a runtime `setActive(canvas, true)` (Unity would keep it hidden because
+  Canvas.enabled is still false). Also: a C# `canvas.enabled = true/false` runtime toggle and a
+  `gameObject.SetActive` toggle would both target the same `ScreenGui.Enabled` bit and clobber
+  each other — there is no durable source of truth for the component-enabled half once runtime
+  toggling begins. PROPER FIX (cross-phase, out of THIS run's blast radius): stamp the Canvas
+  component-enabled state as a ScreenGui attribute at build (Phase-1 surface) and have the runtime
+  toggle AND it in (and route C# `Canvas.enabled=` assignments to that attribute, not the same bit).
+  EVIDENCE this is safe to defer: NOT exercised by the real corpus — all four trash-dash Main.unity
+  canvases have `Canvas.m_Enabled=1` (per-state visibility is GameObject-active driven); and it is a
+  strict improvement over the pre-fix baseline (all canvases shipped Enabled=true). Surfaced by codex
+  finalize review.

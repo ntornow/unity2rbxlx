@@ -1237,6 +1237,10 @@ def _emit_screen_gui(b: _LuauBuilder, gui: RbxScreenGui) -> None:
         b.line("g.ResetOnSpawn=true")
     else:
         b.line("g.ResetOnSpawn=false")
+    if getattr(gui, "enabled", True):
+        b.line("g.Enabled=true")
+    else:
+        b.line("g.Enabled=false")
     # Mirror the rbxlx_writer's AttributesSerialize emission: under the
     # headless place builder, attributes only land in the live place when
     # we issue ``SetAttribute`` calls explicitly. Without this, the PR2

@@ -1385,6 +1385,43 @@ CC host spuriously trips the unique-and-exclusive player gate.
   pre-existing. Fix separately.
 
 
+## /drive run screengui-state-visibility-20260620T115219 — followups (2026-06-20T11:06:50Z)
+
+
+- [P2] ScreenGui.Enabled uses Canvas GameObject active-self (m_IsActive) AND Canvas.m_Enabled, NOT true
+  activeInHierarchy. A Canvas active-self=true under an inactive ANCESTOR ships Enabled=true (Unity hides
+  it). Matches the converter's existing element-level `visible=node.active` (active-self) model, so it is
+  consistent and a Pareto improvement, not a regression. True fix: thread ancestor active-state (or an
+  effective-active/activeInHierarchy map) into convert_canvas via its caller (scene_converter.py) and
+  find_canvas_nodes. Edge case; no known corpus hits it. Surfaced by codex phase-1 review (screengui run).
+
+## Phase 2 (dynamic runtime toggle) out-of-scope
+- [P2] awaitUiHost-based boot-race re-toggle inside setActive (EC-2): if a state transition fires
+  before the StarterGui->PlayerGui clone lands, defer the .Enabled set via the already-injected client
+  awaitUiHost from a spawned coroutine. Not load-bearing for trash-dash (HUD canvases clone at boot,
+  ResetOnSpawn=false; transitions are post-boot). Scoped enhancement only.
+- [P2] ScreenGui toggle by ANCESTOR cascade (EC-6): toggling a GUI purely by toggling an ANCESTOR
+  GameObject (goId == ancestor, not the canvas) does not re-resolve the descendant ScreenGui. No
+  observed case (trash-dash toggles the canvas GO directly via self.host.setActive(self.canvas, ...)).
+  Would need per-descendant ScreenGui resolution in the cascade — gold-plating absent evidence.
+- [P2] ResetOnSpawn=true GUI respawn re-clone rebind — already an existing runtime followup
+  (scene_runtime.luau:3410-3413); untouched by Phase 2.
+- [P2] Step-4.5 client/server split misplacing GameState/LoadoutState into ServerStorage is a
+  pre-existing CLI artifact (real /convert-unity splits correctly); orthogonal to Phase 2.
+
+## slop (deferred to finalize)
+converter/converter/ui_translator.py:181 — _canvas_enabled docstring is over-elaborate for a small helper (de-slop at finalize)
+converter/tests/test_ui_translator.py:746 — verbose test prose/contract narration (de-slop at finalize)
+converter/tests/test_luau_place_builder.py:381 — verbose test prose narration (de-slop at finalize)
+converter/tests/test_rbxlx_writer.py:729 — verbose test prose narration (de-slop at finalize)
+converter/runtime/scene_runtime.luau:2374 — _resolveScreenGui/toggle-block comments verbose (de-slop at finalize)
+converter/tests/test_scene_runtime_host_behavior.py:4238 — verbose test prose/green-for-wrong-reason narration (de-slop at finalize)
+
+## finalize P2 (non-blocking)
+- converter/roblox/luau_place_builder.py:1240 / rbxlx_writer.py:1902 — duck-typed missing-`enabled` compat differs across serializers (luau emits Enabled=true, rbxlx omits); behavior-equivalent in Roblox; VETOED as in-run de-slop (would red the dedicated backcompat tests without criterion coverage).
+- converter/runtime/scene_runtime.luau:2378/2387 — pcall(:IsA) after type(x.IsA)=="function"; matches the codebase defensive :IsA convention (1916); optional de-slop, kept for consistency.
+
+HANDOFF: converter/TODO.md Infrastructure P1 "Converter doesn't wire ScreenGui enable/disable into the state machine" is RESOLVED by /drive run screengui-state-visibility-20260620T115219 (PR) — mark the checkbox done in a TODO-reconcile (not edited in this PR's ship commit to keep the ledger commit allowlist-clean).
 # Followups — gap4-dynamic-dedup
 
 ## FU — genuine-list double-stamp residual (conservative clear-detector abstains on non-canonical clears)

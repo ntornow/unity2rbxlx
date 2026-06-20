@@ -4234,3 +4234,325 @@ class TestAddressableHostResolution:
         rc, out, err = _run_scenario(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: dynamic runtime ScreenGui toggle in setActive
+#
+# When SceneRuntime:setActive(go, bool) toggles a GameObject that OWNS a
+# ScreenGui (the canvas GO's _SceneRuntimeId stamps the ScreenGui), the
+# ScreenGui's .Enabled is driven to match (ANDed with activeInHierarchy),
+# so a Unity ``canvas.gameObject.SetActive(b)`` state transition actually
+# hides/shows the converted GUI. Driven through the REAL scene_runtime.luau
+# via the luau harness with a ScreenGui mock carrying a real
+# ``:IsA("ScreenGui")`` and a settable ``.Enabled`` -- the resolution the
+# test exercises is NOT stubbed.
+# ---------------------------------------------------------------------------
+
+# Shared Lua snippet: a ScreenGui mock. ``IsA`` returns true only for
+# "ScreenGui"; ``.Enabled`` starts true and is a plain settable field; it
+# also carries the GO machinery (_sceneRuntimeId, _children) so the
+# setActive cascade can walk it harmlessly.
+_SCREENGUI_MOCK = """
+local function makeScreenGui(sri)
+    return {
+        Name = "Canvas",
+        _sceneRuntimeId = sri,
+        _children = {},
+        Enabled = true,
+        IsA = function(self, class) return class == "ScreenGui" end,
+    }
+end
+"""
+
+
+class TestScreenGuiToggle:
+
+    def test_ac1_setactive_instance_toggles_enabled(self):
+        # AC#1: setActive(guiInstance, false/true) sets .Enabled to match
+        # when guiInstance:IsA("ScreenGui"). go IS the ScreenGui (the
+        # common client-resolved path). No ancestor -> activeInHierarchy
+        # defaults true, so Enabled tracks the bool directly.
+        scenario = _SCREENGUI_MOCK + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui = makeScreenGui("canvasSRI")
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            engine:setActive(gui, false)
+            assert(gui.Enabled == false, "setActive(gui,false) must set Enabled=false; got " .. tostring(gui.Enabled))
+            engine:setActive(gui, true)
+            assert(gui.Enabled == true, "setActive(gui,true) must set Enabled=true; got " .. tostring(gui.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_ac2_normal_gameobject_no_enabled_cascade_unchanged(self):
+        # AC#2: setActive(normalGameObject, false) -- the GO is NOT a
+        # ScreenGui -- does NOT error and does NOT set .Enabled, AND the
+        # existing component activeInHierarchy cascade is unchanged (the
+        # component's OnDisable/OnEnable fires exactly as before).
+        scenario = textwrap.dedent("""\
+            local enableCount = 0
+            local disableCount = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnEnable() enableCount = enableCount + 1 end
+            function Foo:OnDisable() disableCount = disableCount + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            -- A plain GO: no IsA, no Enabled field. workspaceFind(g)
+            -- returns this GO (not a ScreenGui) so _resolveScreenGui -> nil.
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            assert(enableCount == 1, "OnEnable should fire once at boot; got " .. enableCount)
+            -- Toggle the plain GO off: cascade must fire OnDisable and
+            -- the new block must NOT add an Enabled field.
+            engine:setActive(go, false)
+            assert(disableCount == 1, "setActive(false) must fire OnDisable; got " .. disableCount)
+            assert(go.Enabled == nil, "non-ScreenGui GO must NOT get an Enabled field; got " .. tostring(go.Enabled))
+            -- Re-enable: OnEnable fires again, still no Enabled set.
+            engine:setActive(go, true)
+            assert(enableCount == 2, "setActive(true) must re-fire OnEnable; got " .. enableCount)
+            assert(go.Enabled == nil, "non-ScreenGui GO must still have no Enabled field")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_ac3_string_id_form_resolves_via_workspacefind(self):
+        # AC#3: setActive("<canvasSRI>", false) with the ScreenGui
+        # registered under the harness workspaceFind map for that SRI ->
+        # .Enabled=false. Exercises the workspaceFind(goId) resolve branch
+        # (go is a STRING, not the gui instance).
+        scenario = _SCREENGUI_MOCK + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui = makeScreenGui("canvasSRI")
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            engine:setActive("canvasSRI", false)
+            assert(gui.Enabled == false, "string-id setActive must resolve via workspaceFind and set Enabled=false; got " .. tostring(gui.Enabled))
+            engine:setActive("canvasSRI", true)
+            assert(gui.Enabled == true, "string-id setActive(true) must set Enabled=true; got " .. tostring(gui.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_ac3b_plan_ref_wiring_resolves_screengui_then_toggles(self):
+        # AC#3b: drive the REAL ref-wiring. Feed _resolveReferenceTarget a
+        # target_kind=="gameobject", target_is_ui==true ref whose
+        # target_ref is the canvas SRI, with a client-shaped workspaceFind
+        # mock returning the ScreenGui -> assert self.canvas-style
+        # resolution yields the ScreenGui, then setActive(thatResolved,
+        # false) sets .Enabled=false. This exercises
+        # _resolveReferenceTarget -> workspaceFind -> setActive end-to-end,
+        # not a hand-supplied gui/id (closes the unit-layer
+        # green-for-wrong-reason gap below the live E2E).
+        scenario = _SCREENGUI_MOCK + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui = makeScreenGui("canvasSRI")
+            -- Client-shaped workspaceFind: PlayerGui-aware, returns the
+            -- ScreenGui for the canvas SRI.
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            -- The real deterministic plan ref for ``self.canvas``.
+            local refRow = {
+                ["from"] = "A:1", field = "canvas", index = nil,
+                target_kind = "gameobject", target_ref = "canvasSRI",
+                target_is_ui = true, target_component_type = "Canvas",
+            }
+            local resolved = engine:_resolveReferenceTarget(refRow, {}, nil)
+            assert(resolved == gui, "ref-wiring must resolve self.canvas to the ScreenGui Instance; got " .. tostring(resolved))
+            engine:setActive(resolved, false)
+            assert(gui.Enabled == false, "setActive(resolved-canvas, false) must set Enabled=false; got " .. tostring(gui.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_ac4_active_in_hierarchy_gate(self):
+        # AC#4: activeInHierarchy gate. The canvas GO is a child of an
+        # ancestor authored INACTIVE, so the cascade computes
+        # _goActiveInHierarchy[canvasGoId] == false. Even setActive(canvasGO,
+        # true) yields gui.Enabled == false (an inactive ancestor keeps the
+        # GUI hidden, matching Unity). Re-enabling the ancestor and
+        # re-toggling the canvas -> Enabled == true.
+        #
+        # The canvas GO here IS the ScreenGui mock (client-resolved path)
+        # and is a child of an ancestor GO. The planner parent map
+        # (_goParentId) is wired via the plan instances so the ancestor
+        # walk in setActive sees the inactive ancestor.
+        scenario = _SCREENGUI_MOCK + textwrap.dedent("""\
+            local plan = {
+                modules = {},
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:anc", script_id = nil,
+                             game_object_id = "ancSRI", active = false,
+                             enabled = true, config = {}},
+                            {instance_id = "A:cv", script_id = nil,
+                             game_object_id = "canvasSRI", active = true,
+                             enabled = true, config = {},
+                             parent_game_object_id = "ancSRI"},
+                        },
+                        references = {},
+                        lifecycle_order = {},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local gui = makeScreenGui("canvasSRI")
+            local anc = {Name = "Anc", _sceneRuntimeId = "ancSRI",
+                         _children = {canvasSRI = gui}}
+            local services = servicesFor(plan, {}, {ancSRI = anc, canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            -- Establish the parent map + the ancestor's inactive state.
+            engine._goParentId["canvasSRI"] = "ancSRI"
+            engine._goActiveSelf["ancSRI"] = false
+            engine._goActiveInHierarchy["ancSRI"] = false
+            -- Explicit setActive(canvas, true): inactive ancestor keeps it hidden.
+            engine:setActive(gui, true)
+            assert(gui.Enabled == false, "inactive ancestor must keep Enabled=false even on setActive(true); got " .. tostring(gui.Enabled))
+            -- Re-enable the ancestor, then re-toggle the canvas -> visible.
+            engine:setActive(anc, true)
+            engine:setActive(gui, true)
+            assert(gui.Enabled == true, "re-enabling ancestor then re-toggling canvas must yield Enabled=true; got " .. tostring(gui.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    # -- Regression: REAL userdata Instance shape --------------------------
+    # The table-mock tests above pass even when the runtime guards reject
+    # userdata, because a Lua table reports ``type() == "table"``. Real
+    # Roblox Instances report ``type() == "userdata"``. These two tests use
+    # ``newproxy(true)`` (the same idiom as test_destroy_accepts_userdata_
+    # instance) to build a value whose ``type()`` is genuinely "userdata",
+    # so they BITE the three ``type==table``-only guards that silently
+    # no-op the toggle in production (dispatch arm + _resolveScreenGui
+    # branches 1 & 2). They FAIL against the pre-fix runtime and pass after.
+    #
+    # A userdata proxy cannot carry fields directly, so the metatable
+    # provides ``IsA``/``_sceneRuntimeId`` via __index and captures the
+    # ``.Enabled`` write into a side table via __newindex. ``getInstanceId``
+    # (harness) reads ``inst._sceneRuntimeId`` -> served by __index.
+    _USERDATA_SCREENGUI = textwrap.dedent("""\
+        -- Build a userdata-typed ScreenGui (type() == "userdata"). The
+        -- captured ``Enabled`` lives in ``state`` since userdata fields
+        -- cannot be set directly; reads/writes route through the metatable.
+        local function makeUserdataScreenGui(sri)
+            local state = { Enabled = true }
+            local ud = newproxy(true)
+            local mt = getmetatable(ud)
+            mt.__index = function(_, key)
+                if key == "IsA" then
+                    return function(_, class) return class == "ScreenGui" end
+                elseif key == "_sceneRuntimeId" then
+                    return sri
+                elseif key == "Enabled" then
+                    return state.Enabled
+                end
+                return nil
+            end
+            mt.__newindex = function(_, key, value)
+                if key == "Enabled" then
+                    state.Enabled = value
+                else
+                    error("unexpected userdata write: " .. tostring(key))
+                end
+            end
+            return ud, state
+        end
+    """)
+
+    def test_userdata_instance_setactive_toggles_enabled(self):
+        # Test A: setActive(<userdata ScreenGui>, false) must set the
+        # captured Enabled to false. Exercises the dispatch userdata arm
+        # (getInstanceId reaches the goId) AND _resolveScreenGui branch 1
+        # userdata arm. MUST fail pre-fix (userdata rejected -> no-op).
+        scenario = self._USERDATA_SCREENGUI + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui, state = makeUserdataScreenGui("canvasSRI")
+            assert(type(gui) == "userdata", "test bug: gui must be userdata; got " .. type(gui))
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            engine:setActive(gui, false)
+            assert(state.Enabled == false, "userdata setActive(gui,false) must set Enabled=false; got " .. tostring(state.Enabled))
+            engine:setActive(gui, true)
+            assert(state.Enabled == true, "userdata setActive(gui,true) must set Enabled=true; got " .. tostring(state.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_userdata_instance_string_id_resolves_via_workspacefind(self):
+        # Test B: string-id form where workspaceFind(goId) returns a
+        # <userdata ScreenGui>. Exercises _resolveScreenGui branch 2
+        # userdata arm. MUST fail pre-fix (the workspaceFind result is
+        # userdata -> rejected -> no-op).
+        scenario = self._USERDATA_SCREENGUI + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui, state = makeUserdataScreenGui("canvasSRI")
+            assert(type(gui) == "userdata", "test bug: gui must be userdata; got " .. type(gui))
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            engine:setActive("canvasSRI", false)
+            assert(state.Enabled == false, "string-id setActive must resolve userdata via workspaceFind and set Enabled=false; got " .. tostring(state.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_ac5_server_no_playergui_is_noop(self):
+        # AC#5: server-shaped services table whose workspaceFind returns
+        # nil for the GUI SRI (server scans workspace only, no PlayerGui)
+        # -> setActive("<canvasSRI>", false) is a no-op (no ScreenGui
+        # found, no error). The gui mock is NOT registered in workspaceFind.
+        scenario = _SCREENGUI_MOCK + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui = makeScreenGui("canvasSRI")
+            -- Server-shaped: workspaceFind does NOT know the canvas SRI
+            -- (the ScreenGui lives in PlayerGui, unreachable server-side).
+            local services = servicesFor(plan, {}, {})
+            local engine = SceneRuntime.new(services, plan)
+            local ok, errmsg = pcall(function()
+                engine:setActive("canvasSRI", false)
+            end)
+            assert(ok, "server-domain setActive must not error: " .. tostring(errmsg))
+            -- The unregistered gui keeps its boot Enabled value (no-op).
+            assert(gui.Enabled == true, "server no-op must not touch the unresolved gui; got " .. tostring(gui.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
