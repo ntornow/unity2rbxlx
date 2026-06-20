@@ -86,7 +86,7 @@ class TestReferencedTypesGlobalLookupExclusion:
     scene-lookup generic (``FindObjectOfType<T>``) as a dependency — that
     locates an already-existing T, creating no edge and no ``require()``
     need. Counting it poisons ``dependency_map`` and misroutes the target
-    in storage classification (TODO.md "Transpiler false-positive
+    in storage classification (TODO_archive.md "Transpiler false-positive
     require() injection").
 
     But COMPONENT-lookup generics (``GetComponent<T>`` / ``AddComponent<T>``)

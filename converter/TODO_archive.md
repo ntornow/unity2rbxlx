@@ -13,6 +13,90 @@ Open work moves to `TODO.md`. Completed work and execution logs stay here.
 
 ---
 
+## 2026-06-20 — TODO reconcile: items already fixed but never struck (verified against tree)
+
+- [x] **P1 — Output boundary doesn't sanitize foreign strings.** FIXED — merged ntornow#215
+  (`1c5723c` rbxlx XML control-char strip + NaN/inf finitize; `669054c` total Luau-literal
+  escaping for the place builder, incl. `]]`-injection in long-bracket literals). Both halves
+  (rbxlx_writer `_add_string`/`_add_float` + `luau_place_builder._luau_str`/place_publisher
+  fixup) covered. Was open in TODO only because this branch lagged upstream/main; merged in
+  2026-06-20.
+- [x] **P1 — Contract verifier ships shadow-mode against a fail-closed contract.** FIXED
+  (`17a7575`, in tree): all 5 checks now in `FAIL_CLOSED_CHECKS`; `pipeline.py` promotes
+  violations to `ctx.errors` (flips `conversion_report.success=False`). `U2R_CONTRACT_VERIFIER_FAIL_OPEN`
+  is the release escape hatch. Never struck from the active TODO.
+- [x] **P1.a (genre-genericness) — `localscript_api_shim` type-aware accessor classification.**
+  FIXED (`95b4fc5`): `_classify_api` now gates the boolean-shim on `_is_boolean_state_var`
+  (every assignment a boolean literal); non-boolean accessors fall through to `return nil`
+  instead of the hardcoded `== true or false`. Regression test `TestLocalScriptApiShimInstanceReturn`.
+  (Sibling P1.b server-side consumer + P1.c template-clone over-broad detector remain OPEN.)
+
+## 2026-06-20 — mesh-fidelity fixes (merged ntornow#212, /drive run mesh-fidelity-20260619T232452)
+
+- [x] **P1 — Mesh face cap stale (10k) + quality floor ignored it.** FIXED #212: `config.py
+  MESH_ROBLOX_MAX_FACES` 10_000 → 20_000; `mesh_processor.decimate_mesh` clamps the floored target to the
+  cap (`min(max(target,floor),cap)`). **Deeper bug found in finalize:** decimation NEVER RAN — the call
+  passed the face count positionally to trimesh 4.x `simplify_quadric_decimation(percent=,face_count=)` →
+  bound to `percent` → ValueError → `except` shipped the un-decimated original. Fixed via `face_count=`
+  keyword (output now strictly bounded by the clamped cap). LATENT: `decimate_mesh` has no production caller
+  today (meshes upload raw; Open Cloud decimates server-side) — correctness fix for when it's wired.
+  Residual followups (.harness): `except`-fallback can still ship oversized on a non-positional backend
+  failure; real-upload 20k-acceptance check deferred until the path is wired.
+- [x] **P1 — Embedded-mesh resolver shipped arbitrary geometry on a bad sub-mesh count.** FIXED #212:
+  the "exactly one sub-mesh" invariant was `log.warning`-only while `_resolve_sub_mesh` still returned
+  `sub_meshes[0]`. Now `_quarantine_bad_embedded_meshes` drops a key resolving to ≠1 sub-mesh from
+  `mesh_hierarchies`/`mesh_native_sizes`/`uploaded_assets` (the real MeshId binding gate, incl. slash
+  variants) + `asset_upload_errors`, so the face-decal fallback takes over. Post-merge on ctx dicts (evicts
+  force-rerun pre-seeded keys); `is_embedded_mesh_key` gate prevents quarantining valid non-embedded FBX;
+  no `scene_converter` change (downstream `_resolve_mesh_id` returns None crash-free).
+
+## 2026-06-19 — items completed and moved from TODO.md (condensed; full prose in git history)
+
+- [x] **P0 (generic) — F10 door never opens (animation driver-domain → server fallback, pattern #9).**
+  FIXED 2026-06-16 (`fix/door-animator-source-narrowing`, PR #195 / `a10b60f`): dynamic-getter
+  Animator drivers resolved via C# source narrowing — scan the scope for the param-write to the
+  clip's `observed_attribute`, inherit that writer's domain (→ client for `Door`). Anim script
+  emitted as a single `LocalScript` in `StarterPlayerScripts`. Implements §3 row 9 of
+  `docs/design/generic-converter-architecture.md`.
+- [x] **P1 (e2e fixture) — F15 mine + F10 door behavior fixtures contact-miss.** FIXED 2026-06-17
+  (PR #207): replaced single-teleport with translation-only swept `PivotTo` entries in
+  `tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`. F15 mine GREEN e2e (Touched →
+  `Humanoid:TakeDamage` 100→90); F10 door harness fixed (panel-tween gated on the binding-race fix below).
+- [x] **P1 (generic) — F10 door Anim_Door LocalScript startup-scan races runtime prefab placement.**
+  FIXED 2026-06-17 (`drive/door-binding-race-20260617T174816`, PR #208 / `59a5646`): the
+  `animation_converter` Anim_* emitter binds runtime-placed prefab targets via a
+  `workspace.DescendantAdded` late-arrival listener + eager scan, gated on runtime
+  `not _ownerIsContainer`, across all four trigger shapes (bool/int param, loop-autoplay,
+  play-once). Also fixed the HostilePlane flying-loop (same boot-scan/early-return bug).
+  Live-verified (door opens in Studio). This was the last blocker turning F10 GREEN.
+- [x] **P1 — Generic-mode SimpleFPS canary failures (2026-06-11).** DONE: **T** ✅ #193 (turret
+  child-index lowering), **R** ✅ #191 (generic `weaponSlot` rebind), **D** ✅ #195 (door
+  dynamic-Animator narrowing), **H** ✅ (HudControl `domain:client`/`LocalScript`). Residual turret
+  projectile-physics + damage (#8 stages 3–4) is tracked under the F16 turret P0 in `TODO.md`.
+- [x] **P1 — Shared-flag name sanitization.** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`,
+  PR #165): canonical ASCII sanitizer at the runtime `"has" .. name` concat (emitted Luau
+  `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine
+  dynamic reader; `itemName`/`ItemType` kept raw; scan made ASCII-explicit.
+  See `docs/design/shared-flag-name-sanitization-brief.md`.
+- [x] **P2 — Topology prepass reads pre-coherence `script_type`.** CLOSED 2026-06-02
+  (`fix/topology-script-type-authority-guard`): premise imprecise — legacy corrects `script_type`
+  before routing reads it; `infer_module_domains` derives `domains` from source/evidence, not type.
+  Shipped a defensive WARNING on the LocalScript/server-domain conflict + a regression test pinning
+  legacy cohere-before-classify ordering. Full type↔domain reconciliation in generic mode deferred.
+- [x] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering modules to server-only.**
+  FIXED 2026-06-01 (`fix/roblox-dead-module-routing`): a generic behavior-based `roblox_dead_modules`
+  detector (mapping-coverage prior + post-coherence output-inertness + hard veto; NO class names)
+  replaces the hardcoded heuristic; dead modules route out of `ServerStorage` to `ReplicatedStorage`
+  (both topology + legacy paths) + a closure-safe prune of fully-dead require-closures.
+  See `docs/design/roblox-dead-module-routing-brief.md`.
+- [x] **P1 — Transpiler false-positive `require()` injection poisons storage classification.**
+  FIXED 2026-06-01 (`fix/dead-require-from-runtime-lookup-generics`): exclude the type args of GLOBAL
+  scene-lookup generics (`FindObjectOfType<T>` / `FindObjectsOfType<T>`) from `referenced_types`
+  (`_GLOBAL_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`) — they locate an existing instance, so
+  no dependency edge / no require. COMPONENT-lookup generics (`GetComponent<T>` etc.) kept as real edges.
+
+---
+
 
 ## P0 — Blocking Gameplay
 

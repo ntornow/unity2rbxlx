@@ -6010,8 +6010,9 @@ class TestSharedFlagChannels:
         fail-open. Fail-open is conservative (keeps the funnel, == today's
         unconditional behavior); over-reporting a genuinely-client reader
         is the lesser evil vs wrongly suppressing a reclassified server
-        reader. Authoritative domain resolution is deferred (see TODO.md
-        pre/post-coherence follow-up). A scene with NO qualifying read
+        reader. Authoritative domain resolution is deferred (see
+        TODO_archive.md "Topology prepass reads pre-coherence script_type").
+        A scene with NO qualifying read
         still yields ``present=False`` — fail-open is specific to
         unmappable-WITH-read, not blanket."""
         for stype in ("LocalScript", "Script", "ModuleScript"):
