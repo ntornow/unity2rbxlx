@@ -26,7 +26,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary, PrefabTemplate
 from unity.yaml_parser import parse_documents, doc_body, is_text_yaml, ref_guid
@@ -1302,14 +1302,29 @@ def generate_tween_script(
                     lines.append(f'if not target then target = workspace:FindFirstChild("{root}", true) end')
             else:
                 lines.append(f'target = workspace:FindFirstChild("{clip.name}", true)')
-    lines.append(f'if not target then')
-    lines.append(f'    -- Animation target not found; script will not run')
-    lines.append(f'    return')
-    lines.append(f'end')
+    # Hoisted out of the param function (where it was duplicated) so all four
+    # trigger shapes read one prologue local; the emitted -- comment below
+    # carries the runtime rationale.
+    lines.append("-- Runtime placement gate: a per-clone embedded driver owns exactly one instance;")
+    lines.append("-- a global flat-list driver must fan out + listen for runtime-placed instances.")
+    lines.append("local _ownerIsContainer = script.Parent and (script.Parent:IsA('BasePart') or script.Parent:IsA('Model'))")
     lines.append("")
-    lines.append("-- If target is a Model, use its PrimaryPart or first BasePart")
-    lines.append("if target:IsA('Model') then")
-    lines.append("    target = target.PrimaryPart or target:FindFirstChildWhichIsA('BasePart') or target")
+    lines.append("if not target and _ownerIsContainer then")
+    lines.append("    -- Embedded clone with no resolvable instance: nothing to bind, no listener to install.")
+    lines.append("    return")
+    lines.append("end")
+    lines.append("")
+    # ``_initialTarget`` DECLARATION is always present (above the guard) so
+    # ``playAnimation``'s ``target or _initialTarget`` fallback resolves a
+    # defined local even on the nil-boot global path. All target derefs
+    # (Model-normalization) live inside ``if target then``.
+    lines.append("local _initialTarget = target")
+    lines.append("if target then")
+    lines.append("    -- If target is a Model, use its PrimaryPart or first BasePart")
+    lines.append("    if target:IsA('Model') then")
+    lines.append("        target = target.PrimaryPart or target:FindFirstChildWhichIsA('BasePart') or target")
+    lines.append("    end")
+    lines.append("    _initialTarget = target")
     lines.append("end")
     lines.append("")
 
@@ -1328,7 +1343,6 @@ def generate_tween_script(
     # require a per-target tween, otherwise only the first instance moves.
     # When called with no arg (loop / play-once branches that pre-date the
     # multi-target refactor) it falls back to the outer ``target`` lookup.
-    lines.append("local _initialTarget = target")
     lines.append("local function playAnimation(target)")
     lines.append("\ttarget = target or _initialTarget")
 
@@ -1382,19 +1396,163 @@ def generate_tween_script(
     lines.append("end")
     lines.append("")
 
+    # Compile-time match-name precedence (mirrors the boot-resolve at 1275-1304):
+    # explicit game_object_name → curve roots → clip name. These literals are the
+    # ONLY match available on the nil-boot path and == what FindFirstChild searched
+    # for; the runtime scaffold adds the resolved target.Name as a superset.
+    if target_name:
+        match_names = [target_name]
+    elif curve_roots:
+        match_names = sorted(curve_roots)
+    else:
+        match_names = [clip.name]
+
     # Determine how to trigger the animation
     if controller and controller.parameters:
-        _generate_parameter_driven_playback(lines, clip, controller)
+        _generate_parameter_driven_playback(lines, clip, controller, match_names)
     elif clip.loop:
-        lines.append("-- Loop the animation")
-        lines.append("while true do")
-        lines.append("\tplayAnimation()")
-        lines.append("end")
+        _emit_placement_robust_binding(lines, clip, match_names, "loop", "")
     else:
-        lines.append("-- Play once on start")
-        lines.append("playAnimation()")
+        _emit_placement_robust_binding(lines, clip, match_names, "once", "")
 
     return "\n".join(lines) + "\n"
+
+
+def _clip_has_tween_content(clip: AnimClip) -> bool:
+    """True iff at least one curve survives simplification with >=2 keyframes.
+
+    Mirrors the ``< 2`` skip in ``_generate_curves_code`` (the same predicate the
+    tween emitter uses). A clip with no surviving content emits a ``playAnimation``
+    body that performs no tween and never yields — the loop branch must not spin on
+    it (decisions.md D9).
+    """
+    for c in clip.curves:
+        if len(simplify_keyframes(c.keyframes)) >= 2:
+            return True
+    return False
+
+
+def _emit_placement_robust_binding(
+    lines: list[str],
+    clip: AnimClip,
+    match_names: list[str],
+    action_kind: Literal["bool", "int", "loop", "once"],
+    param_name: str,
+) -> None:
+    """Emit the placement-order-robust binding scaffold shared by all four shapes.
+
+    Emits ONE ``bindTarget`` closure (carrying the per-shape action), a weak-keyed
+    ``_bound`` idempotency table, the eager ``bindTarget(target)``, and — gated on
+    runtime ``not _ownerIsContainer`` — a ``workspace:GetDescendants()`` fanout plus a
+    ``workspace.DescendantAdded`` late-arrival listener. The scaffold is byte-identical
+    across shapes; only the action body and ``param_name`` vary (decisions.md D8).
+    """
+    # --- bindTarget closure (emitted once, after playAnimation) ---
+    lines.append("local _bound = setmetatable({}, { __mode = \"k\" })")
+    lines.append("local function bindTarget(_t)")
+    lines.append("\tif not _t then return end")
+    lines.append("\tif _t:IsA('Model') then")
+    lines.append("\t\t_t = _t.PrimaryPart or _t:FindFirstChildWhichIsA('BasePart') or _t")
+    lines.append("\tend")
+    lines.append("\tif not (_t and _t:IsA('BasePart')) then return end")
+    lines.append("\tif _bound[_t] then return end")
+    lines.append("\t_bound[_t] = true")
+
+    if action_kind == "bool":
+        lines.append("\tlocal _isActive = false")
+        lines.append(f"\tif _t:GetAttribute(\"{param_name}\") == nil then")
+        lines.append(f"\t\t_t:SetAttribute(\"{param_name}\", false)")
+        lines.append("\tend")
+        lines.append(f"\t_t:GetAttributeChangedSignal(\"{param_name}\"):Connect(function()")
+        lines.append(f"\t\tlocal val = _t:GetAttribute(\"{param_name}\")")
+        lines.append("\t\tif val and not _isActive then")
+        lines.append("\t\t\t_isActive = true")
+        lines.append("\t\t\tplayAnimation(_t)")
+        if clip.loop:
+            lines.append("\t\telseif not val then")
+            lines.append("\t\t\t_isActive = false")
+        else:
+            lines.append("\t\t\t_isActive = false")
+        lines.append("\t\tend")
+        lines.append("\tend)")
+        lines.append("\t-- apply-current-state-on-bind: a target placed after the param flipped open ends up open")
+        lines.append(f"\tif _t:GetAttribute(\"{param_name}\") and not _isActive then")
+        lines.append("\t\t_isActive = true")
+        lines.append("\t\tplayAnimation(_t)")
+        if not clip.loop:
+            # Mirror the non-loop handler: a non-loop clip plays to completion,
+            # so clear _isActive on the bind-time snap too — otherwise a target
+            # bound while the attribute is already true latches active forever
+            # and ignores every later toggle. (Loop clips keep _isActive true;
+            # the handler's false edge clears it.)
+            lines.append("\t\t_isActive = false")
+        lines.append("\tend")
+    elif action_kind == "int":
+        lines.append(f"\tif _t:GetAttribute(\"{param_name}\") == nil then")
+        lines.append(f"\t\t_t:SetAttribute(\"{param_name}\", 0)")
+        lines.append("\tend")
+        lines.append(f"\t_t:GetAttributeChangedSignal(\"{param_name}\"):Connect(function()")
+        lines.append("\t\tplayAnimation(_t)")
+        lines.append("\tend)")
+        lines.append("\t-- snap to a non-default action set before bind")
+        lines.append(f"\tif _t:GetAttribute(\"{param_name}\") ~= nil and _t:GetAttribute(\"{param_name}\") ~= 0 then")
+        lines.append("\t\tplayAnimation(_t)")
+        lines.append("\tend")
+    elif action_kind == "loop":
+        if _clip_has_tween_content(clip):
+            lines.append("\ttask.spawn(function()")
+            lines.append("\t\twhile _t and _t.Parent do")
+            lines.append("\t\t\tplayAnimation(_t)")
+            lines.append("\t\t\tRunService.Heartbeat:Wait()")
+            lines.append("\t\tend")
+            lines.append("\tend)")
+        else:
+            # No surviving tween content: a loop animates nothing. Play once
+            # instead of spinning (the yield floor would otherwise be the only
+            # guard); decisions.md D9.
+            lines.append("\tplayAnimation(_t)")
+    else:  # "once"
+        lines.append("\tplayAnimation(_t)")
+
+    lines.append("end")
+    lines.append("")
+
+    # --- match set: compile-time literals ∪ resolved target.Name (superset) ---
+    literal = ", ".join(_luau_string_literal(n) for n in match_names)
+    lines.append(f"local _matchNames = {{ {literal} }}")
+    lines.append("local _seenName = {}")
+    lines.append("for _, _n in ipairs(_matchNames) do _seenName[_n] = true end")
+    lines.append("if target and not _seenName[target.Name] then")
+    lines.append("\ttable.insert(_matchNames, target.Name)")
+    lines.append("\t_seenName[target.Name] = true")
+    lines.append("end")
+    lines.append("local function _nameMatches(_inst)")
+    lines.append("\treturn _seenName[_inst.Name] == true")
+    lines.append("end")
+    lines.append("")
+
+    # --- eager bind + late-arrival listener (gated on runtime _ownerIsContainer) ---
+    lines.append("bindTarget(target)")
+    lines.append("if not _ownerIsContainer then")
+    lines.append("\t-- Fan out over instances already present at boot (multi-instance prefabs).")
+    lines.append("\tfor _, _inst in ipairs(workspace:GetDescendants()) do")
+    lines.append("\t\tif _nameMatches(_inst) and (_inst:IsA('BasePart') or _inst:IsA('Model')) then")
+    lines.append("\t\t\tbindTarget(_inst)")
+    lines.append("\t\tend")
+    lines.append("\tend")
+    lines.append("\t-- Late-arrival: runtime-cloned prefab instances arrive after this script's boot scan.")
+    lines.append("\tworkspace.DescendantAdded:Connect(function(_inst)")
+    lines.append("\t\tif _nameMatches(_inst) and (_inst:IsA('BasePart') or _inst:IsA('Model')) then")
+    lines.append("\t\t\tbindTarget(_inst)")
+    lines.append("\t\tend")
+    lines.append("\tend)")
+    lines.append("end")
+
+
+def _luau_string_literal(s: str) -> str:
+    """Render a Python string as a double-quoted Luau string literal."""
+    escaped = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    return f"\"{escaped}\""
 
 
 def _generate_curves_code(
@@ -1547,92 +1705,32 @@ def _generate_parameter_driven_playback(
     lines: list[str],
     clip: AnimClip,
     controller: AnimatorController,
+    match_names: list[str],
 ) -> None:
-    """Generate Luau code for parameter-driven animation (e.g. door open/close)."""
+    """Generate Luau code for parameter-driven animation (e.g. door open/close).
+
+    Routes every shape (bool param, int param, or no-param auto-play loop/once)
+    through the shared placement-robust binding scaffold so runtime-placed prefab
+    targets bind via the eager scan + ``DescendantAdded`` listener.
+    """
     # Find bool parameters (common for doors: "open" bool triggers open/close)
     bool_params = [p for p in controller.parameters if p.param_type == 4]
     int_params = [p for p in controller.parameters if p.param_type == 3]
 
     if bool_params:
         param = bool_params[0]
-        # Multi-instance safe: enumerate every same-named descendant the
-        # initial single-target search may have missed (SimpleFPS has 6
-        # ``Door`` Model copies, each with a sibling ``door`` MeshPart;
-        # without the loop, only one of the six listens for the toggle).
-        # ``script.Parent``-bound prefab-scoped scripts run once per clone
-        # so the loop is a no-op in that branch (only one match).
         lines.append(f"-- Parameter-driven animation: {param.name} (bool)")
-        lines.append(f"local _targets = {{ target }}")
-        # Skip the workspace-wide scan when this script is itself a
-        # prefab-scoped clone (parent is a BasePart *or* a Model).
-        # Prefab-scoped clones run once per instance, so each clone's
-        # ``target`` is already the correct single instance — joining
-        # the global scan would re-bind every clone's listener to every
-        # same-named target in the place and call playAnimation N times
-        # per attribute flip. Only the global flat-list driver
-        # (``script.Parent`` is a service like ServerScriptService)
-        # needs the multi-instance fanout.
-        lines.append(f"local _ownerIsContainer = script.Parent and (script.Parent:IsA('BasePart') or script.Parent:IsA('Model'))")
-        lines.append(f"if not _ownerIsContainer then")
-        lines.append(f"\tlocal _targetName = target.Name")
-        lines.append(f"\tfor _, _t in ipairs(workspace:GetDescendants()) do")
-        lines.append(f"\t\tif _t ~= target and _t.Name == _targetName and (_t:IsA('BasePart') or _t:IsA('Model')) then")
-        lines.append(f"\t\t\tif _t:IsA('Model') then _t = _t.PrimaryPart or _t:FindFirstChildWhichIsA('BasePart') or _t end")
-        lines.append(f"\t\t\tif _t and _t:IsA('BasePart') then table.insert(_targets, _t) end")
-        lines.append(f"\t\tend")
-        lines.append(f"\tend")
-        lines.append(f"end")
-        lines.append("")
-        lines.append(f"for _, _t in ipairs(_targets) do")
-        lines.append(f"\tlocal _isActive = false")
-        lines.append(f"\t_t:SetAttribute(\"{param.name}\", false)")
-        lines.append(f"\t_t:GetAttributeChangedSignal(\"{param.name}\"):Connect(function()")
-        lines.append(f"\t\tlocal val = _t:GetAttribute(\"{param.name}\")")
-        lines.append(f"\t\tif val and not _isActive then")
-        lines.append(f"\t\t\t_isActive = true")
-        lines.append(f"\t\t\tplayAnimation(_t)")
-        if clip.loop:
-            lines.append(f"\t\telseif not val then")
-            lines.append(f"\t\t\t_isActive = false")
-        else:
-            lines.append(f"\t\t\t_isActive = false")
-        lines.append(f"\t\tend")
-        lines.append(f"\tend)")
-        lines.append(f"end")
+        _emit_placement_robust_binding(lines, clip, match_names, "bool", param.name)
     elif int_params:
         param = int_params[0]
         lines.append(f"-- Parameter-driven animation: {param.name} (int)")
-        lines.append(f"local _targets = {{ target }}")
-        # Same prefab-scoped guard as the bool-param branch — see
-        # comment above; both Model and BasePart parents indicate a
-        # per-clone driver and must skip the workspace-wide scan.
-        lines.append(f"local _ownerIsContainer = script.Parent and (script.Parent:IsA('BasePart') or script.Parent:IsA('Model'))")
-        lines.append(f"if not _ownerIsContainer then")
-        lines.append(f"\tlocal _targetName = target.Name")
-        lines.append(f"\tfor _, _t in ipairs(workspace:GetDescendants()) do")
-        lines.append(f"\t\tif _t ~= target and _t.Name == _targetName and (_t:IsA('BasePart') or _t:IsA('Model')) then")
-        lines.append(f"\t\t\tif _t:IsA('Model') then _t = _t.PrimaryPart or _t:FindFirstChildWhichIsA('BasePart') or _t end")
-        lines.append(f"\t\t\tif _t and _t:IsA('BasePart') then table.insert(_targets, _t) end")
-        lines.append(f"\t\tend")
-        lines.append(f"\tend")
-        lines.append(f"end")
-        lines.append("")
-        lines.append(f"for _, _t in ipairs(_targets) do")
-        lines.append(f"\t_t:SetAttribute(\"{param.name}\", 0)")
-        lines.append(f"\t_t:GetAttributeChangedSignal(\"{param.name}\"):Connect(function()")
-        lines.append(f"\t\tplayAnimation(_t)")
-        lines.append(f"\tend)")
-        lines.append(f"end")
+        _emit_placement_robust_binding(lines, clip, match_names, "int", param.name)
+    elif clip.loop:
+        lines.append("-- Auto-play looping animation")
+        _emit_placement_robust_binding(lines, clip, match_names, "loop", "")
     else:
-        # No parameters, auto-play
-        if clip.loop:
-            lines.append("-- Auto-play looping animation")
-            lines.append("while true do")
-            lines.append("\tplayAnimation()")
-            lines.append("end")
-        else:
-            lines.append("-- Play once on start")
-            lines.append("playAnimation()")
+        lines.append("-- Play once on start")
+        _emit_placement_robust_binding(lines, clip, match_names, "once", "")
 
 
 # ---------------------------------------------------------------------------

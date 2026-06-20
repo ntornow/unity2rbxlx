@@ -210,6 +210,262 @@ function SceneRuntime.seedAddressableDatabases(plan, services)
 end
 
 -- ---------------------------------------------------------------------
+-- Consumable database seeding (Phase 1 prototype materialization)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim, sibling to ``seedAddressableDatabases``. For
+-- each database in ``plan.consumable_db_seeds`` it MATERIALIZES the database's
+-- design-time array of in-prefab component prototypes into live component
+-- instances and ASSIGNS them onto the DB's declared array field, BEFORE the
+-- consumer's once-only ``Load()`` drain runs. Each seed is:
+--   ``{ db_module_path, array_field, elements = { {class_stem, prefab_id,
+--      module_path, ctor_config = {...}, post_fields = {...}}, ... } }``
+-- where ``ctor_config`` and ``post_fields`` are REAL Luau TABLES rendered by the
+-- plan encoder (no ``loadstring`` — disabled on the Roblox client). The build-
+-- time resolver already coerced serialized bools (``canBeSpawned: 0`` -> ``false``)
+-- and resolved asset refs to ids, so the shim consumes the tables verbatim.
+--
+-- Per element: require the subclass module (``module_path`` resolved at BUILD
+-- time with the planner's collision-exclusion contract — no runtime stem scan),
+-- construct ``<Subclass>.new(ctor_config)`` (the typed ``.new`` reads the scalar
+-- fields, e.g. ``duration`` / ``canBeSpawned``), then assign ONLY the asset-ref
+-- ``post_fields`` (``icon`` / ``ActivatedParticleReference``) onto the instance
+-- POST-construction (``Consumable.new`` drops them, so this is the only path that
+-- carries them) and set ``.gameObject`` to the element's prefab id (the host
+-- resolves prefab ids on instantiate). NOTHING else is copied onto the instance.
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- and BEFORE ``engine:start`` — the array MUST hold materialized objects before
+-- the consumer's once-only ``Load()`` builds its dict (else ``Load()`` iterates
+-- prefab-id strings and crashes calling a method on a string).
+--
+-- Per-DB-instance once-guard: ``db._consumablesSeeded`` short-circuits a second
+-- invocation (both entrypoints / a resume / a retry) so post-``Load()`` state is
+-- never re-materialized or clobbered. Unlike ``seedAddressableDatabases`` (which
+-- APPENDS and relies on the consumer drain), this shim ASSIGNS a FRESH array, so
+-- it carries its OWN explicit guard. Generic no-op on an empty plan.
+function SceneRuntime.seedConsumableDatabases(plan, services)
+	assert(type(plan) == "table", "seedConsumableDatabases: plan required")
+	assert(type(services) == "table", "seedConsumableDatabases: services required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.consumable_db_seeds or {}
+	for _, seed in ipairs(seeds) do
+		local db = resolveModule(nil, seed.db_module_path)
+		if type(db) ~= "table" then
+			warn("[consumable-seed] database module did not resolve to a table: "
+				.. tostring(seed.db_module_path))
+		elseif db._consumablesSeeded then
+			-- Once-guard: already materialized by an earlier entrypoint /
+			-- resume; never re-materialize or clobber post-``Load()`` state.
+		else
+			local arrayField = seed.array_field
+			if type(arrayField) ~= "string" or arrayField == "" then
+				warn("[consumable-seed] seed missing array_field on "
+					.. tostring(seed.db_module_path))
+			else
+				-- Build a FRESH array (assign, not append). Even a zero-element
+				-- seed assigns ``{}`` so ``Load()`` builds an empty dict rather
+				-- than iterating a stale string array (INVARIANT: after seeding,
+				-- the field holds ONLY instances, or is empty — never strings).
+				local materialized = {}
+				for _, element in ipairs(seed.elements or {}) do
+					-- The subclass module path is resolved at BUILD time (with the
+					-- planner's collision-exclusion contract) and carried on the
+					-- element — no runtime stem scan.
+					local modulePath = element.module_path
+					local Cls = (type(modulePath) == "string" and modulePath ~= "")
+						and resolveModule(nil, modulePath) or nil
+					if type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+						warn("[consumable-seed] subclass module did not resolve "
+							.. "to a constructable class: "
+							.. tostring(modulePath or element.class_stem)
+							.. "; dropping element")
+					else
+						-- ``ctor_config`` / ``post_fields`` are REAL Luau tables in
+						-- the plan (no loadstring). Pass scalars THROUGH ``.new``;
+						-- assign ONLY the asset-ref ``post_fields`` afterwards.
+						-- Guard ``.new`` in pcall (mirror ``instantiateComponent``): a
+						-- throwing transpiled constructor must DROP only that element +
+						-- warn, never crash the whole boot shim (and every later DB
+						-- seed) — same fail-closed contract as the non-table cases.
+						local ctorConfig = element.ctor_config or {}
+						local ok, c = pcall(Cls.new, ctorConfig)
+						if not ok then
+							warn("[consumable-seed] " .. tostring(element.class_stem)
+								.. ".new threw: " .. tostring(c) .. "; dropping element")
+						elseif type(c) ~= "table" then
+							warn("[consumable-seed] " .. tostring(element.class_stem)
+								.. ".new did not return an instance; dropping element")
+						else
+							-- Asset-ref fields (icon / ActivatedParticleReference)
+							-- are dropped by ``Consumable.new`` (host-injected), so
+							-- this is the ONLY path that carries them onto the
+							-- instance. NO blanket copyback of ctor_config — that
+							-- would clobber the ctor's bool/normalization work.
+							local postFields = element.post_fields
+							if type(postFields) == "table" then
+								for k, v in pairs(postFields) do
+									c[k] = v
+								end
+							end
+							-- The host resolves the prefab id on instantiate.
+							c.gameObject = element.prefab_id
+							table.insert(materialized, c)
+						end
+					end
+				end
+				db[arrayField] = materialized
+				db._consumablesSeeded = true
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
+-- Lazy-singleton boot-instantiation (Phase 2, gap #2)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim, sibling to ``seedConsumableDatabases``. Some
+-- Unity ``MonoBehaviour``s lazily self-instantiate through a static
+-- ``Instance`` getter (``new GameObject(...) + AddComponent<Self>()``) and
+-- cache themselves in a static backing field, then expose
+-- ``getInstance()``/``StartStaticCoroutine`` off that field. The generic host
+-- has no scene/prefab placement for them, so the field stays ``nil`` and every
+-- static call is a no-op (e.g. ``CoroutineHandler.m_Instance`` nil ->
+-- ``StartStaticCoroutine`` dead). This shim constructs + Awakes EXACTLY ONE
+-- instance of each such singleton at boot — before any consumer uses it — so
+-- the converter-synthesized ``Awake`` runs ``<backing_field> = self`` and the
+-- field is live.
+--
+-- Each ``plan.lazy_singletons`` seed is the build-time record (design-phase2
+-- §1.2):
+--   ``{ module_path, class_stem, domain, script_guid, backing_field }``
+-- The shim is class-agnostic — it loops the plan and uses the generic
+-- ``engine:addComponent`` + ``Cls[seed.backing_field]`` reflection. Nothing is
+-- keyed on a literal class name or field name.
+--
+-- Unlike the other two seed shims, this one needs the LIVE engine to construct
+-- + Awake the instance, so the entrypoint passes the constructed ``engine`` in.
+-- ``domainFilter`` (``"client"``/``"server"``) restricts seeding to the
+-- entrypoint's side; ``nil`` (harness) seeds every seed — mirroring
+-- ``engine:start``'s filter. A ``"helper"`` seed loads in BOTH VMs (a shared
+-- ReplicatedStorage utility), so it is constructed on EITHER side regardless of
+-- ``domainFilter``; the per-VM idempotency guard (2) prevents a double-construct
+-- within a single VM.
+--
+-- Per seed:
+--   1. Resolve the module by ``script_guid`` (the GUID-keyed ``plan.modules``
+--      key ``_buildComponent`` looks up). Warn + skip on a non-table / no
+--      ``.new`` (fail-soft, mirroring ``seedConsumableDatabases``).
+--   2. IDEMPOTENCY GUARD: if ``Cls[seed.backing_field] ~= nil`` an instance is
+--      already cached (a scene-placed instance Awoke, or a prior shim call /
+--      entrypoint), so SKIP — the singleton contract is "exactly one
+--      instance". The guard reads the CARRIED ``backing_field`` (name varies
+--      across projects: ``m_Instance``/``_instance``/``s_Instance``), never a
+--      hardcoded literal.
+--   3. Otherwise construct via ``engine:addComponent(go, seed.script_guid,
+--      {})`` against a synthetic host-container id — that fires the lifecycle
+--      (Awake -> OnEnable -> deferred Start) synchronously through Awake, so
+--      the synthesized ``Awake`` caches ``<backing_field> = self`` and
+--      ``getInstance()`` is live for every later consumer.
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- + the other seeds and BEFORE ``engine:start`` — so the backing field is live
+-- before any scene/prefab Awake/OnEnable/Start (or the deferred Start tick)
+-- calls ``getInstance()``/``StartStaticCoroutine``. Generic no-op on an empty plan.
+function SceneRuntime.seedLazySingletons(plan, services, engine, domainFilter)
+	assert(type(plan) == "table", "seedLazySingletons: plan required")
+	assert(type(services) == "table", "seedLazySingletons: services required")
+	assert(type(engine) == "table", "seedLazySingletons: engine required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.lazy_singletons or {}
+	for _, seed in ipairs(seeds) do
+		-- Side filter: skip a seed whose classified domain is not this
+		-- entrypoint's side. ``nil`` filter (harness) seeds everything. A
+		-- ``"helper"`` seed loads in BOTH VMs, so it is constructed on either
+		-- side regardless of the filter (the per-VM idempotency guard prevents
+		-- a double-construct within a VM).
+		if domainFilter ~= nil
+		   and seed.domain ~= "helper"
+		   and seed.domain ~= domainFilter then
+			-- not this side
+		else
+			-- (1) Resolve the singleton module by its GUID-keyed module path.
+			-- ``resolveModule`` may THROW on an unresolvable module (not just
+			-- return nil), so pcall it — a throwing resolver must warn + skip
+			-- this seed, never crash boot.
+			local ok, Cls = pcall(resolveModule, seed.script_guid, seed.module_path)
+			if not ok then
+				warn("[lazy-singleton] resolveModule errored for "
+					.. tostring(seed.module_path or seed.class_stem)
+					.. " (guid " .. tostring(seed.script_guid) .. "): "
+					.. tostring(Cls) .. "; skipping seed")
+			elseif type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+				warn("[lazy-singleton] module did not resolve to a constructable "
+					.. "class: " .. tostring(seed.module_path or seed.class_stem)
+					.. "; skipping seed")
+			else
+				local backingField = seed.backing_field
+				if type(backingField) ~= "string" or backingField == "" then
+					warn("[lazy-singleton] seed missing backing_field on "
+						.. tostring(seed.module_path or seed.class_stem)
+						.. "; skipping seed")
+				elseif Cls[backingField] ~= nil then
+					-- (2) Idempotency guard: an instance is already cached (a
+					-- scene-placed instance Awoke, or a prior shim call). The
+					-- singleton is live; do NOT double-construct.
+				else
+					-- (3) Construct + Awake one instance. The synthetic host
+					-- container id is the faithful analog of Unity's bare
+					-- ``new GameObject(...)`` (a non-rendered, host-owned
+					-- container). ``addComponent`` accepts a string ``go`` as
+					-- the goId directly, so no Instance creation is needed; the
+					-- id is stable + unique per class. ``addComponent`` ->
+					-- ``_buildComponent`` looks up ``plan.modules[script_guid]``
+					-- (GUID-keyed), constructs ``Cls.new``, injects the host
+					-- surface, then runs Awake (which caches
+					-- ``Cls[backing_field] = self``). ``_buildComponent`` wraps
+					-- ``.new`` in pcall, so a throwing constructor drops just
+					-- this singleton + warns, never crashing boot.
+					local hostId = "_lazysingleton:" .. tostring(seed.class_stem)
+					-- ``_buildComponent`` indexes ``plan.modules[script_guid]``
+					-- (GUID-keyed) — a stale/missing GUID would explode inside
+					-- it before any warn path. Check presence first, then pcall
+					-- the construct so a throwing build (or any addComponent
+					-- error) warns + skips THIS seed, never crashing boot.
+					local plan_modules = plan.modules or {}
+					if plan_modules[seed.script_guid] == nil then
+						warn("[lazy-singleton] script_guid not present in "
+							.. "plan.modules: " .. tostring(seed.script_guid)
+							.. " (" .. tostring(seed.class_stem)
+							.. "); skipping seed")
+					else
+						local buildOk, buildErr =
+							pcall(engine.addComponent, engine, hostId, seed.script_guid, {})
+						if not buildOk then
+							warn("[lazy-singleton] addComponent errored for "
+								.. tostring(seed.class_stem) .. " (guid "
+								.. tostring(seed.script_guid) .. "): "
+								.. tostring(buildErr) .. "; skipping seed")
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Constructor
 -- ---------------------------------------------------------------------
 
@@ -328,6 +584,21 @@ function SceneRuntime.new(services, plan)
 	-- ``{source=, field=, index=, target_ref=}`` with ``target_ref`` already
 	-- the full engine-union key (``<placement>:<prefab>:<src_fid>``).
 	self._pendingPlacementRefs = nil
+
+	-- Toggle ``isOn`` -> checkmark ``.Visible`` bindings (client-only). Built
+	-- lazily at watch install; nil/empty for non-UI or no-toggle runs.
+	--   ``_boundRows[row] = toggle instance`` -- PER-ROW exactly-once marker
+	--     (NOT per-instance: two rows sharing one toggle each bind their own
+	--     graphic). The instance VALUE re-binds on a respawn re-clone (same
+	--     SRI, NEW instance -> ``_boundRows[row] ~= newToggle``).
+	--   ``_unboundToggleIndex[sri] = LIST of rows`` -- O(1) dispatch per
+	--     ``DescendantAdded`` fire, seeded with BOTH ``toggle_sri`` and
+	--     ``graphic_sri`` (either may be shared across rows -> a list, not a
+	--     single row). Rows stay indexed for the session so respawn re-clones
+	--     re-match; per-bind idempotency is the per-row marker, not eviction.
+	self._boundRows = setmetatable({}, {__mode = "v"})
+	self._unboundToggleIndex = nil
+	self._toggleWatchConn = nil
 
 	return self
 end
@@ -946,6 +1217,24 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:playersInRadius(arg1, arg2)
 		end,
+		sendMessage = function(arg1, arg2, arg3, ...)
+			-- Colon: host:sendMessage(recv, name, ...) -> arg1=host,
+			--   arg2=recv, arg3=name, ...=gameplay args.
+			-- Dotted: host.sendMessage(recv, name, ...) -> arg1=recv,
+			--   arg2=name, arg3..=gameplay args.
+			if arg1 == host then
+				return engine:sendMessage(arg2, arg3, ...)
+			end
+			return engine:sendMessage(arg1, arg2, arg3, ...)
+		end,
+		broadcastMessage = function(arg1, arg2, arg3, ...)
+			-- Colon: host:broadcastMessage(recv, name, ...) -> arg1=host.
+			-- Dotted: host.broadcastMessage(recv, name, ...) -> arg1=recv.
+			if arg1 == host then
+				return engine:broadcastMessage(arg2, arg3, ...)
+			end
+			return engine:broadcastMessage(arg1, arg2, arg3, ...)
+		end,
 		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
 		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
 		-- Phase 3's Shoot raycast can reach ``self.host.player:getLookCFrame()``
@@ -1520,6 +1809,269 @@ function SceneRuntime:_callMethod(instance, name, ...)
 				"[scene_runtime] %s.%s threw: %s",
 				tostring(self._meta[instance].scriptId), name, tostring(err)))
 		end
+	end
+end
+
+-- ---------------------------------------------------------------------
+-- SendMessage / BroadcastMessage host primitives (Unity engine ops)
+-- ---------------------------------------------------------------------
+-- Unity's ``recv.SendMessage("M", arg)`` invokes ``M`` on EVERY component
+-- on ``recv``'s GameObject that implements it, but only while the
+-- GameObject is ``activeInHierarchy``. ``BroadcastMessage`` additionally
+-- descends to every child GameObject. Resolution is at RUNTIME because the
+-- receiver expression (a component, a Model/GameObject, or a touched
+-- BasePart) only resolves to a live GameObject id once instances exist.
+
+-- ``_resolveReceiverGoId(recv) -> gameObjectId?`` -- best-effort map of a
+-- SendMessage receiver onto an internal ``gameObjectId``:
+--   * a component table -> ``_meta[recv].gameObjectId``
+--   * a Model / GameObject instance -> ``getInstanceId(recv)``
+--   * a BasePart -> ``getInstanceId(part)`` else its ancestor Model's id
+--     (mirrors the ``playerFromTouch`` ancestor walk for touched parts)
+-- Returns nil (with a warn) when nothing resolves -- best-effort, matching
+-- Unity's ``SendMessageOptions.DontRequireReceiver`` (Roblox has no
+-- missing-handler error analog).
+function SceneRuntime:_resolveReceiverGoId(recv)
+	if recv == nil then return nil end
+	-- Component table: registered in ``_meta`` with its gameObjectId.
+	local meta = self._meta[recv]
+	if meta ~= nil then
+		return meta.gameObjectId
+	end
+	-- Roblox Instance (Model / GameObject / BasePart): resolve its own
+	-- stamped id first; a GameObject whose components are registered will
+	-- have a bucket under that id.
+	local getInstanceId = self._services.getInstanceId
+	if getInstanceId == nil then return nil end
+	local ownId = getInstanceId(recv)
+	if ownId ~= nil and self._componentsByGameObject[ownId] ~= nil then
+		return ownId
+	end
+	-- BasePart (or any descendant Instance) whose own id carries no
+	-- components: climb to the owning Model and resolve that.
+	if type(recv.FindFirstAncestorWhichIsA) == "function" then
+		local ok, ancestor = pcall(function()
+			return recv:FindFirstAncestorWhichIsA("Model")
+		end)
+		if ok and ancestor ~= nil then
+			local ancId = getInstanceId(ancestor)
+			if ancId ~= nil then
+				return ancId
+			end
+		end
+	end
+	-- Fall back to the receiver's own id even without a component bucket
+	-- so the caller can still attempt dispatch (no-op if empty).
+	return ownId
+end
+
+-- ``_dispatchToGameObject(goId, name, ...)`` -- invoke ``name`` on every
+-- component registered at ``goId`` that implements it, gated on the
+-- GameObject being ``activeInHierarchy`` (Unity targets only active
+-- GameObjects). Each call goes through ``_callMethod`` (pcall-wrapped).
+function SceneRuntime:_dispatchToGameObject(goId, name, ...)
+	if goId == nil then return end
+	-- Active gate: reuse the lifecycle's computed ``activeInHierarchy``.
+	-- A goId never seeded into the cache defaults to the parent-map
+	-- computation (absence == active, matching ``_injectHostSurface``).
+	local active = self._goActiveInHierarchy[goId]
+	if active == nil then
+		active = self:_computeActiveInHierarchyViaParentMap(goId)
+	end
+	if not active then return end
+	local bucket = self._componentsByGameObject[goId]
+	if bucket == nil then return end
+	-- Snapshot so a handler that mutates the bucket (adds/destroys a
+	-- component) does not disturb iteration.
+	local snap = {}
+	for i, comp in ipairs(bucket) do snap[i] = comp end
+	for _, comp in ipairs(snap) do
+		local meta = self._meta[comp]
+		local class = meta and meta.classTable
+		if class and type(class[name]) == "function" then
+			self:_callMethod(comp, name, ...)
+		end
+	end
+end
+
+-- ``_playerFromAlias(recv) -> Player?`` -- resolve ANY handle that denotes the
+-- local player's embodiment to its ``Players``-service ``Player``:
+--   * a ``Player`` object (explicit ``IsA("Player")`` guard, pcall-wrapped
+--     because ``recv`` may be a plain component table without ``IsA``);
+--   * the character ``Model`` ITSELF (``plr.Character`` -- what Pickup passes),
+--     a limb/``BasePart`` under it, its ``HumanoidRootPart``, or its
+--     ``Humanoid`` -- via an INCLUSIVE ancestor walk (start at ``recv`` itself,
+--     not ``recv.Parent``) for the first Humanoid-bearing ``Model``, then
+--     ``GetPlayerFromCharacter``.
+-- Inclusive so the character Model matches as the FIRST node -- the touch-only
+-- ``playerFromTouch`` starts at ``recv.Parent``, which misses the Model itself.
+-- Returns nil for non-player receivers (no Humanoid-bearing Model ancestor) and
+-- for NPCs (a Humanoid Model ``GetPlayerFromCharacter`` does not resolve), so
+-- both fall through to the non-player ``_resolveReceiverGoId`` path.
+function SceneRuntime:_playerFromAlias(recv)
+	if recv == nil then return nil end
+	local players = self._services.players
+	if players == nil then return nil end
+	-- (a) Players-service Player object.
+	if type(recv.IsA) == "function" then
+		local ok, isPlayer = pcall(function() return recv:IsA("Player") end)
+		if ok and isPlayer then return recv end
+	end
+	-- (b) any embodiment handle -> owning Player via an INCLUSIVE ancestor walk
+	-- (``recv`` itself + ancestors) for a Humanoid-bearing character Model.
+	local node = recv
+	local guard = 0
+	while node ~= nil and guard < 16 do
+		guard += 1
+		-- pcall the ``IsA`` probe so a component table with an erroring ``IsA``
+		-- can't throw mid-dispatch.
+		local okModel, isModel = false, false
+		if type(node.IsA) == "function" then
+			okModel, isModel = pcall(function() return node:IsA("Model") end)
+		end
+		if okModel and isModel
+			and type(node.FindFirstChildWhichIsA) == "function"
+			and node:FindFirstChildWhichIsA("Humanoid")
+		then
+			-- Keep climbing past an inner Humanoid Model that maps to no player
+			-- (a nested rig); the player's character may be an OUTER ancestor.
+			local p = players:GetPlayerFromCharacter(node)
+			if p ~= nil then return p end
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+-- ``_isPlayerAlias(recv) -> boolean`` -- TRUE iff ``recv`` denotes the local
+-- player's embodiment (any handle ``_playerFromAlias`` resolves). The converter
+-- decouples the player into the Roblox character (what the receiver points at,
+-- carrying no Unity component) and the Unity Player logic GameObject
+-- (``Workspace.DynamicObjects.Player``, carrying ``GetItem``/``GetRifle``) -- so
+-- a player-alias receiver must route to the LATTER, not whatever the alias
+-- literally points at.
+function SceneRuntime:_isPlayerAlias(recv)
+	return self:_playerFromAlias(recv) ~= nil
+end
+
+-- ``_playerGoIds() -> {gameObjectId}`` -- the LIST of DISTINCT internal
+-- ``gameObjectId``(s) of the player-embodiment component(s), keyed on the
+-- deterministic ``_player._playerScriptId`` (rung-3 upstream identity, NOT an
+-- AI fingerprint). Mirrors ``_playerRigInstances``'s walk but collects
+-- ``meta.gameObjectId`` (what ``_dispatchToGameObject`` keys on) instead of
+-- ``meta.gameObjectInstance``. Returns ``{}`` when no player authority is
+-- bound (0/>1 character-controller modules -> nil ``_player``) or the rig
+-- isn't built yet -- the caller treats empty as no-route (fail-closed, no
+-- error). Guards nil ``_player`` FIRST so it never indexes a nil ``_player``.
+function SceneRuntime:_playerGoIds()
+	local p = self._player
+	if not p or not p._playerScriptId then return {} end
+	local out, seen = {}, {}
+	for _, m in pairs(self._meta) do
+		if m.scriptId == p._playerScriptId then
+			local goId = m.gameObjectId
+			if goId ~= nil and not seen[goId] then
+				seen[goId] = true
+				table.insert(out, goId)
+			end
+		end
+	end
+	return out
+end
+
+-- ``sendMessage(recv, name, ...)`` -- Unity ``recv.SendMessage("name", ...)``:
+-- dispatch ``name`` to every implementing component on the resolved
+-- GameObject (active only).
+function SceneRuntime:sendMessage(recv, name, ...)
+	-- Player-FIRST branch: a player alias maps to a LIST of
+	-- embodiment goIds, which does not fit the single-id resolver. Check it
+	-- BEFORE ``_resolveReceiverGoId`` so a player alias never falls into the
+	-- ancestor-Model walk that mis-resolved the literal character.
+	if self:_isPlayerAlias(recv) then
+		local goIds = self:_playerGoIds()
+		if #goIds == 0 then
+			self._warn(string.format(
+				"[scene_runtime] sendMessage(%q): player-alias receiver but no "
+				.. "player-embodiment GameObject bound (0/>1 character "
+				.. "controllers, or rig not built)", tostring(name)))
+			return
+		end
+		for _, goId in ipairs(goIds) do
+			self:_dispatchToGameObject(goId, name, ...)
+		end
+		return
+	end
+	-- Non-player path.
+	local goId = self:_resolveReceiverGoId(recv)
+	if goId == nil then
+		self._warn(string.format(
+			"[scene_runtime] sendMessage(%q): no GameObject for receiver",
+			tostring(name)))
+		return
+	end
+	self:_dispatchToGameObject(goId, name, ...)
+end
+
+-- ``broadcastMessage(recv, name, ...)`` -- Unity
+-- ``recv.BroadcastMessage("name", ...)``: dispatch to the GameObject AND
+-- every descendant GameObject (via the planner parent map walked DOWN).
+function SceneRuntime:broadcastMessage(recv, name, ...)
+	-- Player-FIRST branch: a player-alias receiver dispatches
+	-- FLAT to each player-embodiment goId WITHOUT the descendant walk -- the
+	-- embodiment is a logic singleton (no Unity child GameObjects carrying
+	-- broadcast-target components; the rig's children are character limbs, not
+	-- registered GameObjects), so the walk would only re-hit the same set.
+	-- Same delivery as sendMessage for a player alias.
+	if self:_isPlayerAlias(recv) then
+		local goIds = self:_playerGoIds()
+		if #goIds == 0 then
+			self._warn(string.format(
+				"[scene_runtime] broadcastMessage(%q): player-alias receiver but "
+				.. "no player-embodiment GameObject bound (0/>1 character "
+				.. "controllers, or rig not built)", tostring(name)))
+			return
+		end
+		for _, goId in ipairs(goIds) do
+			self:_dispatchToGameObject(goId, name, ...)
+		end
+		return
+	end
+	-- Non-player path.
+	local goId = self:_resolveReceiverGoId(recv)
+	if goId == nil then
+		self._warn(string.format(
+			"[scene_runtime] broadcastMessage(%q): no GameObject for receiver",
+			tostring(name)))
+		return
+	end
+	-- Collect the COMPLETE target set FIRST -- the root goId plus every
+	-- GameObject whose ancestor chain (``_goParentId`` walked UP) reaches
+	-- ``goId`` -- WITHOUT dispatching. A dispatched handler may destroy or
+	-- add GameObjects/components (e.g. an Extinguish handler tearing down a
+	-- sibling), and ``pairs`` over a table being mutated mid-walk skips or
+	-- duplicates entries. Snapshotting the target ids before any dispatch
+	-- makes the descendant walk immune to that mutation. Bounded by a depth
+	-- budget per node so an accidental cycle can't loop forever.
+	local targets = {goId}
+	for childId in pairs(self._componentsByGameObject) do
+		if childId ~= goId then
+			local cur = self._goParentId[childId]
+			local depth = 0
+			while cur ~= nil and depth < 1024 do
+				if cur == goId then
+					targets[#targets + 1] = childId
+					break
+				end
+				cur = self._goParentId[cur]
+				depth = depth + 1
+			end
+		end
+	end
+	-- THEN dispatch to each captured target. ``_dispatchToGameObject``
+	-- already snapshots its per-GameObject bucket, so a handler mutating
+	-- that bucket can't disturb delivery either.
+	for _, targetId in ipairs(targets) do
+		self:_dispatchToGameObject(targetId, name, ...)
 	end
 end
 
@@ -2616,6 +3168,228 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 end
 
 -- ---------------------------------------------------------------------
+-- Phase 2: camera-mount -> player-mount weapon equip (server-side)
+-- ---------------------------------------------------------------------
+-- The client's Phase-1 lowered request fires the prefab FIELD NAME through the
+-- ``EquipWeapon`` RemoteEvent; the SceneRuntimeServer entrypoint's OnServerEvent
+-- handler delegates to the methods below. They are SERVER-CALLABLE PLAIN methods
+-- (no ``isClient`` gate -- they run only from the server entrypoint's
+-- OnServerEvent / CharacterAdded, never from a ``_tick`` bracket). They use only
+-- ``self._services`` (clonePrefabTemplate) + ``self._plan`` (equip_prefabs), so
+-- the test harness drives them with stub services. The weapon is server-parented
+-- under the requesting player's Character so Roblox auto-replicates it to every
+-- client (the load-bearing "other players see the held gun" win, D5/D6).
+
+-- Field-name -> prefab_id bridge (D13). Reads the conversion-time-seeded
+-- ``self._plan.equip_prefabs`` map ``{ [fieldName] = prefab_id }`` built by the
+-- post-transpile pipeline step. Returns the prefab_id or nil (unknown field ->
+-- the handler no-ops, D11 parity). Pure read.
+function SceneRuntime:resolveEquipPrefabId(fieldName)
+	if type(fieldName) ~= "string" or fieldName == "" then return nil end
+	local map = self._plan and self._plan.equip_prefabs
+	if type(map) ~= "table" then return nil end
+	local prefabId = map[fieldName]
+	if type(prefabId) ~= "string" or prefabId == "" then return nil end
+	return prefabId
+end
+
+-- D17/Bug-2: the uniform display scale for a weapon prefab, from the Plan's
+-- ``equip_prefabs`` sibling ``equip_scales`` map (keyed by prefab_id, captured from
+-- the C# ``localScale = Vector3.one * f``). Returns 1 (no-op) when absent / invalid
+-- so the common no-scale game welds at native template size. Keyed by prefab_id so
+-- BOTH the manual equip and the respawn re-equip (which hold prefab_id, not the
+-- field name) resolve the same scale.
+function SceneRuntime:resolveEquipScale(prefabId)
+	local map = self._plan and self._plan.equip_scales
+	if type(map) ~= "table" then return 1 end
+	local s = map[prefabId]
+	if type(s) == "number" and s > 0 then return s end
+	return 1
+end
+
+-- Bounded wait (seconds) for a respawned Character's hand limb to be parented
+-- before the re-equip gives up. Generous enough to absorb the normal
+-- one-/two-frame R15 limb-parenting delay without an unbounded stall.
+local EQUIP_HAND_WAIT_TIMEOUT = 5
+
+-- R15 right-hand resolver with ONE documented fallback (D15). R15 has a
+-- dedicated ``RightHand`` part; R6 has none, so ``"Right Arm"`` is the closest
+-- grip analog. The full rig-variant matrix is OUT OF SCOPE -- this single
+-- fallback keeps an R6 character from a hard no-op. Returns nil when neither
+-- resolves (caller then no-ops, no weld).
+function SceneRuntime:_resolveRightHand(character)
+	if not character then return nil end
+	local hand = character:FindFirstChild("RightHand")
+	if hand and hand:IsA("BasePart") then return hand end
+	hand = character:FindFirstChild("Right Arm")
+	if hand and hand:IsA("BasePart") then return hand end
+	return nil
+end
+
+-- Respawn-tolerant hand resolver (CharacterAdded fires BEFORE the R15 limbs
+-- are parented, so a one-shot ``FindFirstChild`` no-ops on respawn). A BOUNDED
+-- POLL that checks BOTH limb names every tick and returns whichever appears
+-- first, so:
+--   * R6 (has "Right Arm", never "RightHand") resolves on the FIRST check -- no
+--     stall (an earlier ``WaitForChild("RightHand", timeout)``-then-fallback
+--     spent the FULL timeout unarmed every respawn, since R6 never grows a
+--     "RightHand").
+--   * R15 with a late-arriving "RightHand" resolves the tick it lands.
+--   * neither present within the bounded deadline -> nil so the caller no-ops
+--     (no unbounded wait).
+-- "RightHand" is checked first so R15 prefers its dedicated grip part. The
+-- deadline is a fixed iteration cap over the engine's ``task.wait`` yield floor
+-- (no os.clock/tick dependency); ``timeout`` seconds / the per-frame wait gives
+-- the ~5s cap. The yield floor matches the rest of the runtime
+-- (``self._services.task.wait``).
+function SceneRuntime:_resolveRightHandBounded(character, timeout)
+	if not character then return nil end
+	local function pick()
+		local hand = character:FindFirstChild("RightHand")
+		if hand and hand:IsA("BasePart") then return hand end
+		hand = character:FindFirstChild("Right Arm")
+		if hand and hand:IsA("BasePart") then return hand end
+		return nil
+	end
+	-- First check before any yield: a limb already present (R6 / fast R15)
+	-- resolves immediately.
+	local hand = pick()
+	if hand then return hand end
+	-- Bounded poll: ~one check per engine frame, capped at ``timeout`` seconds'
+	-- worth of frames (60 fps assumed -> a fixed iteration count, no real clock).
+	local waitFn = self._services and self._services.task and self._services.task.wait
+	local maxIters = math.max(1, math.floor((timeout or EQUIP_HAND_WAIT_TIMEOUT) * 60))
+	for _ = 1, maxIters do
+		if waitFn then waitFn() end
+		hand = pick()
+		if hand then return hand end
+	end
+	return nil
+end
+
+-- The weld core (the NEW rigging surface, D16). Clones the prefab template
+-- SERVER-SIDE under the Character (so Roblox auto-replicates it), normalizes a
+-- Model to a weldable BasePart anchor, welds it to the right hand with a
+-- ``WeldConstraint`` (rigid static-offset attachment; no C0/C1, no joint the
+-- Animate script fights), and makes every weapon part CanCollide=false /
+-- Massless=true so the gun neither blocks movement nor drags the humanoid's
+-- physics. Double-equip safety (Edge d): a prior ``_EquippedWeapon`` under THIS
+-- character is removed before welding the new one. Returns the clone, or nil on
+-- any safe no-op (no hand / clone failed / no weldable part).
+-- ``waitForHand`` (respawn path): when true, the hand is resolved with a BOUNDED
+-- WaitForChild so a just-spawned Character whose limbs land a frame later still
+-- equips; the already-spawned OnServerEvent path passes nil/false for the fast
+-- one-shot resolve.
+function SceneRuntime:equipWeaponOnCharacter(character, prefabId, waitForHand)
+	local hand
+	if waitForHand then
+		hand = self:_resolveRightHandBounded(character, EQUIP_HAND_WAIT_TIMEOUT)
+	else
+		hand = self:_resolveRightHand(character)
+	end
+	if not hand then return nil end
+	-- Double-equip safety: remove any existing equipped weapon first.
+	local existing = character:FindFirstChild("_EquippedWeapon")
+	if existing then existing:Destroy() end
+	-- Clone server-side, parented under the Character (clonePrefabTemplate
+	-- parents to ``parent``).
+	local clone = self._services.clonePrefabTemplate(prefabId, character, nil)
+	if not clone then return nil end
+	clone.Name = "_EquippedWeapon"
+	-- D17/Bug-2: apply the captured uniform display scale BEFORE positioning/welding
+	-- (the C# equip set ``localScale = Vector3.one * f``; the converted template is
+	-- at native size). ScaleTo scales geometry about the model pivot; doing it before
+	-- PivotTo/weld means the subsequent placement lands the scaled weapon on the hand.
+	-- Model -> ScaleTo (uniform); single BasePart -> scale Size. No-op when scale == 1.
+	local equipScale = self:resolveEquipScale(prefabId)
+	if equipScale ~= 1 then
+		if clone:IsA("Model") then
+			clone:ScaleTo(equipScale)
+		elseif clone:IsA("BasePart") then
+			clone.Size = clone.Size * equipScale
+		end
+	end
+	-- Normalize Model -> a weldable BasePart anchor (PrimaryPart or first
+	-- BasePart). A non-Model non-BasePart clone is unweldable -> drop it.
+	local weldPart = clone
+	if clone:IsA("Model") then
+		weldPart = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart", true)
+		if not weldPart then clone:Destroy(); return nil end
+	elseif not clone:IsA("BasePart") then
+		clone:Destroy(); return nil
+	end
+	-- Reset EVERY BasePart in the clone so the live weapon is VISIBLE
+	-- (templates are emitted Transparency=1.0 / hidden) and moves as one rigid
+	-- body welded to the hand (parts default Anchored=true; an anchored part
+	-- ignores its WeldConstraint and stays pinned in world space). CanCollide
+	-- /Massless keep the gun from blocking or dragging the humanoid's physics.
+	local function normalizePart(p)
+		p.Transparency = 0
+		p.Anchored = false
+		p.CanCollide = false
+		p.Massless = true
+	end
+	for _, d in clone:GetDescendants() do
+		if d:IsA("BasePart") then normalizePart(d) end
+	end
+	if clone:IsA("BasePart") then normalizePart(clone) end
+	-- Relocate the WHOLE clone to the hand as a unit (a multi-part Model keeps
+	-- its internal offsets), then weld. (First-person muzzle offset is a
+	-- DEFERRED live-tune, D4 -- a zero offset lands the gun ON the hand.)
+	-- For a Model, pin PrimaryPart to the chosen anchor BEFORE PivotTo so the
+	-- ANCHOR lands exactly at hand.CFrame. Without this pin PivotTo uses the
+	-- bounding-box pivot, leaving the anchor at an arbitrary offset that the
+	-- subsequent hand WeldConstraint would freeze (gun floats off the hand).
+	if clone:IsA("Model") then
+		clone.PrimaryPart = weldPart
+		clone:PivotTo(hand.CFrame)
+	else
+		weldPart.CFrame = hand.CFrame
+	end
+	-- For a multi-part Model, weld every OTHER descendant BasePart to the chosen
+	-- primary anchor first so the model is internally rigid, then weld the
+	-- anchor to the hand.
+	if clone:IsA("Model") then
+		for _, d in clone:GetDescendants() do
+			if d:IsA("BasePart") and d ~= weldPart then
+				local inner = Instance.new("WeldConstraint")
+				inner.Part0 = weldPart
+				inner.Part1 = d
+				inner.Parent = weldPart
+			end
+		end
+	end
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = hand
+	weld.Part1 = weldPart
+	weld.Parent = weldPart
+	return clone
+end
+
+-- Per-player last-equip memory (server-only engine state, keyed by the Player
+-- instance). Recorded by the handler after a successful equip; a stale entry for
+-- a departed player is harmless (the key just lingers).
+function SceneRuntime:rememberEquip(player, prefabId)
+	self._lastEquip = self._lastEquip or {}
+	self._lastEquip[player] = prefabId
+end
+
+-- Re-equip on respawn (Edge e). A NEW Character has no welded weapon, so re-run
+-- the last successful equip for this player.
+function SceneRuntime:reequipLastWeapon(player, character)
+	local prefabId = self._lastEquip and self._lastEquip[player]
+	if not prefabId or not character then return end
+	-- NB: do NOT gate on ``character.Parent ~= nil`` here. On respawn the new
+	-- Character is parented to workspace a beat AFTER CharacterAdded fires, so its
+	-- Parent is transiently nil when this runs — a parent guard would no-op the
+	-- whole re-equip (and the limb-arrival self-heal in the emitted entrypoint
+	-- already covers a hand that lands later). equipWeaponOnCharacter parents the
+	-- weapon UNDER the character, so it rides along once the character is parented;
+	-- a truly-departed character resolves no hand and no-ops there.
+	self:equipWeaponOnCharacter(character, prefabId, true)
+end
+
+-- ---------------------------------------------------------------------
 -- Slice 1.1: deferred UI-host gameObject resolution (generic boot race)
 -- ---------------------------------------------------------------------
 -- A UI-owned instance (``inst.instance_owner_is_ui == true``) binds its
@@ -3119,6 +3893,109 @@ function SceneRuntime:_lifecycleOrderFor(entry)
 end
 
 -- ---------------------------------------------------------------------
+-- Toggle ``isOn`` -> checkmark-graphic visual binding (generic, CLIENT-only).
+-- Anchored on the Unity Toggle component + its serialized ``graphic`` fileID,
+-- resolved (at conversion time) to the checkmark's ``_SceneRuntimeId``. The
+-- runtime drives the graphic's ``.Visible`` off the Toggle's ``isOn``
+-- attribute. NO node names; NO server binding (the watch service is
+-- client-only). Initial visibility is order-independent because every bind
+-- reads the LIVE attribute (fallback ``initial_on``), so no pre-Awake hook is
+-- needed (``start()`` never yields -> a present clone binds before any frame).
+-- ---------------------------------------------------------------------
+
+function SceneRuntime:_setGraphicVisible(inst, on)
+	-- ``.Visible`` is the faithful Roblox show/hide for a GuiObject (the
+	-- checkmark is an ImageLabel). Guard so a non-GuiObject endpoint can't
+	-- error (fail-closed).
+	if inst == nil then return end
+	local ok = pcall(function() inst.Visible = on end)
+	if not ok then
+		self._warn("[toggle-binding] could not set .Visible on graphic")
+	end
+end
+
+function SceneRuntime:_buildUnboundToggleIndex()
+	-- ``sri -> LIST of rows``, seeded with BOTH endpoints of every row so a
+	-- ``DescendantAdded`` for either the toggle OR the graphic looks up the
+	-- row in O(1). A list because either SRI may be shared across rows.
+	local index = {}
+	local function add(sri, row)
+		if type(sri) ~= "string" or sri == "" then return end
+		local list = index[sri]
+		if not list then list = {}; index[sri] = list end
+		table.insert(list, row)
+	end
+	for _, b in ipairs(self._plan.ui_toggle_bindings or {}) do
+		add(b.toggle_sri, b)
+		add(b.graphic_sri, b)
+	end
+	self._unboundToggleIndex = index
+end
+
+function SceneRuntime:_bindOneToggle(b, hint)
+	-- Bind ONE row's toggle->graphic, idempotently. SRI service, never a raw
+	-- walk. ``hint`` is an already-resolved endpoint (the ``DescendantAdded``
+	-- ``desc``) to skip one linear scan.
+	local toggle = (hint and hint:GetAttribute("_SceneRuntimeId") == b.toggle_sri and hint)
+		or self._services.workspaceFind(b.toggle_sri)
+	if toggle == nil then return end
+	if self._boundRows[b] == toggle then return end   -- this ROW already bound to THIS live instance
+	local graphic = (hint and hint:GetAttribute("_SceneRuntimeId") == b.graphic_sri and hint)
+		or self._services.workspaceFind(b.graphic_sri)
+	if graphic == nil then return end                  -- re-attempt when the sibling lands
+	-- Initial visibility from the LIVE attribute if ANYTHING already set it,
+	-- else the static planner ``initial_on``. ``live == nil`` is the NORMAL
+	-- not-yet-flipped case (the writer sets ``isOn`` only on a runtime event),
+	-- so it is the silent ``initial_on`` fallback -- NOT a warn.
+	local live = toggle:GetAttribute(b.attr_name)
+	local on = (live ~= nil and live == true) or (live == nil and b.initial_on == true)
+	self:_setGraphicVisible(graphic, on)
+	-- A destroyed clone (respawn) auto-disconnects its signals, so the old
+	-- connection need not be tracked for teardown; re-bind records the new one.
+	toggle:GetAttributeChangedSignal(b.attr_name):Connect(function()
+		self:_setGraphicVisible(graphic, toggle:GetAttribute(b.attr_name) == true)
+	end)
+	self._boundRows[b] = toggle                        -- per-row exactly-once marker
+end
+
+function SceneRuntime:_applyToggleGraphicBindings()
+	-- One-time scan over all rows (used ONLY at watch install). Rows whose
+	-- clones haven't landed no-op and are bound later by the standing watch.
+	for _, b in ipairs(self._plan.ui_toggle_bindings or {}) do
+		self:_bindOneToggle(b, nil)
+	end
+end
+
+function SceneRuntime:_installToggleGraphicWatch()
+	-- The SOLE binder. Client-only: gated on the client-only
+	-- ``installUiDescendantWatch`` service, so the server NEVER binds (no
+	-- scan, no signal connect, no ``.Visible`` mutation of the StarterGui
+	-- template). Connect-then-scan once: install the standing watch FIRST so a
+	-- clone landing during the install scan still fires, then run the one-time
+	-- scan for clones already present.
+	local install = self._services.installUiDescendantWatch
+	if type(install) ~= "function" then return end       -- server / no UI watch -> never bind
+	local rows = self._plan.ui_toggle_bindings
+	if type(rows) ~= "table" or #rows == 0 then return end -- nothing to bind
+	self:_buildUnboundToggleIndex()
+	local engine = self
+	self._toggleWatchConn = install(function(desc)
+		local sri = desc:GetAttribute("_SceneRuntimeId")
+		if sri == nil then return end                    -- non-matching descendant short-circuit
+		local matched = engine._unboundToggleIndex[sri]
+		if matched == nil then return end                -- O(1) miss -> no rescan
+		for _, b in ipairs(matched) do
+			engine:_bindOneToggle(b, desc)               -- reuse desc as the resolved endpoint
+		end
+	end)
+	-- Fail-closed: a present service may still decline (e.g. client with no
+	-- PlayerGui yet returns ``nil``). No standing watch -> never scan/bind, so
+	-- we never fall back to mutating the StarterGui template's ``.Visible``.
+	if self._toggleWatchConn == nil then return end
+	-- Now bind everything already present (connect-then-scan race close).
+	self:_applyToggleGraphicBindings()
+end
+
 -- Static-event channel identity: pre-set module-table fields before Awake
 -- ---------------------------------------------------------------------
 
@@ -3470,6 +4347,14 @@ function SceneRuntime:start(domainFilter)
 	-- deferred components run their own complete late lifecycle batch once
 	-- their PlayerGui clone resolves event-driven.
 	self:_resolveDeferredUiInstances()
+
+	-- Install the standing client-only Toggle->checkmark watch AFTER deferred
+	-- UI resolution (connect-then-scan once). Client-gated on
+	-- the ``installUiDescendantWatch`` service, so the server never binds. The
+	-- live-attribute read at bind makes initial visibility order-independent --
+	-- no pre-Awake hook needed (``start()`` never yields, so a present clone
+	-- binds before the first rendered frame).
+	self:_installToggleGraphicWatch()
 
 	-- Build the host-owned per-player embodiment authority (paradigm C).
 	-- Client-only + keyed on the upstream has_character_controller MODULE

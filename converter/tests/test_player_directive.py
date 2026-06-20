@@ -105,7 +105,8 @@ def _capture_contexts(monkeypatch) -> dict[str, str]:
 
     def fake_ai(csharp_source, api_key, model, class_name="",
                 script_type="Script", project_context="",
-                runtime_mode="legacy", is_player_controller=False):
+                runtime_mode="legacy", is_player_controller=False,
+                send_message_facts=()):
         captured[class_name] = project_context
         return ("local M = {}\nreturn M\n", 0.9, [])
 
@@ -417,7 +418,8 @@ class TestTranspileWithContractDynamic:
 
         def fake_ai(csharp_source, api_key, model, class_name="",
                     script_type="Script", project_context="",
-                    runtime_mode="legacy", is_player_controller=False):
+                    runtime_mode="legacy", is_player_controller=False,
+                    send_message_facts=()):
             captured[class_name] = project_context
             if flags is not None:
                 flags[class_name] = is_player_controller

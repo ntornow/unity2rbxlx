@@ -189,6 +189,57 @@ class TestResolveAssetsContract:
         assert pipeline.ctx.universe_id == 99
         assert pipeline.ctx.place_id == 88
 
+    def test_resolve_assets_quarantines_bad_embedded_mesh_at_call_site(
+        self, fake_unity_project, tmp_path, monkeypatch,
+    ):
+        """AC4 integration guard: the real ``resolve_assets`` must CALL the
+        embedded-mesh quarantine after the merge. The pure helper and the
+        downstream ``_resolve_mesh_id`` tests cover behaviour in isolation,
+        but nothing proved the pipeline actually wires the call — removing
+        it would leave a bad ``...prefab#<id>`` key (resolved to != 1
+        sub-mesh) live in ctx and bind ``sub_meshes[0]`` to wrong geometry.
+
+        Drive resolve_assets so the merged hierarchy carries an embedded
+        key with TWO sub-meshes, then assert it is evicted from every table
+        the MeshId binding reads and recorded as an upload error.
+        """
+        _set_creds(monkeypatch)
+
+        pipeline = Pipeline(
+            unity_project_path=fake_unity_project,
+            output_dir=tmp_path / "out",
+            skip_upload=False,
+        )
+        bad_key = "Assets/Props/crate.prefab#123456"
+        pipeline.ctx.uploaded_assets[bad_key] = "rbxassetid://111"
+        pipeline.ctx.universe_id = 1234
+        pipeline.ctx.place_id = 5678
+
+        # Stub the Studio round-trip to return TWO sub-mesh lines for the
+        # embedded key — the synthesised FBX must resolve to exactly one,
+        # so this trips the quarantine. Result line format:
+        # path|name|meshId|sx,sy,sz|px,py,pz|textureId
+        from roblox import cloud_api, id_cache
+
+        def _stub(api_key, uid, pid, script, **_kw):
+            text = (
+                f"{bad_key}|GeomA|rbxassetid://900|1,1,1|0,0,0|\n"
+                f"{bad_key}|GeomB|rbxassetid://901|1,1,1|0,0,0|"
+            )
+            return {"state": "COMPLETE", "output": {"results": [text]}}
+
+        monkeypatch.setattr(cloud_api, "execute_luau", _stub)
+        monkeypatch.setattr(id_cache, "write_ids", lambda *a, **k: None)
+
+        pipeline.resolve_assets()
+
+        # After the call-site quarantine, the bad key is gone from every
+        # binding table and recorded as an upload error.
+        assert bad_key not in pipeline.ctx.mesh_hierarchies
+        assert bad_key not in pipeline.ctx.mesh_native_sizes
+        assert bad_key not in pipeline.ctx.uploaded_assets
+        assert bad_key in pipeline.ctx.asset_upload_errors
+
     def test_stale_resolved_keys_do_not_suppress_new_resolution(
         self, fake_unity_project, tmp_path, monkeypatch,
     ):

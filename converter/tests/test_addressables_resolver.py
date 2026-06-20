@@ -10,6 +10,7 @@ from unity.addressables_resolver import (
     parse_addressables,
     resolve_prefab_addressables,
     resolve_scriptable_object_addressables,
+    resolve_so_assetref_prefab_ids,
 )
 
 GROUP = """\
@@ -215,3 +216,151 @@ class TestScriptableObjectSurface:
         assert idx.by_address["themeData"].count("dayguid") == 2
         so = resolve_scriptable_object_addressables(idx, _guid_index({}), {"dayguid"})
         assert so.by_address["themeData"] == ["dayguid"]  # appears once
+
+
+# --- L0: SO-AssetReference prefab inclusion (gap #5 spawn closure) -----------
+
+# A ThemeData-style SO .asset carrying prefab refs in BOTH spellings the walk
+# must catch: ``m_AssetGUID:`` (AssetReference, prefabList) and ``guid:``
+# (object-ref, collectiblePrefab/cloudPrefabs), plus a NON-prefab ref (a Sprite
+# themeIcon + the m_Script .cs) that must be DROPPED by the .prefab filter.
+# Unity guids are exactly 32 hex chars; the resolver's token regexes require that
+# (a deterministic guard). Use realistic 32-hex guids so the fixture matches the
+# real serialized shape, not a synthetic short token the regex would reject.
+_SEG1 = "11111111111111111111111111111111"
+_SEG2 = "22222222222222222222222222222222"
+_COIN = "33333333333333333333333333333333"
+_CLOUD = "44444444444444444444444444444444"
+_SPRITE = "55555555555555555555555555555555"
+_SCRIPT = "66666666666666666666666666666666"
+_THEME = "77777777777777777777777777777777"
+
+SO_ASSET = f"""\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_Script: {{fileID: 11500000, guid: {_SCRIPT}, type: 3}}
+  m_Name: themeData
+  themeIcon: {{fileID: 21300036, guid: {_SPRITE}, type: 3}}
+  zones:
+  - prefabList:
+    - m_AssetGUID: {_SEG1}
+      m_CachedAsset: {{fileID: 1000, guid: {_SEG1}, type: 3}}
+    - m_AssetGUID: {_SEG2}
+      m_CachedAsset: {{fileID: 1001, guid: {_SEG2}, type: 3}}
+  collectiblePrefab: {{fileID: 184264, guid: {_COIN}, type: 3}}
+  cloudPrefabs:
+  - {{fileID: 1002, guid: {_CLOUD}, type: 3}}
+"""
+
+
+def _so_guid_index(tmp_path: Path) -> tuple[GuidIndex, str]:
+    """A GuidIndex with: one EMITTED SO (.asset on real disk) + prefab guids +
+    a non-prefab sprite + a .cs script guid. Returns (index, so_guid)."""
+    asset_file = tmp_path / "themeData.asset"
+    asset_file.write_text(SO_ASSET, encoding="utf-8")
+    project_root = tmp_path
+    index = GuidIndex(project_root=project_root)
+
+    def _add(guid: str, abspath: Path, rel: str, kind: str) -> None:
+        index.guid_to_entry[guid] = GuidEntry(
+            guid=guid, asset_path=abspath, relative_path=Path(rel), kind=kind,
+        )
+
+    so_guid = _THEME
+    _add(so_guid, asset_file, "themeData.asset", "scriptableobject")
+    for g, rel in (
+        (_SEG1, "Themes/Seg1.prefab"),
+        (_SEG2, "Themes/Seg2.prefab"),
+        (_COIN, "Prefabs/Coin.prefab"),
+        (_CLOUD, "Sky/Cloud.prefab"),
+    ):
+        _add(g, project_root / rel, rel, "prefab")
+    _add(_SPRITE, project_root / "Icon.png", "Icon.png", "texture")
+    _add(_SCRIPT, project_root / "Theme.cs", "Theme.cs", "script")
+    return index, so_guid
+
+
+class TestSoAssetRefPrefabResolver:
+    def test_resolves_prefab_ids_from_both_ref_spellings(self, tmp_path):
+        index, so_guid = _so_guid_index(tmp_path)
+        ids = resolve_so_assetref_prefab_ids({so_guid}, index)
+        # All four prefab refs are recovered (AssetReference + object-ref forms).
+        assert any(i.startswith(f"{_SEG1}:") for i in ids)
+        assert any(i.startswith(f"{_SEG2}:") for i in ids)
+        assert any(i.startswith(f"{_COIN}:") for i in ids)
+        assert any(i.startswith(f"{_CLOUD}:") for i in ids)
+        assert len(ids) == 4
+
+    def test_non_prefab_refs_excluded(self, tmp_path):
+        index, so_guid = _so_guid_index(tmp_path)
+        ids = resolve_so_assetref_prefab_ids({so_guid}, index)
+        # The Sprite themeIcon and the m_Script .cs are NOT prefabs -> dropped.
+        assert not any(i.startswith(f"{_SPRITE}:") for i in ids)
+        assert not any(i.startswith(f"{_SCRIPT}:") for i in ids)
+
+    def test_so_guid_gate_excludes_non_emitted_so(self, tmp_path):
+        # The SO file exists + carries prefab refs, but it is NOT in the emitted
+        # so_guids set -> nothing reachable (the positive-evidence gate).
+        index, _ = _so_guid_index(tmp_path)
+        ids = resolve_so_assetref_prefab_ids(set(), index)
+        assert ids == set()
+
+    def test_unresolvable_so_guid_fails_soft(self, tmp_path):
+        # An so_guid not in the index resolves to no .asset path -> no crash, {}.
+        index, _ = _so_guid_index(tmp_path)
+        ids = resolve_so_assetref_prefab_ids({"99999999999999999999999999999999"}, index)
+        assert ids == set()
+
+    def test_disjoint_from_prefab_address_surface(self, tmp_path):
+        # The L0 SO walk must not perturb the AddressableAssetsData prefab surface
+        # (it feeds the emit set, not by_address/by_label). Resolve both from the
+        # same project and assert they are independent.
+        index, so_guid = _so_guid_index(tmp_path)
+        # No AssetGroups dir here -> the prefab address surface is empty.
+        pa = parse_addressables(tmp_path)
+        assert pa.by_address == {} and pa.by_label == {}
+        ids = resolve_so_assetref_prefab_ids({so_guid}, index)
+        assert len(ids) == 4  # the SO surface is populated independently
+
+
+class TestPersistedSoPrefabIdsAxis:
+    """AC5: the L0 so-prefab ids land in the PERSISTED ``addressables`` block under
+    the ``so_prefab_ids`` axis (a FLAT list, not a label/address dict), and the
+    emit-gate consumers read that axis so the prefabs pass the emission gate."""
+
+    def test_consumer_loop_reads_so_prefab_ids_axis(self):
+        # Drives the REAL shared consumer (``prefab_packages.collect_addressable_prefab_ids``)
+        # that BOTH pipeline emit-gate arms (``_generate_prefab_packages`` and the
+        # collision-rekey pass) call — NOT a re-implemented inline loop. The
+        # by_address/by_label axes are label->[ids] dicts; so_prefab_ids (L0 gap #5)
+        # is a FLAT list read directly. If the real arm dropped the so_prefab_ids
+        # read, this would go RED (no longer green-for-wrong-reason).
+        from converter.prefab_packages import collect_addressable_prefab_ids
+
+        addr_block = {
+            "by_address": {"Coin": ["coin:Prefabs/Coin.prefab"]},
+            "by_label": {},
+            "so_prefab_ids": [
+                "seg1:Themes/Seg1.prefab",
+                "seg2:Themes/Seg2.prefab",
+            ],
+        }
+        addressable_prefab_ids = collect_addressable_prefab_ids(addr_block)
+        assert "seg1:Themes/Seg1.prefab" in addressable_prefab_ids
+        assert "seg2:Themes/Seg2.prefab" in addressable_prefab_ids
+        assert "coin:Prefabs/Coin.prefab" in addressable_prefab_ids
+        # A FLAT-list mis-read via ``.values()`` (the bug the axis guards against)
+        # would iterate the id STRINGS char-by-char — assert that did not happen.
+        assert all(len(pid) > 1 for pid in addressable_prefab_ids)
+
+    def test_so_prefab_ids_pass_emit_gate(self):
+        # AC5(b): the so-prefab ids pass ``select_emitted_prefab_ids`` (i.e.
+        # ``_is_emitted``) — a prefab id in the addressable set is emitted even
+        # with no prefab library entry (the union arm at prefab_packages.py:222).
+        from converter.prefab_packages import select_emitted_prefab_ids
+
+        so_ids = {"seg1:Themes/Seg1.prefab", "seg2:Themes/Seg2.prefab"}
+        emitted = select_emitted_prefab_ids(None, None, so_ids)
+        assert so_ids <= emitted

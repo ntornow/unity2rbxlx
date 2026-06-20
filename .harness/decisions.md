@@ -2851,6 +2851,93 @@ themeIcon (sprite) / skyMesh (mesh) → None.
   the runtime cross-domain policy classifies the target domain without finding it in scene-local
   `instanceById` (placement-scoped key never appears there). Closes the cross-domain bypass.
 
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 ==== -->
+# Decisions — checkmark-toggle-binding-20260617T075020
+
+Generic Unity Toggle `isOn`→checkmark visual binding (follow-on to PR #202). Recorded per the 6 decision
+principles. Design: `design.md` (re-anchored against worktree `1acd1bb`).
+
+## 2026-06-17 — design revision (3 prior dual-voice findings addressed)
+
+- **D-1 — Scope: Toggle→checkmark only; Slider→fill DEFERRED.** Build the generic `ui_*_bindings` mechanism so the
+  Slider side slots in later as `ui_slider_bindings`; write NO Slider code now. (Right-size-at-design.)
+- **D-2 — Anchor on the Unity Toggle component + its serialized `graphic` fileID, resolved to the checkmark's
+  `_SceneRuntimeId`; never node names.** VERIFIED chain: Toggle `&264237065` `graphic`→component `250410366`→
+  owning GameObject `250410364` "Checkmark" / SRI `...:250410364`; toggle GO SRI `...:264237063` (re-decoded from
+  the real rbxlx this revision). Deterministic upstream source, not an AI-output fingerprint.
+- **D-3 — The component-fileID→GameObject resolver is net-new work and its OWN slice (Slice 1).** Corrects the
+  prior design's assumption that the onClick `m_Target` path already provides it — VERIFIED `target_file_id`
+  (`ui_translator.py:371-376`) has ZERO readers, no such index exists anywhere. The binding (Slice 2) depends on
+  it. (Adversarial BLOCKING reproduced against the REAL source → fix it, do not overrule.)
+- **D-4 — Plan-driven binding (`ui_toggle_bindings`), consumed via `workspaceFind`; NOT a runtime workspace scan,
+  NOT an edit to the AI-generated HudControl.** Mirrors `scene_prefab_placements`/`scriptable_objects`;
+  deterministic + harness-testable lever. The `SetAttribute("isOn")` writer is left untouched; the runtime reads
+  it.
+- **D-5 — `attr_name` single-sourced via a new `_TOGGLE_ISON_ATTR = "isOn"` constant, asserted against the AI
+  writer's literal.** No converter constant named the toggle attribute today (VERIFIED grep; `"isOn"` lives only
+  in AI output / `fixture.json:73`). Introduce one + a pin test (A4) so a lowering-casing drift fails RED rather
+  than silently inert.
+- **D-6 — Initial visibility applied BEFORE Awake.** Deferred path hooks immediately before
+  `engine:_runAwakeEnableStart(batch)` at `scene_runtime.luau:3040`; synchronous/late paths apply before their
+  host's lifecycle. (codex P1 #2 — the prior end-of-`start()` hook was too late; every batch already ran Awake by
+  then.)
+- **D-7 — Generic late-clone coverage via a `PlayerGui.DescendantAdded` watch keyed on unbound binding records,
+  reusing the client `awaitUiHost` primitive (`autogen.py:756-810`); client-only, fail-closed on the server.**
+  Binds a Toggle in a late-cloned ScreenGui whose host has NO deferred runtime component (which never reaches
+  `_completeDeferredBatch`/`_resolveDeferredUiInstances`). Makes "ANY Unity Toggle" actually hold. (codex P1 #3.)
+- **D-8 — Idempotent pass run from hook A, hook B, and the late watch; exactly-once per toggle via a marker**
+  (mirrors `boundClones` `scene_runtime.luau:3213`). Fail-closed on nil SRI resolution (E1/E7/E9).
+
+### Slicing
+- **TWO slices** (was ONE in the prior design). Slice 1 = `build_component_owner_index` resolver (no deps,
+  independently RED-provable, no output change). Slice 2 = the binding (depends on Slice 1; converter capture +
+  plan key + runtime consumer co-locate behind the shared `ToggleBinding` contract). Staged-risk fan-in seam, not
+  a size cut.
+
+### Out-of-scope (→ followups)
+- Health-bar fill (Unity Slider→fill) — DEFERRED, build as `ui_slider_bindings` later.
+- Transparency-based hide vs `.Visible` — revisit only if e2e shows a graphic that must dim.
+- Resolving the long-dead onClick `target_file_id` via the new index — latent cleanup the resolver enables.
+
+## 2026-06-17 — Execute-stage decision (graphic-only-reclone)
+- **D-9 — Revert the `(toggle,graphic)`-pair marker; keep the toggle-only marker (`1abead9`).** The phase-integration
+  review flagged that the toggle-only `_boundRows` marker won't re-bind a graphic re-cloned while its toggle survives
+  (MAJOR). A pair marker was implemented (`66b7ba2`) but its own review found it LEAKS the change-signal listener
+  (connected to the surviving toggle, not auto-disconnected) — a net-negative forward fix. The edge is UNREACHABLE in
+  converter output (a converted checkmark is a child of the toggle's ScreenGui → clones/destroys with it). Per
+  OPERATING.md (net-negative fix → revert to last-good + log residual; right-size: gate hardening on evidence the
+  failure occurs), reverted to `1abead9` and carried the gap as a documented followup. Overruled-with-evidence, not
+  silently dropped; surfaced at Gate B.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 (e2e-found addendum) ==== -->
+## 2026-06-17 — verify-stage decision (dispatch root cause; e2e-found)
+  silently dropped; surfaced at Gate B.
+
+## 2026-06-17 — verify-stage decision (dispatch root cause; e2e-found)
+- **D-10 — Detect Toggle as `MonoBehaviour + m_IsOn`, not `ct == "Toggle"`.** A live SimpleFPS conversion (the e2e the
+  feature is for) emitted 0 binding rows for 4 real HUD toggles: real Unity UI Toggles serialize as `MonoBehaviour`
+  (m_Script GUID), never a literal `"Toggle"` component_type, so the dispatch was dead on real scenes (and the
+  pre-existing `ToggleIsOn` never fired either). Fix mirrors the Button `m_OnClick` heuristic. Re-verified live:
+  4 rows incl Battery `toggle_sri=264237063 graphic_sri=250410364`. The whole 5-round design + slice reviews missed
+  this by anchoring on the assumed canonical "Toggle" type — the real input space (MonoBehaviour+GUID) was never
+  exercised until a live conversion. Lesson: enumerate the REAL serialization before locking a dispatch.
+
+<!-- /drive checkmark-toggle-binding-20260617T075020 — verify-stage (faithful Mode-2 e2e) -->
+## 2026-06-17 — verify-stage decision (premise correction; faithful Mode-2 e2e)
+- **D-11 — Premise refined against the FAITHFUL conversion; feature confirmed live.** A faithful `/convert-unity`
+  Mode-2 conversion (NOT u2r — `convert_interactive`, client/server split, AI transpile) revealed the AI `HudControl`
+  ALREADY reveals the checkmark on pickup by node-NAME (`FindFirstChild("Checkmark")`). So the original premise
+  ("UpdatePlayerItems only SetAttribute('isOn') with NO reader") is conversion-dependent/incomplete. The bug the
+  binding UNIQUELY + DETERMINISTICALLY fixes: (1) **initial-state hide** — uncollected items show checkmarks at spawn
+  (template `Visible=true`, m_IsOn=0); the AI reveal-on-pickup never hides them; and (2) the **generic, deterministic
+  guarantee** — the AI's reveal is non-deterministic (it reasoned its way to adding it this run) + non-generic
+  (hardcodes the name "Checkmark"); the binding keys on SRIs and always runs. **LIVE A9 (faithful build, Studio Play
+  client) PASS:** all 4 checkmarks `Visible=false` at spawn; Battery `isOn=true`→`Visible=true`, `isOn=false`→`false`,
+  driven by the binding's attr-change listener (set the attribute directly, isolating the binding from HudControl).
+  smoke=pass, validator=pass, scriptErrorCount=0.
+- **D-12 — e2e MUST use /convert-unity (or /e2e-test), NEVER u2r** (recorded as a durable lesson): u2r mandates
+  `--skip-architecture-step` (no client/server split) → can't faithfully run the client-only binding. u2r is OK only
+  for deterministic converter-unit checks (A6 plan emission).
 
 ## ── /drive run addressables-unit3-themes-20260617T080323 — Addressables Unit 3 (Themes) — 2026-06-17T04:00:11Z ──
 
@@ -3265,3 +3352,744 @@ The re-lowering changes the return from a raw tagged Instance to a `Character.ne
   - TrackManager.luau:204→:209 (unit2-proper, instantiatePrefab(GetCharacter(charName))) — POST-boot, Instance-expecting → DIVERGENT (table → player fails to spawn on Run).
   - ShopCharacterList.luau:39/:46-49 (dictionary()-value :GetAttribute) — POST-boot → DIVERGENT (table has no :GetAttribute → error on shop open).
 Per the tier-problems rule: root (boot) fixed in Phase 2; downstream-conditional (post-boot character-object consumers) scoped as a follow-on (followups.md). Phase 2 does NOT re-lower TrackManager/Shop and does NOT expand the mechanism, trigger, dead-module carrier, or .gameObject binding. SHAPE-SPECIFIC: unit2-proper affected; unit1 TrackManager.luau:152 passes the name string → unaffected. AC10 makes the boundary explicit so the divergence is disclosed, not a latent regression.
+
+<!-- promoted from /drive run trash-dash-playable-20260617T192649 (2026-06-18) -->
+# Decisions — trash-dash-playable-20260617T192649
+
+- Structural validator fix over a regex/name denylist: key the proven-vs-not decision on
+  whether the receiver resolves to a require()'d local module (deterministic upstream signal),
+  not on a method-name list. A denylist abstains silently the moment the AI emits a valid-but-
+  different shape.
+  Classification: Mechanical
+
+- Single-point fix in `roblox_call_validator.py`: it is the one source feeding both the
+  contract verifier and the `_repair_invalid_roblox_calls` reprompt path; fixing it there
+  corrects both without touching the reprompt loops.
+  Classification: Mechanical
+
+- Phase the downstream gameplay-spawn work behind a live Phase-1 verify: don't pre-scope
+  Addressables fixes against a masked, unobservable state — re-convert first, then scope from
+  the playtest.
+  Classification: Mechanical
+
+- Verify end-to-end via fresh `/convert-unity` conversion + Studio playtest, not unit tests
+  alone: the bug only surfaces on the integrated transpile→reprompt→runtime path.
+  Classification: Mechanical
+
+- Hold the secondary reprompt-degradation guard (reject a degraded/truncated reprompt
+  response, keep the original) as a design alternative, not a commitment; decide at Phase-1
+  detailed design.
+  Classification: Taste
+
+## Plan-stage decisions (trash-dash-playable) — 2026-06-17
+- Root cause anchored on a FRESH current-main conversion + live Studio playtest, NOT the stale unit2 build (which misled toward an already-merged storage fix). Classification: Mechanical.
+- Primary fix = structural change in roblox_call_validator.py (key on require()-binding-RHS provenance, not a method-name denylist). Classification: Mechanical.
+- Signal methods (:Connect/:Once/:Wait) recognized via a corpus addition, not a global validator special-case (avoids nonSignal:Connect bypass). Classification: Taste.
+- Two phases, staged-risk: Phase 2 (downstream Addressables gameplay) scoped ONLY after the Phase-1 re-convert + playtest reveals what the revived state machine exposes. Classification: Mechanical.
+- Phase-1 verification = cold-cache fresh conversion + Studio playtest; exit criterion is STRUCTURAL (4 state modules return valid class tables) + a run starts, not a lucky boot. Classification: Mechanical.
+- Reprompt-degradation guard held as a lean-include hardening candidate; decided at Phase-1 detailed design. Classification: Taste.
+- Verify END-TO-END (fresh /convert-unity-style conversion + Studio), not unit tests alone. Classification: Mechanical.
+- NOT re-fixing ServerStorage misrouting (already fixed on main by #199/#200 reachability closure). Classification: Mechanical.
+
+## Gate-A refinement (user challenge: "more elegant/general? prior work?") — 2026-06-17
+- PRIOR WORK identified: PR #197 (c85fb6f) built the whole roblox_call_validator — a provenance-gated validator + vendored corpus + bounded repair-reprompt, with a zero-FP fixture proof (6c66a2f). The bug is a FALSE-POSITIVE HOLE in that system.
+- MORE ELEGANT/GENERAL fix (replaces the original "new module track-state"): EXTEND #197's two existing mechanisms, don't add parallel machinery.
+  (1) Provenance: bind a `require(...)` RHS to the EXISTING `component` non-Roblox-table state in `_rhs_provenance` (roblox_call_validator.py:384) — the `.Instance` promotion-suppression for `component` bases (`:292`) already exists. DRY reuse, ~1 branch. Classification: Mechanical (clearer, reuses existing).
+  (2) Corpus: add RBXScriptSignal members (Connect/Once/Wait/ConnectParallel) via the EXISTING tools/refresh_roblox_corpus.py — data-driven, not a validator special-case. Classification: Mechanical.
+  (3) Extend #197's zero-FP fixture set with the Module.Instance:Method() + event:Connect cases. Classification: Mechanical.
+- Size dropped (~15-50 SLOC) vs the original framing because the fix reuses existing state rather than adding one. The user's challenge improved the plan.
+
+## Gate-A evidence revision (user challenge: "what does Phase 1 actually solve? prove it") — 2026-06-17
+- Cache forensics (.cache/llm, evidence-phase1-sufficiency.md) PARTIALLY REFUTED "validator FP fix alone -> full modules":
+  the broken state modules are reprompt-acceptance DEGRADATIONS (kept a `...` fragment), and the full
+  versions carry INDEPENDENT rule-a/b contract violations that fire the contract reprompt on their own.
+- DECISION: promote the reprompt-degradation guard from optional-secondary to Phase-1 PRIMARY/load-bearing
+  (keep the better of {original, reprompt}; never accept a structurally-worse/fragment output). The validator
+  FP fix stays as a quality lever (fewer spurious reprompts). Classification: Mechanical (evidence-forced).
+- DECISION: Phase-1 exit criterion is STRUCTURAL + empirical (4 modules return valid class tables + load on a
+  COLD re-convert), explicitly NOT "a run starts." rule-a/b runtime correctness + gameplay spawning are
+  surfaced by the playtest and (gameplay) deferred to Phase 2. Classification: Mechanical.
+- What Phase 1 solves, bounded: state modules load -> state machine boots (the current hard blocker). It does
+  NOT by itself guarantee rule-a/b runtime correctness or gameplay spawning. Classification: Mechanical.
+
+## Phase-1 detailed-design decisions — 2026-06-17
+- Reprompt-degradation guard lives in a SHARED pure helper (`_reprompt_is_structurally_safe`) that BOTH `_verify_and_reprompt` AND `_repair_invalid_roblox_calls` call — the repair path has the identical unconditional-accept shape/risk; one predicate closes both (DRY). Classification: Mechanical.
+- "Structurally worse" defined CONSERVATIVELY: reject only on parse-loss (candidate fails parse while original parsed), top-level-return-loss, or size-collapse <50%; function-count-drop is a contributing signal only, never standalone. Biases to ACCEPT a smaller-but-correct reprompt (false-reject re-ships the original broken module = the costly error). Classification: Taste.
+- Length floor 0.5 (stricter than the existing 0.3 at `_reprompt_fix:2656`): a contract/repair reprompt should return a corrected FULL module; 0.5 clears every legitimate smaller-correct case and catches the 0.07-ratio fragment. Classification: Taste.
+- On guard rejection, re-surface the ORIGINAL violations as survivors reusing the existing failed/empty-reprompt branch shape; NO new warning tag (keeps the compliance-spike taxonomy stable; fails-closed at project level exactly as today). Classification: Mechanical.
+- KEEP the `component` state name and broaden its docstring (do NOT rename to `non_roblox_table`): a require'd module is the same class as a host-component result; the existing `.Instance` promotion-suppression already handles any `component` base. Rename = pure churn (TrackLit + 5+ sites + literal-asserting tests) for zero behavior change. Classification: Taste.
+- `_rhs_provenance` binds a `require(...)` RHS to `component` via a new `_is_require_call(rhs)` keyed on the BINDING RHS, not the variable name (a real Roblox var bound from `workspace:FindFirstChild` stays proven and is still checked; a require'd-local reassigned to a Roblox instance upgrades via the plain-reassign rule). Classification: Mechanical.
+- RBXScriptSignal members (Connect/Once/Wait/ConnectParallel) added via a curated constant unioned into `tools/refresh_roblox_corpus.py` then regenerate — they live in the API dump's data-type section the tool's `Classes`/`MemberType==Function` filter cannot reach, so the tool MUST supply them; routing through the corpus keeps `Connect` under the provenance gate (no `nonSignal:Connect` blanket bypass). Classification: Mechanical.
+- `nonSignal:Connect()` on a wrong-typed receiver is accepted-with-rationale / out of scope: the validator catches "nonexistent Roblox method NAME", not "method on wrong-typed receiver"; `Connect` is a real name. Classification: Taste.
+- Phase 1 = two slices FAN-OUT/parallel (1.1 guard in code_transpiler.py; 1.2 validator FP + corpus) — disjoint files, no shared NEW contract (the `find_invalid_roblox_calls` signature is unchanged), so fan-out allowed. The COLD-cache `/convert-unity` re-convert + playtest is a phase-integration step (criteria 15/16), not a slice dep. Classification: Mechanical.
+## Run door-binding-race (2026-06-17) — placement-order-robust Anim_* binding
+
+# Decisions — door-binding-race run
+
+## D1 — Root cause confirmed empirically (premise grounding)
+The F10 door-never-opens bug is NOT a domain bug (PR #195 already fixed that). It is a
+binding-PLACEMENT-ORDER race in the emitted `Anim_*` animation-driver LocalScript:
+`generate_tween_script()` (converter/converter/animation_converter.py) emits a ONE-TIME
+startup scan (`workspace:FindFirstChild(name,true)` + a one-pass `workspace:GetDescendants()`
+fanout, no DescendantAdded/retry). Generic scene-runtime places the Door prefab at RUNTIME
+(scene_runtime.luau instantiatePrefab/_constructPrefabClone) AFTER the LocalScript's scan ran,
+so the script binds nothing and the door never tweens.
+- Fix lever: the binding template in generate_tween_script() — deterministic Python, has tests.
+- Fix approach (general): placement-order-robust binding — a workspace.DescendantAdded listener
+  that wires late-arriving same-named targets into the param-driven tween, preserving the eager
+  scan for parts that already exist at boot. Applies to ANY Animator-driven animation (generic).
+- baseRef: upstream/main @ 5b3efaa (includes #207). PRs target ntornow upstream.
+
+## D2 — Late-arrival mechanism: workspace.DescendantAdded (not retry-poll)
+Event-driven binding is order-robust by construction and has no poll window/timeout
+to tune; the runtime prefab placement is a discrete event the listener catches.
+Classification: Taste (close call vs bounded poll; design recommends DescendantAdded).
+
+## D3 — Ride the existing `not _ownerIsContainer` guard for the late-arrival path
+The guard already separates the flat-list scene-scoped driver (door's case, late
+listener REQUIRED) from the per-clone prefab-scoped driver (already binds its own
+instance, MUST NOT start a workspace-wide listener). The late-arrival path has the
+identical scoping need, so it emits under the same condition — keeps prefab-scoped
+shape unregressed. Classification: Mechanical.
+
+## D4 — Factor a single `bind(_t)` step shared by eager scan + late listener
+One closure per param branch (bool keeps its `_isActive` open/close state machine;
+int keeps its replay), called by both the boot loop and DescendantAdded, with a
+`_bound` set for idempotency. Guarantees boot and late paths are semantically
+identical. Classification: Mechanical.
+
+## D5 — Apply current param state on late bind
+A target placed after its param already flipped open should snap/tween to the active
+state on bind, not stay closed until the next flip. Read attribute on bind; drive
+playAnimation if active. Default-attribute write only when currently nil (don't
+clobber a runtime-set value). Classification: Taste.
+
+## D2 — Hoist late-arrival binding above the boot-target early-return (round-1 BLOCKING)
+The DescendantAdded listener must NOT be nested under the `if not target then return end`
+in generate_tween_script (animation_converter.py:1305-1308): for a door absent at boot the
+script returns before reaching it. Fix: in the scene-scoped (`not _ownerIsContainer`) case,
+don't hard-return on nil boot target — emit listeners + late-arrival path keyed on the
+compile-time name constant (target_name/clip.name/curve_roots), not a runtime target.Name.
+Classification: Mechanical (required for correctness).
+
+## D3 — DescendantAdded resolves on ANY matching event, not only the Model's own (round-1 MAJOR)
+A named Model can fire DescendantAdded before its PrimaryPart/BasePart exists. Listener matches
+same-named Model OR same-named BasePart so the target binds whenever a usable instance arrives.
+`_bound` weak-keyed / dropped on destroy to avoid unbounded retention. Classification: Mechanical.
+
+## D4 — No target-dependent prologue on the nil-boot path (round-2 BLOCKING)
+Removing the early-return is insufficient: Model-normalization (1310-1313) and `_initialTarget`
+(1331) dereference `target` and throw on nil. Structural rule: guard ALL target-dependent prologue
+inside `if target then ... end`; the param-listener + DescendantAdded emission runs unconditionally,
+keyed on compile-time name constants. Boundary ~1263-1331. Classification: Mechanical.
+
+## D5 — Reachability confirmed: generalize to the SHARED layer (all 4 trigger shapes)
+Empirical evidence (conversion run 2026-06-17T09-17-02, SimpleFPS generic):
+- The bug lives in the SHARED boot-scan + early-return (generate_tween_script:1305-1308), inherited by
+  ALL trigger branches: bool param, int param, loop-autoplay (1388-1392 / 1628-1632), play-once (1393-1395 / 1633-1635).
+- SECOND reachable symptom found: `Anim_HostilePlane_HostilePlane_Flying.luau` is a LOOP-autoplay anim
+  targeting the `HostilePlane.prefab` — a RUNTIME-placed prefab (1 entry in scene_prefab_placements,
+  same as Door's 6). Its script lives in ServerScriptService (global container) and does
+  `workspace:FindFirstChild("HostilePlane")` + early-return → the flying loop never starts (currently broken).
+DECISION: hoist the placement-order-robust binding to the SHARED layer so bool/int/loop/play-once ALL
+bind runtime-placed targets via one scaffold (eager scan + DescendantAdded late-arrival, gated on runtime
+`not _ownerIsContainer`); per-branch action varies trivially (connect listener / task.spawn loop / play once).
+Side effect (improvement): loop/play-once gain multi-instance fanout (previously single-target).
+Classification: Taste (scope width — user chose "general fix, verify reachability first"; reachability verified).
+
+## D6 — Per-iteration yield floor on the loop (round-4 MAJOR)
+The task.spawn loop emits `RunService.Heartbeat:Wait()` per iteration so a contentless clip
+(curves all simplify <2 keyframes → playAnimation never yields) cannot tight-spin and freeze the
+DataModel. Without it the fix would worsen "never animates" into "freezes" for a loop on a
+runtime-placed prefab. RunService already imported (1251). Detailed design SHOULD also skip the loop
+for no-content clips, but the yield floor is load-bearing. Classification: Mechanical.
+
+## D7 — `_bound` is a weak-key table, not a strong set drained on destroy (detailed-design)
+`setmetatable({}, {__mode="k"})`: a destroyed BasePart key is GC'd automatically → no unbounded
+retention (the only `_bound` concern, design.md §4) and zero per-instance lifecycle code (no
+`.Destroying` connect to remove keys). The loop branch's `while _t and _t.Parent do` guard
+independently stops work on a destroyed instance, so weak-key vs strong-drop is not load-bearing for
+correctness — choose the lower-code weak-key form. Classification: Mechanical.
+
+## D8 — Factor ONE Python emit helper for the bindTarget/scan/listener scaffold (detailed-design)
+`_emit_placement_robust_binding(lines, clip, match_names, action_kind, param_name)` emits the
+byte-identical bindTarget closure + `_bound` weak table + eager `bindTarget(target)` + GetDescendants
+fanout + DescendantAdded listener, dispatching only the per-shape ACTION body (bool/int/loop/once) and
+the param name. Rationale: the scaffold is identical across all four shapes and the match-name
+precedence (target_name → curve_roots → clip.name) must be computed ONCE and used in two emit sites
+(fanout + listener) so they cannot drift; four inline copies would be ~100 duplicated emitted-template
+lines and would fracture the shared contract. Strict typing: `list[str]` / `Literal[...]` / `str`, no
+`Any`. Classification: Mechanical.
+
+## D9 — Skip the loop AND keep the yield floor for no-content clips (detailed-design)
+Emit BOTH guards (belt-and-suspenders, per design.md §1 step-1 loop bullet): the load-bearing guard is
+the unconditional per-iteration `RunService.Heartbeat:Wait()` yield floor (cannot tight-spin even if the
+content predicate is ever wrong); ADDITIONALLY, when the clip has no surviving tween content (every
+curve simplifies to <2 keyframes — the same predicate `_generate_curves_code` uses at 1413-1415), emit a
+single `playAnimation(_t)` instead of the `task.spawn` loop, since a contentless loop animates nothing.
+The yield floor remains the authority; the content-skip is an optimization that also reads cleaner.
+Classification: Mechanical.
+
+## D10 — Hoist `_ownerIsContainer` to the shared prologue (detailed-design)
+Currently `_ownerIsContainer` is computed twice inside `_generate_parameter_driven_playback` (bool 1575,
+int 1609) and absent from the loop/play-once fallback. The unified scaffold needs it BEFORE the
+early-return (to gate the return) and in all four shapes (to gate fanout/listener), so emit it ONCE in
+the prologue (just after boot-resolve) and delete the two in-function copies. The early-return becomes
+`if not target and _ownerIsContainer then return end`. Classification: Mechanical.
+
+## D11 — Match set is a SUPERSET of the old resolved-name fanout (phase-design round 1, codex MAJOR)
+NEW match keys on compile-time literal(s) PLUS the resolved target.Name (added at runtime when a boot
+target exists). NEW >= OLD => never regresses which instances match (incl. the Model "Door" -> part
+"door" case); the literal adds the nil-boot late-arrival capability. For real door/plane both reduce to
+the same single name. Classification: Mechanical (no-regression hardening).
+
+## D12 — AC12 covers test_generate_rotation_tween (phase-design round 1, Claude MAJOR)
+test_generate_rotation_tween:1054 asserts the removed `while true do`; AC12 now requires updating EVERY
+test asserting the removed shape (grep `while true do`/`_targets`/`_ownerIsContainer`). Classification: Mechanical.
+
+<!-- ===== /drive run rifle-mount-diag-20260617T215229 (2026-06-18) ===== -->
+# Decisions — rifle-mount-diag run
+
+## Phase 2 (design-phase2.md) — player-alias receiver routing
+
+- **D-P2-1 (interface placement).** Player-alias branch lives in `sendMessage`/`broadcastMessage`
+  BEFORE `_resolveReceiverGoId`; the resolver stays single-id and byte-for-byte unchanged. Rationale:
+  player alias maps to a LIST of goIds (single-return resolver is the wrong shape) + zero-diff
+  guarantee for the Phase-1 non-player path (doors/fires/turrets). Classification: workflow/domain.
+- **D-P2-2 (explicit IsA guard).** `_isPlayerAlias` uses an explicit `pcall`-wrapped
+  `recv:IsA("Player")` plus `playerFromTouch(recv)`, never a duck-typed/field-sniff check — else the
+  live `plr` (`Players`-service object) symptom persists. Classification: universal-candidate.
+- **D-P2-3 (player goIds, not instances).** `_playerGoIds` mirrors `_playerRigInstances`'s walk
+  (`meta.scriptId == _player._playerScriptId`, dedupe) but collects `meta.gameObjectId` (what
+  `_dispatchToGameObject` keys on), NOT `meta.gameObjectInstance`. Classification: workflow/domain.
+- **D-P2-4 (broadcast = flat per-goId, no subtree descent for a player alias).** A player-alias
+  `broadcastMessage` dispatches to each player goId WITHOUT the descendant walk (logic singleton, no
+  corpus player-rooted broadcast, walk would only re-hit the same components). Non-player broadcast
+  keeps the Phase-1 descendant walk. Classification: workflow/domain.
+- **D-P2-5 (>1 character-controller MODULES fail-close to no-route).** `_player == nil` →
+  `_playerGoIds` returns {} → warn + no dispatch (= current `_initPlayerAuthority` behavior; one camera
+  per client). Distinct from >1 rig INSTANCES of one module, which all dispatch (P2-F). Classification:
+  workflow/domain.
+- **D-P2-6 (live test is the gate).** Cold `/convert-unity` SimpleFPS + Studio Play (rifle mounts on
+  camera WeaponSlot AND fires) is the acceptance authority — NOT the seeded `luau` unit tests
+  (green-test-can-pass-for-the-wrong-reason). Classification: universal (already canonical).
+
+## Phase 2 — round-1 dual-voice review fold-ins
+
+- **D-P2-7 (nil-`_player` fail-closed — refutes codex round-1 BLOCKING).** `_isPlayerAlias` may match a
+  live `Player` object while `self._player` is nil. This is SAFE at the doc level: `_playerGoIds()`
+  guards `if not p or not p._playerScriptId then return {} end`, so it NEVER indexes
+  `_player._playerScriptId` on a nil `_player` — it returns `{}`, and the caller treats empty as
+  warn + no-route. A Player-object receiver under 0/>1-character-controller (nil `_player`) fail-closes
+  to a no-op, never a runtime error. The BLOCKING is refuted in design (Interfaces section + edge case 4).
+  Classification: workflow/domain.
+- **D-P2-8 (`playerFromTouch` breadth — codex MAJOR #3).** Branch (b) `playerFromTouch(recv)` runs for
+  non-player receivers too; it resolves ONLY a character/limb belonging to a player's character model
+  and returns nil otherwise, so doors/fires/turrets (never parented under a player character) take the
+  unchanged Phase-1 path. Boundary/documented limit: a non-player object deliberately parented inside a
+  player character WOULD be treated as a player alias — not exercised by any corpus site. New edge case
+  8. Classification: workflow/domain.
+- **D-P2-9 (multi-goId fan-out / "multiple rifles" — codex MAJOR #4).** `>1` distinct goId →
+  dispatch to each (intended Unity multi-GameObject semantics); single-embodiment (one Player module on
+  one GameObject) → exactly one goId → exactly one dispatch (no duplicate rifle). New edge case 9 + an
+  AC-1 assertion that dispatch count == `#_playerGoIds()` (== 1 in the single-embodiment fixture), so a
+  double-registered player rig is caught. Classification: workflow/domain.
+
+## D-FIN2 (finalize scope after v4 redesign) — Classification: workflow/domain
+The v3 finalize CONVERGED at a3451a4 (de-slopped phase 1). The v4 redesign added phase 2 on top
+(now drive tip 364699d). Re-running finalize's de-slop/logic lenses over the WHOLE c30c259..364699d
+diff would re-audit already-finalized clean phase-1 code (review-churn). Scope this finalize's
+code lenses to the NEW work since the converged v3 finalize: a3451a4..364699d (the phase-2 delta);
+whole-run read context retained for aggregate awareness. The terminal review-finalize-2.md still
+binds the full featureBranch tip 364699d (ship-gate R==tip holds).
+
+## ---- /drive run mesh-fidelity-20260619T232452 (promoted 2026-06-19T16:22:45Z) ----
+
+# Decisions — mesh-fidelity-20260619T232452
+
+## PLAN-stage design choices
+
+- **`MESH_ROBLOX_MAX_FACES = 20_000`** — documented Roblox per-mesh triangle limit since ~2021. Classification: Mechanical (matches platform spec the task cites).
+- **Clamp semantics `min(max(target, floor), cap)`** — quality floor may raise the target; the hard cap always wins so output never exceeds what Roblox accepts. `MESH_TARGET_FACES = 8_000` left unchanged (only the cap was stale). Classification: Mechanical.
+- **Quarantine at the single invariant site (`pipeline.py:2820–2851`)** — on an embedded-mesh key resolving to ≠1 sub-mesh, drop it from freshly-parsed `mesh_hierarchies` + `mesh_native_sizes` before merge, and append to `ctx.asset_upload_errors`. Keep the existing `log.warning` as the diagnostic. Classification: Taste (chose single-source-of-truth quarantine over a separate pass).
+- **No `scene_converter.py` change** — its face-decal/no-mesh fallback already fires on key-absence from the hierarchy tables (read-confirmed in `_resolve_mesh_geometry`/`_resolve_sub_mesh`), so upstream quarantine is sufficient. Classification: Taste (avoid redundant downstream gate).
+
+## Single phase
+- One phase, one slice. Both fixes are independent, disjoint-file, ≲25 logic SLOC total → no fan-out and no staged-risk seam. Classification: Mechanical (default-to-one-phase).
+
+
+## Design review r1 (2026-06-19) — BLOCKING: bug-2 binding gate is uploaded_assets, not hierarchy tables
+Classification: Mechanical (root-caused against real code by the Claude voice; codex text-only missed it).
+Revise design: bug-2 quarantine must also drop the key from `uploaded_assets` (the table _resolve_mesh_id
+reads), detailed design to verify the mesh-less node reaches the face-decal/no-geometry path. Fold MINORs:
+(1) note bug-1 decimation path is currently unwired (latent fix + test pin; don't claim real-output change);
+(2) also pop the quarantined key from the merged/ctx dicts, not just the pre-merge fresh dicts.
+
+## Revised decisions (post-r1, against real code under converter/converter/)
+
+- **Bug-2 quarantine mechanism (REVISED)** — at the invariant site (`pipeline.py:2820–2851`), drop the
+  offending embedded key from THREE table sets and append to `ctx.asset_upload_errors`:
+  (1) `mesh_hierarchies` + `mesh_native_sizes`, (2) `ctx.uploaded_assets` (the MeshId binding gate read by
+  `_resolve_mesh_id` at `scene_converter.py:2892–2896`), (3) the MERGED/`ctx` dicts, not just the pre-merge
+  fresh dicts (merge is `{**existing, **fresh}` → a prior-rerun `ctx` key survives a pre-merge-only drop).
+  Same `f"{rel}#{file_id}"` key shape in both tables (`pipeline.py:2014`), recognised by `is_embedded_mesh_key`.
+  Classification: Mechanical (binding-gate root-caused against real code; the round-1 "hierarchy-tables-only,
+  no scene_converter change" claim was FALSE — size-only, MeshId still bound to leaked geometry).
+
+- **Verified end-state — NO `scene_converter.py` change needed** — with the key absent from `uploaded_assets`
+  AND `mesh_hierarchies`, `_resolve_mesh_id` returns `None` via membership-guarded `in` checks (no KeyError):
+  `_resolve_sub_mesh`→None, embedded-candidate lookup misses, `.prefab` path is not an `uploaded_assets` key.
+  `part.mesh_id` is never set (`scene_converter.py:1889`); sizing falls to `_compute_mesh_size_from_fbx_bbox`
+  (reads FBX, not the tables) / unity-scale fallback → MeshPart with no MeshId = existing colored-part /
+  face-decal fallback, crash-free. Classification: Taste (skip a redundant downstream guard the trace proves
+  unnecessary). If the trace had shown a KeyError, the fallback was a `scene_converter` guard on
+  `asset_upload_errors`; it is not needed.
+
+- **Bug-1 is a LATENT fix (MINOR folded)** — `decimate_mesh`/`needs_decimation` have NO production callers
+  (grep-confirmed; test-only references). Meshes upload raw, Open Cloud decimates server-side. Cap bump
+  (20_000) + clamp are correct and test-pinned, but the design/PR must NOT claim they change real conversion
+  output today. Classification: Mechanical (latent correctness + spec-accuracy).
+
+## Stage-1 autoplan skipped (proportionality)
+Classification: Taste. Ran the dual-voice design review (the load-bearing P1 gate — it caught + fixed a
+real BLOCKING). Skipped the full gstack autoplan (CEO/Design/Eng/DX) as disproportionate for a ~30-SLOC
+internal mesh-pipeline correctness fix with no product/UX surface. Per OPERATING.md right-size-at-design.
+
+## Phase-1 DETAILED-DESIGN choices (2026-06-19, against real code @ eb8f452)
+- **File layout (verified):** `config.py` is at `converter/config.py` (NOT `converter/converter/`); constants at lines 173–175. Clamp line is `mesh_processor.py:168`. Quarantine site `pipeline.py`, ctx-merge at 2847–2851 (log.warning loop 2830–2841). `_resolve_mesh_id` 2882–2933, embedded lookup 2917–2921. Classification: Mechanical.
+- **Bug-2 extracted as a pure module-level helper `_quarantine_bad_embedded_meshes(mesh_hierarchies, mesh_native_sizes, uploaded_assets, upload_errors)`** — mutates in place, returns quarantined keys, called once right after the ctx merge (post-merge). Single source of truth at the invariant site (honors locked "no second pass"); makes the quarantine unit-testable without the Open Cloud resolve round-trip. log.warning diagnostic kept. Classification: Taste.
+- **Quarantine operates on `self.ctx.*` (merged dicts), pops all three slash directions of the embedded key from `uploaded_assets`** (mirrors `_embedded_key_candidates`), discovers offending keys via `mesh_hierarchies.items()` + `is_embedded_mesh_key` with `len(subs) != 1` (covers 0 and ≥2). Satisfies the post-merge + slash-variant pins. Classification: Mechanical.
+- **Bug-1 existing tests survive the bump** — `test_mesh_processor_decimation.py` passes `max_faces=10_000` as an explicit arg, not the default constant; no test asserts the default value. Update the stale module docstring ("currently 21,844 faces" → 20_000). Classification: Taste.
+- **Single slice confirmed at detailed design** — disjoint files, no fan-out / staged-risk, ~25–30 SLOC; the bug-2 helper + its single call site stay in one review unit (shared contract). Classification: Mechanical.
+
+## Phase-1 integration review — proportionate (single-slice)
+Classification: Taste. phaseInt is a clean FF of the already-dual-voice-reviewed slice (identical content).
+Recorded CONVERGED on the integration suite (4014 passed, no-Any) + the slice dual-voice pass rather than
+burning a duplicate full review round on byte-identical code. Per OPERATING.md right-size-at-design.
+
+## Finalize r1 — bug-1 was deeper than framed: decimation was entirely non-functional (positional arg)
+Classification: Mechanical (empirically root-caused). decimate_mesh passed the face count positionally to
+trimesh's simplify_quadric_decimation(percent=…, face_count=…) → ValueError → except → un-decimated original.
+So bug-1 is NOT merely a stale-constant/clamp latent fix: whenever a decimation backend IS present the path
+was broken (no decimation, oversized meshes shipped). Fixed with face_count= keyword; output now strictly
+bounded by the (clamped) cap. decimate_mesh still has no production caller today (impact latent until wired),
+but the fix makes the path actually correct. Surface this corrected framing at Gate B.
+
+## Verify stage skipped (no UI/URL; real-upload check low-yield)
+Classification: Taste. The change is converter-internal (no UI/URL surface to qa-only/browse). The Gate-A
+deferred 20k real-upload acceptance check is now low-yield (decimate_mesh has no production caller + no
+decimation backend in-env, so a live conversion wouldn't exercise the clamp). Documented as a followup;
+verification rests on the unit suite (4016 passed) + the strict <=cap real-path tests (active with a backend).
+
+
+# Decisions — trash-dash-phase2 run
+
+## Phase 3 — ThemeDatabase SO-seed population (gap #5a)
+
+- **D-P3-1.** Fix the dict-store SO-DB by **rewriting the transpiled `LoadDatabase`**
+  (consumer-lowering, Option A), NOT by extending the list-store seed+shim
+  (`_build_theme_seed_plan` / `seedAddressableDatabases`). The store the consumer reads
+  (`GetThemeData` → `themeDataList[type]`) is a **closure-private LOCAL upvalue** in the
+  transpiled output, unreachable by any external shim — so the DB module itself must own
+  its own keyed write. Endorsed by codex (xhigh) over options B (shim-into-public-setter)
+  and C (generalize drain-bind to keyed-local stores). Direct precedent:
+  `converter/converter/roster_consumer_lowering.py` already does exactly this region-rewrite
+  for the prefab `<GameObject>` roster analogue. **Classification: converter-architecture.**
+
+- **D-P3-2.** Key the lowering on the deterministic `LoadAssetsAsync<SOType>("<label>")` C#
+  ownership + the SO-seed surface (`resolve_scriptable_object_addressables`), never the
+  AI-output fingerprint or a per-game string. Fail-closed (`SoDbUnresolved` →
+  `FailClosed(kind="so_db_unresolved")`) when the rewrite TARGET cannot be located in the
+  AI output. Named blind spot: the trigger is upstream-deterministic, but the rewrite
+  target lives in non-deterministic AI output, so target-location failure fails loud, not
+  guesses. **Classification: converter-generality.**
+
+- **D-P3-3.** Leave the list-store seed/shim path (`_build_theme_seed_plan`,
+  `seedAddressableDatabases`) intact for genuine list-store DBs; the new lowering
+  supersedes it ONLY for the keyed-dictionary SO-store shape. The gate-(b) regex fix
+  (`_CS_METHOD_HEADER` control-keyword exclusion) benefits BOTH paths. **Classification:
+  converter-architecture.**
+
+- **D-P3-4 (phasedesign3 BLOCKING 1).** Place the SO-DB consumer-lowering in
+  `pipeline.py`'s `write_output`, as a NEW method `_lower_so_db_consumers` SIBLING of
+  `_build_theme_seed_plan` (call site right after it, pipeline.py:7236-7242), NOT in
+  `contract_pipeline.transpile_with_contract` next to the roster call. Reason: the SO surface
+  needs `so_map` (emitted-SO GUIDs from `_build_scriptable_object_module_map`), which does not
+  exist until `write_output`; `transpile_with_contract` runs earlier (from `transpile_scripts`)
+  and reads ONLY the plan-time-persisted prefab `by_label`. `_build_theme_seed_plan` is the one
+  place `so_map`, `so_addr` (`resolve_scriptable_object_addressables`), the placed luau source
+  (`source_by_name` ← `rbx_place.scripts[*].source`), and the per-module C#
+  (`_find_cs_source_for_module`) all coexist, and it runs before the plan/entrypoints emit, so
+  mutating `RbxScript.source` there reaches the emitted output. **`contract_pipeline.py` is no
+  longer touched by this phase.** Verified against the detached Phase-1&2 worktree
+  `…/wt/design3` (`transpile_with_contract` reads `by_label` only; `_build_theme_seed_plan` at
+  pipeline.py:7372 has all four inputs in scope). Classification: **converter-architecture.**
+
+- **D-P3-5 (phasedesign3 BLOCKING 2).** ENFORCE roster/SO-DB disjointness (a shared label can
+  appear in BOTH the prefab `by_label` and the SO `by_label` — prefab narrowing drops SO *guids*,
+  not the label *key*), with TWO deterministic guards in the NEW module + the new orchestration
+  (NO edit to `roster_consumer_lowering.py`): (b) `find_so_db_consumers` BINDS `<T>` from
+  `LoadAssetsAsync<T>(...)` and produces a fact ONLY when the label's SO-surface guids resolve
+  to ≥1 emitted SO module — a `<GameObject>` load abstains; and (a) the SO finder abstains on any
+  `source_path` the roster lowering already claimed this run (`roster_claimed_paths`), preventing
+  a double-rewrite even in the pathological both-resolve case. The pre-existing roster-finder
+  `<T>` gap is GUARDED-AROUND here, not fixed (fixing it edits roster code + re-reviews the live
+  CharacterDatabase path — deferred to the filed followup). Keyed on the deterministic
+  `<T>`/SO-map/claimed-set facts, never a per-game string. Classification: **converter-generality.**
+
+## Slice 3.1 implementation notes (clarification, no design deviation)
+- **D-P3-4 (clarify §3f layers).** Confirmed empirically: layer (b) (`<T>`/SO-surface
+  gate) only distinguishes the roster vs SO DB when their labels resolve to DISJOINT
+  guids (the GameObject label's guids are prefab guids absent from the SO map). For a
+  TRULY-shared label (one label genuinely tagging an SO that both DBs load), both loads
+  resolve to the same SO guids and layer (b) claims BOTH — exactly the pathological case
+  the design names; layer (a) `roster_claimed_paths` is the enforcing guard there. This
+  matches design §3f intent ("could in principle satisfy both finders … layer (a) prevents
+  the roster finder's pre-existing gap from causing a double-rewrite"). Tests encode both.
+- **Lowering details:** the path resolver is INLINED into the rewritten `LoadDatabase`
+  (no module-level `local function` helper) so the region locator's state-decl walk-back
+  stays byte-stable across re-runs (idempotence). The keyed accessor (`GetThemeData`) is
+  LOCATED as the public method that is neither getter nor the load method; getters are
+  located by the state-local they return (nil-init -> dict getter, bool-init -> loaded).
+- **roster_claimed_paths re-derivation:** read-only via `find_roster_consumers` over the
+  off-disk prefab-narrowed `by_label` in the write_output window (touches no roster code).
+
+## Phase 3 HARDEN pass (drive-harden, 2026-06-18)
+- **P2-1 (lens 1) — ACTED: added pipeline-orchestration coverage.** The diff unit-tested
+  only the pure `so_db_consumer_lowering` functions + the gate-b regex; the production
+  `Pipeline._lower_so_db_consumers` orchestration (real input derivation: parse_addressables
+  → resolve_scriptable_object_addressables; per-module `.cs` re-read + `_derive_cs_load_ownership`
+  → `load_method_by_path`; the read-only `find_roster_consumers` re-derivation →
+  `roster_claimed_paths`; the fail-closed re-raise) was UNEXERCISED. Added
+  `TestLowerSoDbConsumersOrchestration` (5 tests) to `tests/test_theme_seed_plan.py`,
+  reusing the existing real `_make_project`/`_pipeline_with_state` harness. Drives the real
+  method end-to-end on the keyed-dict Luau shape. Verified the orchestration test FAILS if the
+  gate-b regex regresses (`load_method='if'` → `SoDbUnresolved`), so it is a genuine regression
+  guard, not green-for-wrong-reason. Classification: **converter-architecture (test coverage)**.
+  - Discovered while spiking: the orchestration keys `csharp_by_path` by `RbxScript.source_path`,
+    which production stamps at pipeline.py:3334 (`source_path=ts.output_filename`). The existing
+    `_pipeline_with_state` harness did NOT set it, so a naive reuse silently no-ops. The new
+    `_lower_pipeline` helper sets `source_path` to mirror production; a `test_orchestration_noop_without_source_path`
+    documents+guards that keying contract so the positive test can't pass for the wrong reason.
+- **P2-2 (lens 2) — CLASSIFIED filed-followup, NOT an in-scope bug.** `roster_claimed_paths`
+  cannot under-approximate relative to what the SO finder can act on: BOTH `find_roster_consumers`
+  and `find_so_db_consumers` iterate the SAME `csharp_by_path` (keyed by `source_path`), so a
+  module whose C# is unresolvable in the write_output window is invisible to BOTH finders — the
+  SO finder cannot rewrite a module the roster re-derivation didn't see. The only residual is the
+  pre-existing roster `<T>` gap (already filed; the §3f layer-(b)-is-tautological residual already
+  filed in followups.md round 2). No fix in this phase: a real fix touches `roster_consumer_lowering.py`
+  (scope expansion). Classification: **filed-followup, no current-input impact**.
+
+## Harden phase 3 — adjudication
+- **D-P3-6.** Overruled codex's harden lens-2 P1 (roster_claimed_paths under-approximation) as a
+  false-positive at the real integrated path: pipeline.py:7621-7654 passes ONE csharp_by_path to both
+  find_roster_consumers and find_so_db_consumers, so a module invisible to the roster re-derivation
+  (C# unresolvable → skipped from the dict) is equally invisible to the SO finder → cannot be
+  mis-routed/double-rewritten. Confirmed lens-1 P1 (orchestration test gap) and fixed it (5 tests).
+  Classification: **review-adjudication** (adversarial BLOCKING reproduced against the integrated
+  path, refuted, overruled WITH evidence — not silently dropped).
+
+## Phase 4 — gameplay spawn closure + residual bindings (detailed design, 2026-06-19)
+
+- **D-P4-1.** Gap #5 is THREE layers (re-diagnosed): L2 (theme prefab-id data) already works
+  post-Phase-3; L1 (5 `nil`+abort InstantiateAsync call sites in TrackManager.luau) and a
+  NEWLY-FOUND L0 (segment/obstacle prefabs never emitted as Templates — `addr_ids` only sources
+  AddressableAssetsData groups, not SO `.asset` AssetReference arrays; `prefab_packages.py:402`)
+  are both dead. L0 folded into this phase (slice 4.1) — L1 is unverifiable without it.
+  **Classification: converter-architecture.**
+- **D-P4-2.** L0 fix = a NEW SO-AssetReference prefab resolver in `addressables_resolver.py`
+  (symmetric with `resolve_scriptable_object_addressables`, but prefab-typed), unioned into
+  `addr_ids` at `pipeline._build_addressables_block`/`plan_scene_runtime` upstream of both
+  `select_emitted_prefab_ids` and `_generate_prefab_packages`, and fed to
+  `resolve_template_child_names`. Keyed on serialized `m_AssetGUID` + guid_index `.prefab`
+  classification — never a label/AI fingerprint. **Classification: converter-generality.**
+- **D-P4-3.** L1 fix = a coherence-pack-style call-site lowering (new
+  `spawn_call_site_lowering.py`, orchestrated in `write_output` like `_lower_so_db_consumers`):
+  identity-gated detection of `local v=nil`+`if v==nil then warn("Unable to load…") return end`
+  with an InstantiateAsync/LoadAssetAsync origin comment → rewrite to
+  `host.instantiatePrefab(<resolved prefab-id>, …)`. Fail-CLOSED + loud on shape/ref-resolution
+  miss (rewrite target in non-deterministic AI output — D-P3-2 precedent). Idempotent (twice-call
+  test). MUST key on the collision-resolved EMITTED template name, not the dangling registry
+  `template_name`. **Classification: converter-architecture.**
+- **D-P4-4.** Gaps #3 and #4 are the SAME defect class (planner emits a component/deferred row;
+  placement prunes the inactive host) in DISJOINT files → fan-out slices. #3 fix = producer-side
+  at `scene_converter._emit_dormant_holder` / planner (defer/resolve dormant-holder MonoBehaviour
+  descendants; prefer DEFER over eager placement to avoid duplicating the runtime rig). #4 fix =
+  producer-side at `ui_translator.py:394` (emit inactive UI subtree HIDDEN + keep recursing, so
+  the `_SceneRuntimeId` host clone lands; planner-side suppress is WRONG — kills SetActive-driven
+  popups). **Classification: converter-architecture.**
+- **D-P4-5.** Slices: 4.1 (L0+L1 spawn closure, foundation, no dep — keep L0+L1 together for the
+  shared prefab-id/Template-name contract); 4.2 (gap #3, fan-out, owns scene_converter/planner);
+  4.3 (gap #4, fan-out, owns ui_translator.py). 4.2 ∥ 4.3 disjoint from 4.1 and each other.
+  **Classification: decomposition (fan-out per design.md split commitment).**
+
+## Phase 4 — design review revisions (dual-voice FINDINGS, 2026-06-19)
+
+- **D-P4-6 (supersedes D-P4-3's detector premise — P1-1/P2-2).** The L1 detector is RE-ANCHORED
+  on the deterministic transpiler ORIGIN COMMENT (`Instantiate*`/`LoadAssetAsync<GameObject>`),
+  NOT a single `local v=nil`+warn-abort guard shape. Empirically against the REAL TrackManager.luau
+  the guard shape matches ONLY the segment site (484); the other rewritable sites diverge —
+  obstacle inverted `if obj~=nil` (547), consumable/premium bare `toUse=nil` reassign (599/612),
+  cloud `:Clone()` on a string (307). There are SIX origin sites (not five): the 6th is the
+  character site (168), which is already lowered to a scene-find degrade and EXCLUDED (no clonable
+  prefab). Five sites enter the rewrite set (segment/obstacle/consumable/premium/cloud).
+  **Classification: converter-generality (enumerate the real input space before locking the
+  abstraction).**
+- **D-P4-7 (P1-2).** The cloud site (`local obj = cloud:Clone()`, TrackManager.luau:307) is
+  BROKEN, not "works": C# `ThemeData.cloudPrefabs` is `GameObject[]` but the converter serializes
+  it as prefab-id STRINGS (themeData__86f154.luau), so `:Clone()` on a string errors at runtime.
+  It is folded INTO the L1 rewrite set (instantiate by prefab-id via `host.instantiatePrefab`),
+  not left as `:Clone()`. **Classification: converter-architecture.**
+- **D-P4-8 (corrects D-P4-2's write point — P1-3).** L0 must union the SO-prefab ids into the
+  PERSISTED `artifact["addressables"]` block (a new `so_prefab_ids` axis) BEFORE the freeze
+  `self.ctx.scene_runtime = dict(artifact)` (pipeline.py:1458), AND extend BOTH emit-gate consumer
+  loops (`pipeline.py:6500` and `:6752`) to read that axis. The emit gate re-walks the PERSISTED
+  block, NOT the local `addr_ids` (pipeline.py:1418) — unioning only into the local makes L0
+  half-work (names resolve via the :1438 name-pass, but Templates never emit). The local also gets
+  the union (for the name pass). **L1 target API: `self.host.instantiatePrefab(prefab_id, parent,
+  cframe)` (scene_runtime.luau:2846, dotted accessor :1067) — it resolves a `"<guid>:<path>"`
+  prefab-id string; NOT `PrefabSpawner.spawn(name, …)` (prefab_packages.py:79), which keys on the
+  bare Template NAME.** **Classification: converter-architecture.**
+- **D-P4-9 (P2-1).** The L0 SO walk is GATED on the emitted-SO `so_guids` set (mirror
+  `resolve_scriptable_object_addressables`, addressables_resolver.py:179-218 — positive evidence
+  an SO module was emitted), NOT a walk of every SO in the project. **Classification:
+  converter-generality.**
+- **D-P4-10 (slice structure re-justified, unchanged).** All five findings (P1-1/P1-2/P1-3/
+  P2-1/P2-2) land WITHIN slice 4.1; none introduces a new cross-slice contract. Structure stays
+  **4.1 (foundation) + 4.2 ∥ 4.3 (fan-out)** — 4.2/4.3 owns (scene_converter/planner;
+  ui_translator.py) remain disjoint from 4.1 and each other. **Classification: decomposition.**
+
+## Slice 4.1 implementation — consumable site DEFERRED (dual-voice deviation, 2026-06-19)
+
+- **D-P4-11 (deviation from AC2/AC6's literal 5-site set; consumable DEFERS).** The L1 lowering
+  rewrites FOUR of the five sites (segment/obstacle/premium/cloud); the **consumable site is
+  DETECTED but NOT rewritten** (fail-closed: skip + loud converter warning + filed followup).
+  Evidence (real materialized output): segment (`zone.prefabList[...]`), obstacle (`reference`
+  param), premium (`self.currentTheme.premiumCollectible` — materialized as a prefab-id STRING in
+  `themeData__*.luau:49`), and cloud (`cloud` from `cloudPrefabs`) all carry a PROVABLE prefab-id
+  STRING at the site. The **consumable** source `self.consumableDatabase.consumbales[picked]` is
+  accessed by the surrounding transpiled code as a STRUCT (`.canBeSpawned`, `.gameObject.Name`),
+  but the `Consumables` SO materialized `consumbales` as a bare prefab-id STRING list
+  (`Consumables.luau:7-11`) — the C# `ConsumableData {gameObject, canBeSpawned}` struct was
+  FLATTENED. So no prefab-id-string expression is provably available at that site, and the
+  surrounding code is already semantically broken (a separate SO-materialization mismatch, out of
+  this slice's scope). Force-rewriting would convert a loud, diagnosable mismatch into a SILENT
+  host-call mis-resolution. **Both review voices converged: codex (adversarial) — "DEFER: if the
+  recovered source is not provably a prefab-id string, rewriting mis-resolves; fail-closed is
+  correct"; design-Claude — "detect-but-skip with a loud warning + filed followup for the SO
+  flattening is the faithful reading of fail-closed-over-guess." The faithful reading of AC2/AC6 is
+  that the rewrite applies where the prefab-id-string contract holds.** Filed the consumable
+  SO-struct-flattening as the root-cause followup. **Classification: converter-generality
+  (fail-closed over guess on AI output; enumerate the real input space).**
+
+## Slice 4.2 — Gap #3 dormant-holder descendant trigger-nil (implement)
+- **Fix site: planner `_walk_scene` (producer), not `_emit_dormant_holder`.** `SceneNode.active = bool(m_IsActive)` is SELF-active. The bug host (CharacterSlot) is self-active under an inactive parent (PlayerPivot). scene_converter never places descendants of an inactive node in ANY mode (legacy prunes the subtree; generic emits a childless dormant holder — `_emit_dormant_holder` does not recurse). So the deterministic build fact is "host has an INACTIVE ANCESTOR" → suppress its instance row + references + lifecycle entry. Threaded a `ancestor_inactive` bool down `_visit`; propagate `ancestor_inactive or not node.active` to children.
+- **Self-inactive does NOT suppress.** An inactive-but-referenced node gets its own dormant holder, so its OWN MonoBehaviour rows resolve to it (preserves existing `test_disabled_monobehaviour_recorded_with_enabled_false`). Only DESCENDANTS of an inactive node are never-placed.
+- **`runtime_bearing.add` kept before the suppression `continue`** (per design "keep runtime_bearing so the module still emits"). `_build_modules_table` keys on set membership, not instance existence — verified no consumer requires an instance row per runtime_bearing script (codex Q2 confirmed). The class may also run on a runtime-instantiated rig.
+- **Prefab walk (`_walk_prefab`) left untouched.** `_convert_prefab_node` does NOT prune on `node.active` — inactive prefab descendants ARE emitted as parts. The dormant-holder non-recursion is scene-converter-specific, so the bug is scene-side only. Applying suppression to prefabs would over-suppress placed prefab content.
+- **Codex (gpt-5.4, xhigh) review of the approach: confirmed all 4 questions** (correct boundary; runtime_bearing-kept safe; apply all modes; no over-suppression of placed triggers). Log: codex-raw-4.2.log.
+
+## Slice 4.3 — Gap #4 inactive UI subtree emission (impl)
+- Implemented exactly the design §B Gap #4 spec: removed `ui_translator.py:394`
+  `if not node.active: return None`. The element is now created with the existing
+  `visible=node.active` (ui_translator.py:464) → an inactive node lands hidden
+  (`Visible=false`), its `_SceneRuntimeId` is stamped (:470), and child recursion
+  (:535) proceeds, so the 3 named deferred-component host clones (ConfirmPopup
+  1918594629, VisitUnityButton 1834564028, VisitGameChangerButton 375939466) land.
+  No new code path needed — `visible` was already wired to active; pruning was the
+  only blocker. Runtime `_applyPlannerFlagsAndTag` keeps the woken subtree inactive
+  until a script `SetActive(true)`s it (no visible-at-boot regression).
+- Tests: added `TestInactiveUiSubtreeEmission` (AC4 host-clone landing, AC8
+  emitted-not-pruned, hidden-not-visible E6, active-subtree-unchanged, nested
+  inactive-within-inactive, bug-guard). 4/5 new tests fail against the restored
+  pre-fix prune (verified); active-subtree-unchanged correctly passes pre-fix.
+  Full fast suite 4046 passed / 47 skipped; no-Any gate pass.
+
+## Slice 4.1 review fixes (2026-06-19) — 2 P1 + P2s
+
+- **P1-1 (cloud no-gate wrong-region rewrite):** `_locate_cloud` now gates the
+  `:Clone()` rewrite on a `-- …Instantiate(…` origin comment in the contiguous
+  comment block IMMEDIATELY above the `local v=expr:Clone()` shape
+  (`_instantiate_comment_above`: blank/comment lines may intervene; a code line ends
+  the block, so an unrelated earlier comment cannot leak down). REPRODUCED the
+  corruption pre-fix: real Pooler.luau (`local obj = original:Clone(); obj.Parent =
+  Workspace`, no comment) was rewritten; post-fix it is byte-identical. The other 4
+  real `:Clone()` modules (AllLaneObstacle/PatrollingObstacle/GameState/LoadoutState)
+  have no `.Parent=` on the next line so never matched, but Pooler did.
+- **P1-2 (game-specific keys):** obstacle re-keyed off `SpawnFromAssetReference` →
+  recovers the prefab-id STRUCTURALLY from the transpiler's `local _ = <param>`
+  discard (else the enclosing function's first param, guarded against binding `self`
+  for dot-form methods). Premium/consumable merged onto the shared
+  `Addressables.InstantiateAsync` marker + `<v>=nil`+warn-abort shape; split by
+  POSITIVE prefab-id evidence (`_extract_prefab_id_expr`: rewrite iff the warn
+  `tostring(<EXPR>.[Nn]ame)` exposes an <EXPR> NOT routed through `.gameObject`;
+  consumable's struct-flattened `…gameObject.Name` defers). Scans ALL InstantiateAsync
+  matches (consumable precedes premium in source order) — a `.search`-only approach
+  would have wrongly abstained premium.
+- **P2 uniform fail-soft:** segment/obstacle/instantiate-async/cloud all LOG on
+  origin-present-but-shape/expr-absent drift (cloud guarded so the idempotent re-run,
+  which has the comment but no live `:Clone()`, does not trip it).
+- **P2 green-for-wrong-reason:** extracted `prefab_packages.collect_addressable_prefab_ids`
+  (the SINGLE persisted-axis reader both pipeline emit-gate arms now call); the
+  persisted-axis test drives that REAL helper (proven RED when the helper drops the
+  so_prefab_ids read). Real-TrackManager coverage moved to vendored real-shape
+  fixtures (hermetic) + a `test_real_diag_outputs_when_present` cross-check that
+  skips loudly only when the diag tree is absent.
+- **P2 resolver typing:** `resolve_so_assetref_prefab_ids` param re-typed
+  `GuidIndexLike` (drop the `object`+`cast`); two pre-existing siblings keep their
+  `object`+cast (out of slice scope).
+- Codex re-review (corrected artifact): obstacle `self`-misbind → hardened
+  (fail-closed). Cloud "pooler inherits an Instantiate comment block" + premium "warn
+  via temp/helper" findings are FALSE-POSITIVES on the real path (real Pooler has no
+  Instantiate comment; real premium is literally `tostring(…name)`) — overruled with
+  evidence, filed as output-fingerprint blind-spot residual (no speculative code).
+
+## D-P4-6 (slice 4.2, phase-integration P1 fix)
+- **Decision:** Narrowed 4.2 gap #3 ancestor-inactive row suppression with a UI carve-out: `if ancestor_inactive and node.file_id not in ui_go_fids: continue` (scene_runtime_planner.py `_walk_scene._visit`). UI hosts (under a Canvas) under an inactive ancestor KEEP their planner instance row so the 4.3 ui_translator deferred host clone binds via `awaitUiHost` (driven by the `instance_owner_is_ui` row). Gap #3 scene/world dormant-holder descendants stay suppressed.
+- **Why:** un-gated suppression deleted the gap #4 deferred-UI-host rows (ConfirmPopup/OpenURL/missionPopup under inactive AboutPopup), re-introducing the planner-side UI suppression D-P4-4 declared WRONG and negating 4.3. `ui_go_fids = _scene_ui_go_fids(scene)` was already in `_visit` scope.
+- **Test:** `test_inactive_ancestor_ui_host_under_canvas_keeps_row` (Canvas→inactive AboutPopup→active OpenURL button) — proven RED against 922b27f (row==[]), green with fix. Gap #3 tests stay green.
+
+## Phase 4 HARDEN (drive-harden, 2026-06-19)
+
+- **BUG FIXED (P1) — spawn lowering premium/consumable warn paren over-close.**
+  `spawn_call_site_lowering._instantiate_async_outcomes` re-emitted the original
+  `warn(...)` by splicing the captured `warn` regex group (which ALREADY closes
+  `tostring(`+`string.format(`+`warn(` with three trailing `)`), then the replacement
+  template added a FOURTH `)` via `warn(string.format({warn})`. On the real
+  TrackManager.luau the premium rewrite produced `...premiumCollectible.name))))`
+  (1 open / 4 close on the warn-args line; module 264→267 opens but 268 closes) — a
+  Luau syntax error that fails the WHOLE TrackManager module to compile, killing all
+  spawning (live AC i-b). Fix: drop the trailing `)` from the replacement template
+  (the captured group already closes everything). Verified: real TrackManager now
+  267/267 balanced, 4 rewrites + 1 defer intact. Bug-guard `test_premium_rewrite_warn
+  _parens_balanced` added — FAILS pre-fix (`name))))` vs `name)))`), passes post-fix.
+  This was a green-test-for-wrong-reason: `test_premium_rewrite_recovers_prefab_id_expr`
+  only substring-checked "Unable to load collectable", never paren balance.
+- **AUDIT — clean elsewhere.** L0 SO-AssetReference resolver + persisted `so_prefab_ids`
+  axis + shared `collect_addressable_prefab_ids` reader: correct, well-tested (both
+  consumer arms use the shared helper). Gaps #3/#4 (planner ancestor-inactive
+  suppression + UI carve-out; ui_translator emit-hidden): correct, thorough tests incl.
+  the cross-slice UI-host carve-out asserting `instance_owner_is_ui`. Segment index
+  off-by-one (`+1`) correct; cloud passes the already-1-based value through.
+## /drive run output-boundary-sanitize-20260620T082237 (2026-06-20T02:28:30Z)
+
+# Decisions — output-boundary-sanitize
+
+- Harden the choke-point helpers (`_luau_str`, `_add_float`, `_add_string`), not the
+  ~120 individual call sites that already funnel through them.
+  Classification: Mechanical.
+
+- Do not double-escape XML entities — ElementTree + minidom already escape `<&>`/quotes;
+  the fix adds only control-char (U+0000–U+001F) + inf/nan/-inf handling.
+  Classification: Mechanical.
+
+- `rbxl_binary_writer.py` is out of scope — it re-encodes an already-written rbxlx as
+  binary bytes, tolerates arbitrary bytes by construction, and inherits sanitized input.
+  Classification: Taste.
+
+- Single phase — ≲150 production SLOC, no staged-risk dependency between the two
+  boundaries, and the one shared Luau long-bracket contract must stay co-located in one
+  review unit. Fan-out (two independent files) is expressed as parallel slices at
+  /drive-design, not as separate phases.
+  Classification: Taste.
+
+- Control-char canonical form (strip vs replace) and non-finite float sentinel
+  (0.0 vs finite clamp) deferred to phase detailed-design; defaults are strip-illegal
+  and 0.0.
+  Classification: Taste.
+
+## Plan-stage autoplan eng dual-voice review (CEO premise sound; Design/DX phases skipped — no UI/DX surface)
+
+Premise (CEO): CONFIRMED sound — this is a stated repo-TODO P1 (output-boundary
+sanitization). Right problem; no reframing. Not auto-deciding the premise is moot
+(it's /drive Gate A's job), but both voices and the TODO agree it's the right fix.
+
+Eng dual-voice (Claude subagent + codex, both adversarial "find the bypass") — CONVERGED
+on the SAME core correction. P1 findings folded into design.md revision:
+
+- **D1 [P1, Mechanical] Float is a CONTRACT, not a single choke point.** ~10 numeric
+  emitters bypass `_add_float` (particle NumberRange/Sequence/Vector2, UDim2, .4f
+  CustomPhysicalProperties) AND the Luau side has an independent `_f` (line 47) that
+  CRASHES on inf/nan. Fix: a `_finite(float)->str` contract applied at every float→text
+  site across BOTH rbxlx_writer.py and luau_place_builder.py. Enumerate all sites at
+  phase design. Rejected: patch only `_add_float` (ships a half-fix).
+- **D2 [P1, Mechanical] Three long-bracket sites, not two.** `_luau_str` slow path +
+  place_publisher fixup + `_emit_script_inline` (line 1144, script source). Extract ONE
+  helper, route all three. Rejected: route only the two named (leaves the highest-risk
+  script-source site live → "can't drift" violated at birth).
+- **D3 [P1, Taste→resolve at phase design] Control chars need explicit handling on BOTH
+  sides.** XML: strip illegal control chars in `_add_string`, `_add_content`,
+  `_add_protected_string` (CDATA does NOT make control chars legal in XML 1.0), and any
+  attribute value carrying generator-derived names (verify `class_name` reachability).
+  Luau: long-bracket does NOT finitize control chars (`\0`/`\r` emitted raw inside
+  `[==[...]==]`) — the contract "no raw control chars" requires strip or quoted `\ddd`
+  escaping, NOT "fall through to long-bracket". Recommendation: strip on XML side;
+  on Luau side decide strip-vs-quote at phase design (quoted `\ddd` is total + byte-exact).
+- **D4 [OK] Long-bracket level-search has no breakout** (both voices) — keep the
+  structural level search for injection-safety; quoted-escape only marginally better.
+- **D5 [OK] Binary writer out of scope** — sound conditional on float completeness
+  (Claude verified both call sites parse the already-sanitized rbxlx). Note the
+  dependency: an inf leaking through any unfixed numeric emitter poisons BOTH the rbxlx
+  load AND the binary re-encode. Classification: Taste.
+- **D6 [P2] Size re-baseline.** Float finitizer ~10+ sites across 2 files; long-bracket 3
+  sites; XML text-sanitize ~3-4 emitters. ~15-20 touch-points (was "~4"). Still ≲150 SLOC
+  of helper logic; still ONE phase, two parallel slices (rbxlx-writer slice; luau slice).
+
+## Design review round 1 → round 2 deltas (codex P1s folded in)
+- **D7 [P1] Luau numeric contract covers raw int() sites, not just `_f`.** `_c3u8`
+  (int(r*255)) and UDim2 offset int(px[1]) crash on nan/inf outside `_f`. Approach now
+  says finitize every float→Luau-numeric site incl. non-`_f` int() coercions. Mechanical.
+- **D8 [P1] XML contract = "XML-1.0-valid chars only", not just strip-C0.** Also excludes
+  U+FFFE/FFFF + lone surrogates → truly total, matches the goal. Mechanical.
+- **D9 [P2] Out-of-scope wording reconciled.** Script-body CONTENT is out of scope; the
+  `_add_protected_string` control-char sanitize + `_emit_script_inline` long-bracket
+  encoding are IN scope. Mechanical.
+
+## Phase 1 detailed-design decisions (DP1–DP6) — see design-phase1.md
+
+- **DP1** [Taste] `_xml_text`/`_finite` (XML) are module-level helpers in
+  rbxlx_writer.py; `_long_bracket` + Luau `_finite` live in luau_place_builder.py,
+  imported by place_publisher.py. No shared cross-file module.
+- **DP2** [Taste] XML control-char form = STRIP; contract = "XML-1.0-valid chars
+  only" (drops C0 except tab/LF/CR, U+FFFE, U+FFFF, lone surrogates U+D800–DFFF).
+- **DP3** [Taste] XML non-finite sentinel: nan→0.0, ±inf→±1e38 (_XML_INF_CLAMP,
+  below float32 max so the binary re-encode stays finite). CustomPhysicalProperties
+  emits f"{_finite_val(x):.4f}" — the .4f is KEPT (only the value is finitized),
+  byte-identical on finite input (superseded the round-1 "drop .4f" note; see DP8).
+- **DP4** [Taste] Luau control-char form = quoted \ddd escaping on _luau_str fast
+  path (total + byte-exact). Consequence: _luau_str no longer uses long-bracket;
+  the old slow-path level search (L1) is retired; _long_bracket consumed only by
+  _emit_script_inline (L2) + place_publisher fixup (L3).
+- **DP5** [Mechanical] Non-_f raw int() Luau sites (_c3u8, UDim2 offsets 1193/1196)
+  finitize the VALUE before int(); _f finitizes at the top before its int(v) test.
+  Genuinely int-typed numeric fields (text_size/layout_padding/layout_cell_size/
+  segments) are NOT touched (an int can't be inf/nan).
+- **DP6** [Taste] Float finitizer duplicated as a per-file helper (_finite_val in
+  rbxlx_writer; inline value-finitize in _f + int()-guard sites in
+  luau_place_builder) (independent XML-text vs Luau-numeric shapes); only
+  _long_bracket is the one co-located shared contract.
+
+## Phase 1 detailed-design — round 2 (dual-voice P1s folded; DP7–DP8)
+
+- **DP7** [Taste] Bare-identifier Enum-tail Luau sites (`Enum.X.{member}` at
+  866 alpha_mode / 1212 layout_direction / 1214 layout_h_alignment / 1215
+  layout_v_alignment) get a new generic `_luau_ident(s: str, default: str) -> str`
+  validator: returns s iff `^[A-Za-z_][A-Za-z0-9_]*$`, else the site's existing
+  fallback. `_luau_str` cannot serve these (quoting an identifier breaks the
+  `Enum.X.<member>` syntax). The four `Instance.new('{…}')` class-name sites
+  (932 light_type / 975 constraint_type / 1189 class_name / 1210 layout_type)
+  ARE strings → routed through `_luau_str`. Constant-mapped Enum tails
+  (98/507/576/1095) and constant class literals (545 etc.) are NOT routed. This
+  corrects the round-1 FALSE claim that `_luau_str` covered all string sinks and
+  all numerics routed through `_f`. Classification: Taste.
+
+- **DP8** [Taste] The finitizer is VALUE-returning (`_finite_val(v: float) -> float`
+  on the XML side; inline value-finitize at the top of `_f` on the Luau side),
+  NOT string-returning. Each emission site keeps its ORIGINAL formatting
+  (`str(_finite_val(x))`, `f"{_finite_val(d):.4f}"`, `int(_finite_val(x))`) so on
+  finite input the output is byte-identical (acceptance criterion 1). A
+  string-returning `_finite` would break byte-identity (F15 `.4f`→`0.5000`≠`0.5`;
+  an int field forced through `float()`→`100`≠`100.0`). Also retracts the round-1
+  F4 false bug: `_add_color3`'s `max(0.0,min(1.0,x))` already finitizes ALL
+  non-finite input (min(1.0,nan)=1.0, max(0.0,min(1.0,-inf))=0.0) — no fix
+  needed there. Classification: Taste.

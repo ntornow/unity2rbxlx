@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING
 from typing import Any, NamedTuple, TypedDict, cast
 
@@ -31,7 +31,7 @@ from config import (
     OUTPUT_DIR,
     RBXLX_OUTPUT_FILENAME,
 )
-from core.conversion_context import ConversionContext
+from core.conversion_context import ConversionContext, MeshHierarchyEntry
 from core.unity_types import (
     AssetManifest,
     GuidIndex,
@@ -40,13 +40,234 @@ from core.unity_types import (
 )
 from core.roblox_types import RbxPart, RbxPlace, RbxScript, ScriptType
 from converter.animation_converter import AnimationConversionResult
-from converter.code_transpiler import TranspilationResult
+from converter.code_transpiler import TranspilationResult, TranspiledScript
 from converter.material_mapper import MaterialMapping
 from converter.scriptable_object_converter import AssetConversionResult
 from converter.sprite_extractor import SpriteExtractionResult
 from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (camera-mount -> player-mount equip, D13) — the field-name -> prefab_id
+# bridge. Phase 1's lowered request fires the C# prefab FIELD NAME
+# (``equipWeaponRemote:FireServer("riflePrefab")``); the server clone path
+# ``clonePrefabTemplate(prefab_id, ...)`` needs a ``prefab_id`` key into
+# ``Plan.prefabs``. The mapping field-name -> prefab_id lives ONLY in the
+# per-component ``SceneRuntimeReference`` rows (``{from, field, target_kind,
+# target_ref}``) the planner already seeds into ``scene_runtime``. This helper
+# joins the equip-emitting scripts (keyed by ``equip_binding``) with those rows
+# to build the flat ``{field_name: prefab_id}`` map (D13b), failing CLOSED on a
+# same-field-name-different-prefab collision across equip scripts (the gate that
+# makes the flat map safe — without it a same-named field could silently misbind).
+# ---------------------------------------------------------------------------
+
+
+def _instance_id_to_script_id(
+    scene_runtime: Mapping[str, object],
+) -> dict[str, str]:
+    """Build ``{instance_id: script_id}`` from every ``instances`` list under the
+    ``scenes`` and ``prefabs`` blocks of ``scene_runtime``. The reference rows are
+    keyed by ``from`` = instance_id; the equip join needs the OWNING script_id of
+    each row, which lives on the instance."""
+    out: dict[str, str] = {}
+    for block_key in ("scenes", "prefabs"):
+        block = scene_runtime.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for sub in block.values():
+            if not isinstance(sub, dict):
+                continue
+            instances = sub.get("instances")
+            if not isinstance(instances, list):
+                continue
+            for inst in instances:
+                if not isinstance(inst, dict):
+                    continue
+                iid = inst.get("instance_id")
+                sid = inst.get("script_id")
+                if isinstance(iid, str) and isinstance(sid, str) and sid:
+                    out[iid] = sid
+    return out
+
+
+def _iter_prefab_reference_rows(
+    scene_runtime: Mapping[str, object],
+) -> "list[dict[str, object]]":
+    """Collect every ``target_kind == "prefab"`` reference row across the
+    ``scenes`` and ``prefabs`` blocks. Each row carries ``from`` (instance_id),
+    ``field``, and ``target_ref`` (the prefab_id)."""
+    rows: list[dict[str, object]] = []
+    for block_key in ("scenes", "prefabs"):
+        block = scene_runtime.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for sub in block.values():
+            if not isinstance(sub, dict):
+                continue
+            references = sub.get("references")
+            if not isinstance(references, list):
+                continue
+            for row in references:
+                if isinstance(row, dict) and row.get("target_kind") == "prefab":
+                    rows.append(cast("dict[str, object]", row))
+    return rows
+
+
+def build_equip_prefabs_bridge(
+    scripts: "list[TranspiledScript]",
+    scene_runtime: Mapping[str, object],
+    guid_index: object | None,
+) -> dict[str, str]:
+    """Build the D13b ``{field_name: prefab_id}`` equip bridge.
+
+    For each script carrying an equip obligation (``equip_binding`` non-None with
+    a ``prefab`` field name), resolve that field to a ``prefab_id`` via the prefab
+    reference rows owned by an instance of THAT script (joined on the script's
+    canonical ``script_id``). Build the flat field-name -> prefab_id map.
+
+    FAIL CLOSED (``RuntimeError``) on a same-field-name-different-prefab collision
+    across equip scripts — the build-time gate that converts the flat map's silent
+    misbinding into a loud stop (D13b). Within a single equip obligation, the
+    field resolves to exactly one prefab_id by construction (one field on one
+    script's instances); a single field that resolves to two prefab_ids across
+    DISTINCT equip scripts is the collision case.
+
+    Returns an empty dict when no script carries an equip obligation (the common
+    non-equip game) or when the reference rows do not resolve the field (the
+    handler then abstains at runtime, D11)."""
+    inst_to_script = _instance_id_to_script_id(scene_runtime)
+    prefab_rows = _iter_prefab_reference_rows(scene_runtime)
+
+    equip_prefabs: dict[str, str] = {}
+    # Per-field provenance so a collision message names the offending scripts.
+    field_provenance: dict[str, tuple[str, str]] = {}  # field -> (prefab_id, script_id)
+
+    for ts in scripts:
+        eb = ts.equip_binding
+        if not eb:
+            continue
+        field_name = str(eb.get("prefab") or "")
+        if not field_name:
+            continue
+        script_id = _script_id_for_source_path(ts.source_path, guid_index)
+        if not script_id:
+            # Cannot key the script to its reference rows -> the field stays
+            # unresolved (runtime abstain). A missing script_id is not a
+            # collision, so no fail-close.
+            continue
+        # Resolve the field's prefab_id from THIS script's prefab reference rows.
+        # Collect ALL target_refs across EVERY matching row (across all authored
+        # instances of this script class) — a single instance taking the first
+        # row would silently misbind when two instances of the SAME script class
+        # share the field name but reference DIFFERENT prefabs (same-script
+        # multi-instance collision). The resolved set must be exactly one.
+        resolved_set: set[str] = set()
+        for row in prefab_rows:
+            if row.get("field") != field_name:
+                continue
+            frm = row.get("from")
+            if not isinstance(frm, str):
+                continue
+            if inst_to_script.get(frm) != script_id:
+                continue
+            target_ref = row.get("target_ref")
+            if isinstance(target_ref, str) and target_ref:
+                resolved_set.add(target_ref)
+        if not resolved_set:
+            continue
+        if len(resolved_set) > 1:
+            refs = ", ".join(repr(r) for r in sorted(resolved_set))
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} on script {script_id!r} maps to multiple "
+                f"different prefabs across that script's instances ({refs}) — "
+                "refusing to ship a flat field->prefab_id map that would "
+                "silently misbind one of them (D13b build-time collision "
+                "fail-close). File D13a (scriptId-scoped resolution) to support "
+                "this game."
+            )
+        resolved = next(iter(resolved_set))
+        prior = field_provenance.get(field_name)
+        if prior is not None and prior[0] != resolved:
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} maps to two different prefabs across equip "
+                f"scripts ({prior[0]!r} from script {prior[1]!r} vs "
+                f"{resolved!r} from script {script_id!r}) — refusing to ship a "
+                "flat field->prefab_id map that would silently misbind one of "
+                "them (D13b build-time collision fail-close). File D13a "
+                "(scriptId-scoped resolution) to support this game."
+            )
+        equip_prefabs[field_name] = resolved
+        field_provenance.setdefault(field_name, (resolved, script_id))
+
+    return equip_prefabs
+
+
+def build_equip_scales_bridge(
+    scripts: "list[TranspiledScript]",
+    equip_prefabs: Mapping[str, str],
+) -> dict[str, float]:
+    """Build the D17/Bug-2 ``{prefab_id: uniform_scale}`` map for the runtime weld,
+    reusing the field->prefab_id resolution in ``equip_prefabs`` (no second path).
+
+    Keyed by prefab_id (the runtime equip path holds that, not the C# field name).
+    The carrier ``scale`` is ``None`` when nothing was captured (no localScale /
+    non-uniform / non-positive) and is skipped; a captured value (incl an explicit
+    ``1.0``) enters the per-prefab_id collision check, so two carriers capturing
+    DIFFERENT scales for one prefab_id fail closed (RuntimeError). Only non-1.0
+    captures are emitted (1.0 is the runtime no-op)."""
+    captured: dict[str, float] = {}  # prefab_id -> captured scale (incl explicit 1.0)
+    for ts in scripts:
+        eb = ts.equip_binding
+        if not eb:
+            continue
+        field_name = str(eb.get("prefab") or "")
+        if not field_name:
+            continue
+        prefab_id = equip_prefabs.get(field_name)
+        if not prefab_id:
+            continue  # field unresolved (runtime abstains) -> no scale entry
+        scale = eb.get("scale")
+        if scale is None or not isinstance(scale, (int, float)):
+            continue  # nothing captured (None sentinel) -> no opinion on scale
+        scale = float(scale)
+        prior = captured.get(prefab_id)
+        if prior is not None and prior != scale:
+            raise RuntimeError(
+                "[contract] camera-mount equip scale bridge: prefab_id "
+                f"{prefab_id!r} maps to two different scales ({prior} vs {scale}) "
+                "across equip carriers — refusing to ship an ambiguous scale."
+            )
+        captured[prefab_id] = scale
+    # Emit only the runtime-meaningful (non-1.0) scales; an explicit 1.0 participated
+    # in the collision check above but needs no Plan entry (runtime ScaleTo no-op).
+    return {pid: s for pid, s in captured.items() if s != 1.0}
+
+
+def _script_id_for_source_path(
+    source_path: str,
+    guid_index: object | None,
+) -> str:
+    """Resolve a transpiled script's ``.cs`` ``source_path`` to its canonical
+    ``script_id`` (the .cs GUID), the key the planner uses for reference-row
+    instances. Uses the guid_index reverse lookup (``guid_for_path``); returns
+    ``""`` when unresolvable (caller leaves the field unresolved -> runtime
+    abstain, never a fail-close)."""
+    if not source_path:
+        return ""
+    guid_for_path = getattr(guid_index, "guid_for_path", None)
+    if not callable(guid_for_path):
+        return ""
+    try:
+        guid = guid_for_path(Path(source_path))
+    except (AttributeError, KeyError, TypeError):
+        # Expected missing-index shapes (the index lacks the path / a stub method
+        # signature mismatch) -> abstain. Anything else surfaces.
+        return ""
+    return guid if isinstance(guid, str) and guid else ""
 
 
 # ---------------------------------------------------------------------------
@@ -94,12 +315,23 @@ _CS_DICT_ADD_KEY = re.compile(
 )
 
 
+# C# control-flow / non-method statements whose ``<kw> ( … ) {`` shape would
+# otherwise be mis-captured as a method header (e.g. ``if (x == null) {`` when a
+# preceding comment supplies the ``[\w.]+`` "return-type" slot). Excluded from the
+# ``name`` capture via a ``\b``-anchored negative lookahead so a real identifier
+# that merely STARTS with a keyword (``ifMatched`` / ``forEachItem``) is kept.
+_CS_CONTROL_KEYWORDS = (
+    "if", "for", "foreach", "while", "switch", "using", "lock",
+    "catch", "fixed", "do", "else", "return",
+)
 # A C# method header: ``<modifiers> <ret> <Name>(`` — used to name the load
 # method (the method enclosing the ``LoadAssetsAsync`` call) so the transpiled
 # counterpart's drain body can be isolated by the SAME name.
 _CS_METHOD_HEADER = re.compile(
     r"(?:public|private|protected|internal|static|virtual|override|async|\s)+"
-    r"[\w<>,.\[\]]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{",
+    r"[\w<>,.\[\]]+\s+"
+    r"(?!(?:" + "|".join(_CS_CONTROL_KEYWORDS) + r")\b)"
+    r"(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{",
 )
 
 
@@ -460,6 +692,37 @@ def _roblox_call_net_errors(semantic_report: "object") -> list[str]:
             f"{issue.snippet}]"
         )
     return out
+
+
+def _quarantine_bad_embedded_meshes(
+    mesh_hierarchies: dict[str, list[MeshHierarchyEntry]],
+    mesh_native_sizes: dict[str, list[float]],
+    uploaded_assets: dict[str, str],
+    upload_errors: list[str],
+) -> list[str]:
+    """Drop synthetic embedded-mesh keys that resolved to != 1 sub-mesh.
+
+    The synthesised FBX has exactly one Geometry node by construction; >1 (or 0)
+    means the template-cleanup leaked extra Geometries and ``sub_meshes[0]`` would
+    bind to non-deterministic geometry. Rather than ship the wrong mesh, evict the
+    key from every table the MeshId binding reads so the node falls through to the
+    crash-free no-MeshId / face-decal fallback. Mutates the four args in place;
+    returns the list of quarantined keys.
+    """
+    from core.asset_keys import is_embedded_mesh_key
+    bad = [k for k, subs in mesh_hierarchies.items()
+           if is_embedded_mesh_key(k) and len(subs) != 1]
+    for k in bad:
+        mesh_hierarchies.pop(k, None)
+        mesh_native_sizes.pop(k, None)
+        # _resolve_mesh_id (scene_converter) reads uploaded_assets via
+        # _embedded_key_candidates slash variants, so pop every slash direction.
+        prefix, _, file_id = k.partition("#")
+        for variant in (prefix, prefix.replace("\\", "/"), prefix.replace("/", "\\")):
+            uploaded_assets.pop(f"{variant}#{file_id}", None)
+        if k not in upload_errors:
+            upload_errors.append(k)
+    return bad
 
 
 @dataclass
@@ -1346,6 +1609,59 @@ class Pipeline:
             return None
         return resolved
 
+    def _emitted_so_guids(self) -> set[str]:
+        """The guid set of every EMITTED ScriptableObject module.
+
+        Reverse-maps each converted SO asset's ``.asset`` ``source_path`` to its
+        guid via the GuidIndex (the same positive ``so_guids`` gate
+        ``_build_scriptable_object_module_map`` derives in ``write_output``, but
+        available at plan time from ``self.state.scriptable_objects``). Returns an
+        empty set when no SO assets / no GuidIndex.
+        """
+        from converter.scriptable_object_converter import AssetConversionResult
+
+        so_state = getattr(self.state, "scriptable_objects", None)
+        if not isinstance(so_state, AssetConversionResult) or not so_state.assets:
+            return set()
+        guid_index = self.state.guid_index
+        if guid_index is None:
+            return set()
+        path_to_guid: dict[Path, str] = {}
+        for guid, entry in guid_index.guid_to_entry.items():
+            path_to_guid[entry.asset_path] = guid
+            try:
+                path_to_guid[entry.asset_path.resolve()] = guid
+            except (OSError, RuntimeError):
+                pass
+        out: set[str] = set()
+        for asset in so_state.assets:
+            guid = path_to_guid.get(asset.source_path)
+            if guid is None:
+                try:
+                    guid = path_to_guid.get(asset.source_path.resolve())
+                except (OSError, RuntimeError):
+                    guid = None
+            if guid is not None:
+                out.add(guid)
+        return out
+
+    def _resolve_so_assetref_prefab_ids(self) -> set[str]:
+        """L0: prefab ids reachable from the emitted SOs' AssetReference fields.
+
+        Gated on the emitted-SO guid set (``_emitted_so_guids``), narrowed to
+        ``.prefab`` targets by the shared filter inside
+        ``resolve_so_assetref_prefab_ids``. Empty when no emitted SOs / no
+        GuidIndex.
+        """
+        from unity.addressables_resolver import resolve_so_assetref_prefab_ids
+
+        if self.state.guid_index is None:
+            return set()
+        so_guids = self._emitted_so_guids()
+        if not so_guids:
+            return set()
+        return resolve_so_assetref_prefab_ids(so_guids, self.state.guid_index)
+
     def plan_scene_runtime(self) -> None:
         """Phase: build the project-level ``scene_runtime`` artifact.
 
@@ -1411,6 +1727,31 @@ class Pipeline:
                 len(resolved.by_address),
                 len(resolved.by_label),
                 resolved.skipped_non_prefab,
+            )
+
+        # L0 (gap #5 spawn closure): prefabs referenced ONLY from an emitted SO's
+        # AssetReference/object-ref fields (e.g. ThemeData zones[].prefabList /
+        # collectiblePrefab / cloudPrefabs) appear in NO AddressableAssetsData
+        # group, so the address/label-sourced block above never reaches them and
+        # the emit gate never emits their Templates. Resolve those prefab ids and
+        # union them into BOTH (i) the PERSISTED ``addressables`` block under a new
+        # ``so_prefab_ids`` axis — the structure the emit-gate consumers re-walk
+        # (pipeline.py ``_generate_prefab_packages`` / ``select_emitted_prefab_ids``
+        # loops), so the Templates emit — AND (ii) the LOCAL ``addr_ids`` below,
+        # which feeds the resolved-NAME pass. Gated on the emitted-SO guid set
+        # (D-P4-8/D-P4-9). Off-disk + pure; resume-safe.
+        so_prefab_ids = self._resolve_so_assetref_prefab_ids()
+        if so_prefab_ids:
+            block = artifact.get("addressables")
+            if not isinstance(block, dict):
+                block = {"by_address": {}, "by_label": {}}
+                artifact["addressables"] = block
+            block["so_prefab_ids"] = sorted(so_prefab_ids)
+            addr_ids |= so_prefab_ids
+            log.info(
+                "[plan_scene_runtime] L0 SO-AssetReference prefab ids: %d "
+                "(unioned into emit set + so_prefab_ids axis)",
+                len(so_prefab_ids),
             )
 
         # Resolved-name pass (single source of truth): collision-conditionally
@@ -2489,6 +2830,28 @@ class Pipeline:
             self.ctx.scene_runtime["runtime_bearing_paths"] = sorted(
                 str(p) for p in contract_result.runtime_bearing_paths
             )
+            # Phase 2 (D13): build the field-name -> prefab_id equip bridge now
+            # that BOTH inputs exist — the equip-emitting scripts' ``equip_binding``
+            # (produced by the camera-mount equip lowering inside
+            # ``transpile_with_contract``) AND the per-component prefab reference
+            # rows ``plan_scene_runtime`` seeded into ``ctx.scene_runtime``. This
+            # MUST run here (post-transpile), NOT in ``plan_scene_runtime`` which
+            # runs before the equip facts exist. The map reaches the emitted
+            # SceneRuntimePlan via the ``equip_prefabs`` entry in
+            # ``_PLAN_KEYS_FOR_HOST`` (else the live handler reads nil). Fails
+            # CLOSED on a same-field-name-different-prefab collision (D13b gate).
+            self.ctx.scene_runtime["equip_prefabs"] = build_equip_prefabs_bridge(
+                contract_result.transpilation.scripts,
+                self.ctx.scene_runtime,
+                self.state.guid_index,
+            )
+            # D17/Bug-2: the prefab_id -> uniform display scale map, reusing the
+            # field->prefab_id resolution above. Reaches the runtime weld via the
+            # ``equip_scales`` Plan key; absent prefab_id -> runtime ScaleTo no-op.
+            self.ctx.scene_runtime["equip_scales"] = build_equip_scales_bridge(
+                contract_result.transpilation.scripts,
+                self.ctx.scene_runtime["equip_prefabs"],
+            )
         else:
             # Legacy path -- must stay byte-identical. Do NOT thread
             # ``runtime_mode`` or any other new kwargs here; legacy emit is a
@@ -2849,6 +3212,21 @@ return table.concat(allData, "\\n")'''
             merged_hierarchies = {**existing_hierarchies, **mesh_hierarchies}
             self.ctx.mesh_native_sizes = merged_sizes
             self.ctx.mesh_hierarchies = merged_hierarchies
+            # Quarantine embedded-mesh keys that resolved to the wrong sub-mesh
+            # count (!= 1). Runs on the MERGED ctx dicts so a bad key pre-seeded
+            # from a prior force-rerun is evicted even if this run didn't re-parse
+            # it. self.ctx.* IS the merged dict (assigned just above), so popping
+            # from ctx pops from the merged result.
+            quarantined = _quarantine_bad_embedded_meshes(
+                self.ctx.mesh_hierarchies,
+                self.ctx.mesh_native_sizes,
+                self.ctx.uploaded_assets,
+                self.ctx.asset_upload_errors,
+            )
+            if quarantined:
+                log.warning(
+                    "[resolve_assets] Quarantined %d embedded-mesh key(s) with the "
+                    "wrong sub-mesh count: %s", len(quarantined), quarantined)
             log.info(
                 "[resolve_assets] Resolved %d new meshes (total %d, %d sub-meshes)",
                 len(mesh_native_sizes), len(merged_sizes),
@@ -3331,6 +3709,9 @@ return table.concat(allData, "\\n")'''
                     # the dead-module exemption (a re-lowered roster consumer is
                     # live by construction; its canonical body is inert).
                     roster_binding=ts.roster_binding,
+                    # Generic-mode camera-mount equip-request binding carrier (or
+                    # None) for the equip-present fail-closed check.
+                    equip_binding=ts.equip_binding,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -3468,6 +3849,18 @@ return table.concat(allData, "\\n")'''
         self.state.dead_modules = frozenset()
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
+        # Consumable-db boot-shim live-set: modules the shim materializes at boot
+        # (the subclass ``<class_stem>.new`` + the DB module written onto) are LIVE
+        # BY CONSTRUCTION even when output-inert. Computed from the seed plan (the
+        # same deterministic builder write_output runs), mirroring roster_binding.
+        # Exempted in BOTH the fresh-transpile and resume branches below.
+        consumable_live = self._consumable_seed_live_module_names()
+        # Lazy-singleton boot-shim live-set (Phase 2): a lazy singleton's body is
+        # output-inert, so it would classify Roblox-dead → reroute to a
+        # ``.new``-less stub → the shim cannot construct it. The shim instantiates
+        # it at boot, so it is LIVE BY CONSTRUCTION. Exempted in BOTH branches
+        # below, mirroring ``consumable_live``.
+        lazy_singleton_live = self._lazy_singleton_live_module_names()
         # The input-side prior needs the original C# source. It only exists on
         # a fresh transpile (``transpilation_result``); a resume rehydrates
         # Luau from disk without the C#. On resume, reuse the persisted verdict
@@ -3505,6 +3898,24 @@ return table.concat(allData, "\\n")'''
                     # though its canonical body is output-inert -- never re-add it
                     # to the dead set on resume (it would otherwise be re-flagged
                     # and rerouted to an inert stub, clobbering the re-lowering).
+                    dropped.append(s.name)
+                    continue
+                if s.name in consumable_live:
+                    # Consumable-db materialization: the boot shim instantiates
+                    # this subclass / writes onto this DB module at boot, so it is
+                    # live by construction even with an inert canonical body. The
+                    # seed plan is recomputed from disk-resident inputs (the
+                    # .asset/.prefab/.cs + the SO map), so the exemption survives a
+                    # no-retranspile rehydrated assemble. Mirrors roster_binding.
+                    dropped.append(s.name)
+                    continue
+                if s.name in lazy_singleton_live:
+                    # Lazy-singleton boot-instantiation (Phase 2): the boot shim
+                    # constructs + Awakes this singleton at boot, so it is live by
+                    # construction even with an inert canonical body. Recomputed
+                    # from disk-resident inputs (the .cs via the GuidIndex +
+                    # scene_runtime["modules"]), so the exemption survives a
+                    # no-retranspile rehydrated assemble. Mirrors consumable_live.
                     dropped.append(s.name)
                     continue
                 if is_output_inert(s.source) and not has_genuine_roblox_effect(
@@ -3567,6 +3978,25 @@ return table.concat(allData, "\\n")'''
                 # not reroute it to an inert stub and clobber the re-lowering. Pure
                 # exemption -- does not touch ``strategy`` (D-P2-8).
                 continue
+            if s.name in consumable_live:
+                # Consumable-db materialization: the boot shim instantiates this
+                # subclass (``<class_stem>.new``) and/or writes the materialized
+                # array onto this DB module at boot, so it is LIVE BY CONSTRUCTION
+                # even when its canonical body is output-inert. Exempt BEFORE the
+                # strategy gate so the storage classifier never reroutes it to an
+                # inert ``.new``-less stub (which would drop every consumable
+                # element and silently no-op the feature). Pure exemption --
+                # does not touch ``strategy``. Mirrors roster_binding.
+                continue
+            if s.name in lazy_singleton_live:
+                # Lazy-singleton boot-instantiation (Phase 2): the boot shim
+                # constructs + Awakes this singleton at boot, so it is LIVE BY
+                # CONSTRUCTION even though its canonical body is output-inert.
+                # Exempt BEFORE the strategy gate so the storage classifier never
+                # reroutes it to a ``.new``-less inert stub (which the shim's
+                # resolveModule could not construct). Pure exemption -- does not
+                # touch ``strategy``. Mirrors consumable_live.
+                continue
             if strategy_by_name.get(s.name) not in _DECISIVE_STRATEGIES:
                 # Non-deterministic fallback body -- inertness is unreliable.
                 continue
@@ -3588,6 +4018,102 @@ return table.concat(allData, "\\n")'''
                 "[dead-modules] %d Roblox-dead module(s): %s",
                 len(dead), ", ".join(sorted(dead)),
             )
+
+    def _consumable_seed_live_module_names(self) -> frozenset[str]:
+        """The set of RbxScript names that are LIVE BY CONSTRUCTION because the
+        consumable-db boot shim materializes them.
+
+        Mirrors the ``roster_binding`` dead-module exemption, but the live
+        identity is carried by the SEED PLAN (``scene_runtime["consumable_db_seeds"]``)
+        rather than a per-script attribute: the boot shim instantiates each
+        element's subclass (``<class_stem>.new``) and assigns the array onto the
+        DB module at boot, so neither the subclass module nor the DB module is
+        Roblox-dead even when its canonical body is output-inert.
+
+        The seed plan is RECOMPUTED in ``write_output`` (after this phase), so it
+        is not yet on ``ctx.scene_runtime`` here. Recompute it against a private
+        COPY using the SAME deterministic builder (no game-specific literal), so
+        the exemption sees exactly the modules the shim will materialize. Returns
+        ``frozenset()`` whenever no seed resolves (the generic, fail-quiet
+        default — a non-consumable scene exempts nothing).
+
+        The names are the RbxScript stems: each element's ``class_stem`` (== the
+        subclass output filename stem == ``RbxScript.name``) and each seed's
+        ``db_module_path`` leaf (the DB module the shim writes onto).
+        """
+        scene_runtime_src = getattr(self.ctx, "scene_runtime", None)
+        if not isinstance(scene_runtime_src, dict) or not scene_runtime_src:
+            return frozenset()
+        # Private working copy: the builders below pop/set keys, and
+        # _build_scriptable_object_module_map writes the guid->path map the seed
+        # builder consumes (write_output builds it earlier in its own window; at
+        # this phase it is not yet on the dict). Never mutate ctx.scene_runtime.
+        scene_runtime = dict(scene_runtime_src)
+        self._build_scriptable_object_module_map(scene_runtime)
+        self._build_consumable_db_seeds(scene_runtime)
+        seeds_obj = scene_runtime.get("consumable_db_seeds")
+        if not isinstance(seeds_obj, list):
+            return frozenset()
+        live: set[str] = set()
+        for seed in seeds_obj:
+            if not isinstance(seed, dict):
+                continue
+            db_path = seed.get("db_module_path")
+            if isinstance(db_path, str) and db_path:
+                live.add(db_path.rsplit(".", 1)[-1])
+            elements = seed.get("elements")
+            if not isinstance(elements, list):
+                continue
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                stem = element.get("class_stem")
+                if isinstance(stem, str) and stem:
+                    live.add(stem)
+                mod_path = element.get("module_path")
+                if isinstance(mod_path, str) and mod_path:
+                    live.add(mod_path.rsplit(".", 1)[-1])
+        return frozenset(live)
+
+    def _lazy_singleton_live_module_names(self) -> frozenset[str]:
+        """The set of RbxScript names that are LIVE BY CONSTRUCTION because the
+        lazy-singleton boot shim (slice 2.2) constructs + Awakes them at boot.
+
+        Mirrors ``_consumable_seed_live_module_names``: the live identity is
+        carried by the SEED PLAN (``scene_runtime["lazy_singletons"]``), not a
+        per-script attribute. A lazy singleton's transpiled body is output-inert
+        (it has no dotted Roblox-instance writes), so ``_subphase_analyze_dead_modules``
+        would flag it Roblox-dead → reroute it to a ``.new``-less inert stub → the
+        shim's ``resolveModule`` gets a stub with no ``Cls.new`` → silently dead.
+        The module is LIVE because the shim instantiates it at boot.
+
+        The seed plan is RECOMPUTED in ``write_output`` (after this phase), so it
+        is not yet on ``ctx.scene_runtime`` here. Recompute it against a private
+        COPY using the SAME deterministic builder. Returns ``frozenset()`` when no
+        seed resolves (a non-singleton scene exempts nothing).
+
+        The names are RbxScript stems: each seed's ``class_stem`` and its
+        ``module_path`` leaf (both == the singleton's output filename stem).
+        """
+        scene_runtime_src = getattr(self.ctx, "scene_runtime", None)
+        if not isinstance(scene_runtime_src, dict) or not scene_runtime_src:
+            return frozenset()
+        scene_runtime = dict(scene_runtime_src)
+        self._build_lazy_singleton_seeds(scene_runtime)
+        seeds_obj = scene_runtime.get("lazy_singletons")
+        if not isinstance(seeds_obj, list):
+            return frozenset()
+        live: set[str] = set()
+        for seed in seeds_obj:
+            if not isinstance(seed, dict):
+                continue
+            stem = seed.get("class_stem")
+            if isinstance(stem, str) and stem:
+                live.add(stem)
+            mod_path = seed.get("module_path")
+            if isinstance(mod_path, str) and mod_path:
+                live.add(mod_path.rsplit(".", 1)[-1])
+        return frozenset(live)
 
     def _subphase_prune_dead_module_closures(self) -> None:
         """TODO #8: DROP dead modules whose ENTIRE require-closure is dead.
@@ -4820,6 +5346,7 @@ script.Disabled = true
         child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
         rig_binding_lookup = self._load_rig_binding_for_rehydration()
         roster_binding_lookup = self._load_roster_binding_for_rehydration()
+        equip_binding_lookup = self._load_equip_binding_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -4890,6 +5417,13 @@ script.Disabled = true
             rob = roster_binding_lookup.get(name)
             if rob is not None:
                 script.roster_binding = rob
+            # Restore the camera-mount equip-request carrier so the equip-present
+            # fail-closed check has the IR anchor + discharge stamp on a
+            # preserve/resume assemble (else it would abstain on every rehydrated
+            # script). The check still INDEPENDENTLY scans ``source``.
+            eqb = equip_binding_lookup.get(name)
+            if eqb is not None:
+                script.equip_binding = eqb
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -5097,6 +5631,55 @@ script.Disabled = true
             }
         return out
 
+    def _load_equip_binding_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Load the persisted per-script camera-mount equip-request carrier from
+        ``conversion_plan.json`` into ``name -> {prefab, method, remote, present}``
+        (+ optional ``multi_site``/``dangling_capvar`` sub-flags).
+
+        Mirrors the ``rig_binding`` rehydration. Returns ``{}`` on a
+        missing/malformed plan or a plan that pre-dates the field; a malformed row
+        is dropped (absent -> ``None`` -> the equip-present check abstains, the same
+        safe pre-field default). All FOUR core keys must be well-formed (str prefab/
+        method/remote, bool present) or the row is dropped — a partial carrier would
+        let the fail-closed check anchor on a missing prefab and exempt blind."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("equip_binding")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, object]] = {}
+        for name, eb in block.items():
+            if not isinstance(name, str) or not isinstance(eb, dict):
+                continue
+            prefab = eb.get("prefab")
+            method = eb.get("method")
+            remote = eb.get("remote")
+            present = eb.get("present")
+            if not (isinstance(prefab, str) and isinstance(method, str)
+                    and isinstance(remote, str) and isinstance(present, bool)):
+                continue
+            row: dict[str, object] = {
+                "prefab": prefab,
+                "method": method,
+                "remote": remote,
+                "present": present,
+            }
+            for flag in ("multi_site", "dangling_capvar"):
+                val = eb.get(flag)
+                if isinstance(val, bool):
+                    row[flag] = val
+            out[name] = row
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -5192,6 +5775,16 @@ script.Disabled = true
             s.name: s.roster_binding
             for s in self.state.rbx_place.scripts
             if s.roster_binding is not None
+        }
+
+        # Persist each camera-mount equip carrier so a preserve/resume assemble that
+        # rehydrates from disk can restore the equip-present check's IR anchor +
+        # discharge stamp (without it the check would abstain on that path). Keyed by
+        # script name; ``None`` carriers are dropped (absent == no equip obligation).
+        equip_binding: dict[str, dict[str, object]] = {
+            s.name: s.equip_binding
+            for s in self.state.rbx_place.scripts
+            if s.equip_binding is not None
         }
 
         # Animation routing (Phase 4.5): per-clip target + reason.
@@ -5317,6 +5910,7 @@ script.Disabled = true
                 "child_ref_resolution": child_ref_resolution,
                 "rig_binding": rig_binding,
                 "roster_binding": roster_binding,
+                "equip_binding": equip_binding,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),
@@ -6313,7 +6907,9 @@ script.Disabled = true
         rbxlx from bloating with every parsed prefab in the project.
         """
         from converter.prefab_packages import (
-            generate_prefab_packages, write_packages_manifest,
+            collect_addressable_prefab_ids,
+            generate_prefab_packages,
+            write_packages_manifest,
         )
 
         prefab_library = self.state.prefab_library
@@ -6339,14 +6935,11 @@ script.Disabled = true
             tname = sub.get("template_name") if isinstance(sub, dict) else None
             if isinstance(tname, str):
                 resolved_template_names[pid] = tname
-        addressable_prefab_ids: set[str] = set()
         addr_block = scene_runtime.get("addressables") or {}
-        for axis in ("by_address", "by_label"):
-            for ids in (addr_block.get(axis) or {}).values():
-                if isinstance(ids, (list, tuple, set)):
-                    addressable_prefab_ids.update(
-                        pid for pid in ids if isinstance(pid, str)
-                    )
+        # Shared reader of the persisted addressables axes (incl. the L0 gap #5
+        # ``so_prefab_ids`` flat list) — same helper as the sibling consumer arm,
+        # so the two emit-gate target sets never diverge.
+        addressable_prefab_ids = collect_addressable_prefab_ids(addr_block)
 
         result = generate_prefab_packages(
             prefab_library=prefab_library,
@@ -6588,17 +7181,16 @@ script.Disabled = true
         if prefab_library is None:
             return set()
 
-        from converter.prefab_packages import select_emitted_prefab_ids
+        from converter.prefab_packages import (
+            collect_addressable_prefab_ids,
+            select_emitted_prefab_ids,
+        )
         from converter.scene_converter import _prefab_stable_id
 
         addr_block = scene_runtime.get("addressables") or {}
-        addressable_prefab_ids: set[str] = set()
-        for axis in ("by_address", "by_label"):
-            for ids in (addr_block.get(axis) or {}).values():
-                if isinstance(ids, (list, tuple, set)):
-                    addressable_prefab_ids.update(
-                        pid for pid in ids if isinstance(pid, str)
-                    )
+        # Shared reader of the persisted addressables axes (see the sibling consumer
+        # in ``_generate_prefab_packages``) — incl. the L0 gap #5 ``so_prefab_ids``.
+        addressable_prefab_ids = collect_addressable_prefab_ids(addr_block)
 
         # Scope the collision domain to the EMITTED set, not the full plan's
         # ``prefabs`` block (which carries every parsed prefab).
@@ -7089,6 +7681,36 @@ script.Disabled = true
         # on the dict when generate_scene_runtime_plan_module runs. NOT persisted
         # through conversion_plan.json; recomputed every write_output (D17).
         self._build_theme_seed_plan(scene_runtime)
+        # Phase 3 (SO-store DB consumer-lowering): rewrite each keyed-dictionary
+        # SO-DB module's transpiled LoadDatabase body to drain its owned emitted SO
+        # modules into its local keyed dict — the list-store seed above cannot reach
+        # a closure-private local upvalue (D-P3-1/D-P3-3). Runs in THIS window after
+        # the SO map exists (so so_addr resolves) and BEFORE the plan/entrypoints
+        # emit (so the rewritten RbxScript.source is what gets written). Supersedes
+        # the list-store seed only for the keyed-dictionary shape.
+        self._lower_so_db_consumers(scene_runtime)
+        # Phase 4 / gap #5 L1 (spawn call-site lowering): rewrite the dynamic
+        # Addressables Instantiate/LoadAsset spawn sites the AI left UNCONVERTED
+        # (dead ``= nil`` sentinels / a ``:Clone()`` on a prefab-id string) to
+        # ``self.host.instantiatePrefab(<prefab-id>, …)``. Runs in THIS window
+        # (after the SO map / so-db lowering, before the plan/entrypoints emit)
+        # so the rewritten ``RbxScript.source`` is what gets written. Pairs with
+        # L0 (the SO-AssetReference Template emission unioned into the addressables
+        # block at ``plan_scene_runtime``): L0 guarantees the Template exists, L1
+        # instantiates it. Fail-closed on shape/expr miss; consumable DEFERRED.
+        self._lower_spawn_call_sites()
+        # Phase 1 (consumable prototype materialization): RECOMPUTE the
+        # consumable-db seed onto scene_runtime in THIS window — same property
+        # as the theme seed (after the SO map, before the plan module emits, so
+        # the allowlisted ``consumable_db_seeds`` key is on the dict). NOT
+        # transpile-gated; pop-first authoritative recompute (D17).
+        self._build_consumable_db_seeds(scene_runtime)
+        # Phase 2 (lazy-singleton boot-instantiation): RECOMPUTE the
+        # lazy-singleton seed onto scene_runtime in THIS window — same property as
+        # the consumable seed (after the modules map exists, before the plan
+        # module emits, so the allowlisted ``lazy_singletons`` key is on the dict).
+        # NOT transpile-gated; pop-first authoritative recompute (D17).
+        self._build_lazy_singleton_seeds(scene_runtime)
 
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
@@ -7380,6 +8002,383 @@ script.Disabled = true
                 "db seed(s) (%d SO module(s) total)",
                 len(seeds), sum(len(s["so_module_paths"]) for s in seeds),
             )
+
+    def _lower_so_db_consumers(self, scene_runtime: dict[str, object]) -> None:
+        """Rewrite each dict-store SO-DB module's transpiled ``LoadDatabase`` body
+        to drain its owned emitted SO modules into its local keyed dict.
+
+        Runs in the SAME ``write_output`` window as ``_build_theme_seed_plan`` —
+        after the SO map exists (so the SO addressables surface resolves) and
+        before the plan/entrypoints emit (so the rewritten ``RbxScript.source`` is
+        what gets written). Supersedes the list-store seed for the keyed-dictionary
+        shape (D-P3-3): the store is a closure-private local upvalue no external
+        shim can reach, so the DB module must own its own keyed write.
+
+        Keyed on the DETERMINISTIC C# ``LoadAssetsAsync<SOType>("<label>")``
+        ownership + the SO-seed surface — never an AI-output fingerprint or a
+        per-game string (D-P3-2). Fail-closed (``SoDbUnresolved``) when the rewrite
+        target cannot be located in the AI output. Disjoint from the roster
+        lowering by two layers (§3f): the ``<SOType>``-resolves-to-SO gate in
+        ``find_so_db_consumers`` (primary) and a ``roster_claimed_paths`` exclusion
+        (belt-and-suspenders).
+        """
+        from converter.so_db_consumer_lowering import (
+            SoDbUnresolved,
+            find_so_db_consumers,
+            lower_so_db_consumers,
+        )
+
+        project_root = getattr(self, "unity_project_path", None)
+        if project_root is None:
+            return
+        if self.state.rbx_place is None:
+            return
+        so_map_obj = scene_runtime.get("scriptable_objects")
+        if not isinstance(so_map_obj, dict) or not so_map_obj:
+            return
+        so_map: dict[str, str] = {
+            g: p for g, p in so_map_obj.items()
+            if isinstance(g, str) and isinstance(p, str)
+        }
+        if not so_map:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # The SO-addressables surface (label/address -> emitted-SO guids), re-parsed
+        # off-disk exactly as _build_theme_seed_plan derives it (the persisted
+        # ``addressables`` block is prefab-narrowed and has dropped the SO guids).
+        from unity.addressables_resolver import (
+            parse_addressables,
+            resolve_prefab_addressables,
+            resolve_scriptable_object_addressables,
+        )
+        index = parse_addressables(project_root)
+        so_addr = resolve_scriptable_object_addressables(
+            index, guid_index, set(so_map.keys()),
+        )
+        if not so_addr.by_label and not so_addr.by_address:
+            return
+
+        # C# source per placed module, keyed by the script's source_path so the
+        # finder and the locator share one key space (resume-safe off-disk re-read).
+        scripts = list(getattr(self.state.rbx_place, "scripts", []) or [])
+        csharp_by_path: dict[str, str] = {}
+        load_method_by_path: dict[str, str] = {}
+        for script in scripts:
+            name = getattr(script, "name", None)
+            sp = getattr(script, "source_path", None)
+            if not isinstance(name, str) or not isinstance(sp, str):
+                continue
+            if sp in csharp_by_path:
+                continue
+            cs_source = self._find_cs_source_for_module(name)
+            if cs_source is None:
+                continue
+            csharp_by_path[sp] = cs_source
+            ownership = _derive_cs_load_ownership(cs_source)
+            if ownership is not None:
+                load_method_by_path[sp] = ownership.load_method_name
+
+        # Layer (a) disjointness: exclude any module the roster lowering already
+        # rewrote this run. Re-derive its claimed set read-only via
+        # find_roster_consumers over the prefab-narrowed by_label (touches no roster
+        # code, runs no second rewrite). The roster lowering ran earlier (in
+        # transpile_with_contract), so this set is final.
+        from converter.roster_consumer_lowering import find_roster_consumers
+        prefab_addr = resolve_prefab_addressables(index, guid_index)
+        roster_facts = find_roster_consumers(csharp_by_path, prefab_addr.by_label)
+        roster_claimed_paths = frozenset(roster_facts.keys())
+
+        so_facts = find_so_db_consumers(
+            csharp_by_path,
+            so_addr.by_label,
+            so_addr.by_address,
+            so_map,
+            roster_claimed_paths,
+        )
+        if not so_facts:
+            return
+        try:
+            lowered = lower_so_db_consumers(
+                scripts, so_facts, load_method_by_path,
+            )
+        except SoDbUnresolved as exc:
+            log.warning("[so-db] fail-closed: %s", exc)
+            raise
+        if lowered:
+            log.info(
+                "[write_output] scene-runtime generic: SO-DB consumer-lowering "
+                "rewrote %d keyed-dictionary database(s)", lowered,
+            )
+
+    def _lower_spawn_call_sites(self) -> None:
+        """Rewrite the dynamic Addressables spawn call sites in every placed
+        module to ``self.host.instantiatePrefab(<prefab-id>, …)`` (gap #5 L1).
+
+        Origin-comment-anchored, adjacency-bounded shape rewrite (see
+        ``spawn_call_site_lowering``). Pure per-module; mutates each
+        ``RbxScript.source`` in place (the sibling-pass convention). Fail-soft per
+        site (abstain on a shape/expr miss); the consumable site is DEFERRED
+        (detected + counted, never rewritten — D-P4-11). Idempotent.
+        """
+        if self.state.rbx_place is None:
+            return
+        from converter.spawn_call_site_lowering import (
+            lower_spawn_call_sites_in_scripts,
+        )
+
+        scripts = list(getattr(self.state.rbx_place, "scripts", []) or [])
+        if not scripts:
+            return
+        result = lower_spawn_call_sites_in_scripts(scripts)
+        if result.rewritten or result.deferred:
+            log.info(
+                "[write_output] scene-runtime generic: spawn call-site lowering "
+                "rewrote %d site(s), DEFERRED %d (fail-closed, see followups)",
+                result.rewritten, result.deferred,
+            )
+
+    def _build_consumable_db_seeds(self, scene_runtime: dict[str, object]) -> None:
+        """RECOMPUTE ``scene_runtime["consumable_db_seeds"]`` — the per-DB seed
+        records the boot shim replays to MATERIALIZE a consumable-style SO's
+        array of in-prefab-component refs into component instances before its
+        consumer drains it (design-phase1 §1.A/§1.B).
+
+        Distinct from the addressable/theme seed: that path keys on a
+        ``LoadAssetsAsync<T>("<label>", …)`` LABEL load; THIS path keys on an
+        emitted SO module whose ``.asset`` carries a field that is a list of
+        in-prefab component object-refs sharing one MonoBehaviour-derived base
+        (§1.A.4) AND whose owning DB C# drains the field as objects (§1.A.5).
+
+        RECOMPUTED every ``write_output`` — NOT persisted, NOT transpile-gated.
+        Inputs rehydrated by ESSENTIAL phases on a no-retranspile resume (the
+        ``.asset``/``.prefab``/``.cs`` re-read off disk; the SO guid->module map
+        from ``scene_runtime``). Pop-first AUTHORITATIVE: clear any stale seed
+        BEFORE any abstain, so every abstain path leaves NO seed (D17).
+        """
+        from converter.consumable_db_seed import (
+            ConsumableSeed,
+            _resolve_class_stem,
+            build_base_by_class,
+            resolve_db_seed,
+        )
+        from converter.scriptable_object_converter import convert_asset_file
+
+        scene_runtime.pop("consumable_db_seeds", None)
+        so_map_obj = scene_runtime.get("scriptable_objects")
+        if not isinstance(so_map_obj, dict) or not so_map_obj:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # The class->immediate-base map for the common-base gate (built once,
+        # reused across every DB candidate).
+        base_by_class = build_base_by_class(guid_index)
+
+        # Build-time subclass module-path resolver, replacing the shim's
+        # non-deterministic runtime stem scan (finding P2). Joins a subclass stem
+        # to its emitted ``module_path`` through ``scene_runtime["modules"]``
+        # (primary: ``class_name``; fallback: ``stem``) under the SAME collision-
+        # exclusion contract the planner enforces — a colliding stem/class_name
+        # returns None (the element is DROPPED, fail-closed).
+        module_path_for_stem = self._build_subclass_module_path_resolver(
+            scene_runtime,
+        )
+
+        seeds: list[ConsumableSeed] = []
+        seeded_db_paths: set[str] = set()
+        for guid in sorted(g for g in so_map_obj if isinstance(g, str)):
+            asset_path = guid_index.resolve(guid)
+            if asset_path is None or asset_path.suffix != ".asset":
+                continue
+            converted = convert_asset_file(asset_path, guid_index)
+            if converted is None:
+                continue
+            asset_body = self._asset_monobehaviour_body(asset_path)
+            if asset_body is None:
+                continue
+            # The emitted SO MODULE is named by the asset's ``m_Name``
+            # (``asset_name``); the DB CLASS that DRAINS the array is the
+            # ``.asset``'s backing ``m_Script`` class — which can differ from
+            # ``m_Name`` (e.g. ``Consumables.asset`` backed by class
+            # ``ConsumableDatabase``). Look up the C# source by the CLASS stem,
+            # NOT the asset name, or the drain-pattern gate reads no source and
+            # the seed is silently dead. Fall back to the asset name only when
+            # the class stem is unresolvable (the legacy SO-with-no-script case).
+            db_name = converted.asset_name
+            db_module_path = self._module_plan_path(db_name)
+            if db_module_path is None or db_module_path in seeded_db_paths:
+                continue
+            m_script = asset_body.get("m_Script")
+            script_guid = (
+                m_script.get("guid") if isinstance(m_script, dict) else None
+            )
+            db_class_stem = (
+                _resolve_class_stem(script_guid, guid_index)
+                if isinstance(script_guid, str)
+                else None
+            ) or db_name
+            db_cs_source = self._find_cs_source_for_module(db_class_stem)
+            if db_cs_source is None:
+                continue
+            seed = resolve_db_seed(
+                db_module_path=db_module_path,
+                db_cs_source=db_cs_source,
+                asset_body=asset_body,
+                guid_index=guid_index,
+                base_by_class=base_by_class,
+                module_path_for_stem=module_path_for_stem,
+            )
+            if seed is None:
+                continue
+            if not seed["elements"]:
+                log.warning(
+                    "[consumable_seed] %s: all elements dropped; seeding EMPTY "
+                    "array (degraded-but-bootable)", db_module_path,
+                )
+            seeds.append(seed)
+            seeded_db_paths.add(db_module_path)
+
+        if seeds:
+            scene_runtime["consumable_db_seeds"] = seeds
+            log.info(
+                "[write_output] scene-runtime generic: built %d consumable db "
+                "seed(s) (%d element(s) total)",
+                len(seeds), sum(len(s["elements"]) for s in seeds),
+            )
+
+    def _build_lazy_singleton_seeds(self, scene_runtime: dict[str, object]) -> None:
+        """RECOMPUTE ``scene_runtime["lazy_singletons"]`` — the per-class seed
+        records the boot shim (slice 2.2) replays to CONSTRUCT + AWAKE exactly one
+        instance of each lazily-created singleton MonoBehaviour before any consumer
+        uses it (design-phase2 §1.2).
+
+        A lazy singleton is a component class with a static self-typed backing
+        field + a static ``instance``/``Instance`` getter that self-instantiates
+        (``new GameObject`` + ``AddComponent<Self>`` + cache) and whose whole
+        eager-boot lifecycle surface is side-effect-free (§1.1a). The detection is
+        STRUCTURAL (the C# shape + the component class graph), never the
+        ``CoroutineHandler`` literal and never the AI-emitted Luau.
+
+        RECOMPUTED every ``write_output`` — NOT persisted, NOT transpile-gated.
+        Inputs rehydrated by ESSENTIAL phases on a no-retranspile resume (the
+        ``.cs`` re-read off disk via the GuidIndex; ``scene_runtime["modules"]``
+        for the resolved ``script_guid``/``module_path``/``domain``). Pop-first
+        AUTHORITATIVE: clear any stale seed BEFORE any abstain (D17).
+        """
+        from converter.consumable_db_seed import build_base_by_class
+        from converter.lazy_singleton_seed import (
+            LazySingletonSeed,
+            resolve_lazy_singletons,
+        )
+
+        scene_runtime.pop("lazy_singletons", None)
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict) or not modules_obj:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        base_by_class = build_base_by_class(guid_index)
+        # Same build-time collision-exclusion resolver Phase 1 uses to join a
+        # class stem to its emitted module_path (a colliding stem returns None →
+        # the class is DROPPED fail-closed).
+        module_path_for_stem = self._build_subclass_module_path_resolver(
+            scene_runtime,
+        )
+
+        seeds: list[LazySingletonSeed] = resolve_lazy_singletons(
+            modules=cast("dict[str, object]", modules_obj),
+            guid_index=guid_index,
+            base_by_class=base_by_class,
+            module_path_for_stem=module_path_for_stem,
+        )
+        if seeds:
+            scene_runtime["lazy_singletons"] = seeds
+            log.info(
+                "[write_output] scene-runtime generic: built %d lazy-singleton "
+                "seed(s): %s",
+                len(seeds), ", ".join(s["class_stem"] for s in seeds),
+            )
+
+    def _build_subclass_module_path_resolver(
+        self, scene_runtime: dict[str, object],
+    ) -> "Callable[[str], str | None]":
+        """Return a callable ``class_stem -> module_path | None`` that resolves a
+        subclass stem to its emitted module's dotted DataModel path AT BUILD TIME,
+        replacing the shim's non-deterministic runtime ``pairs()`` scan (P2).
+
+        Joins through ``scene_runtime["modules"]`` (each row carries ``stem`` /
+        ``class_name`` / ``module_path``) with the planner's collision-exclusion
+        contract: a stem that is a colliding ``class_name`` OR a colliding ``stem``
+        is EXCLUDED (returns ``None``), so a fail-closed element DROP mirrors
+        ``build_script_id_by_name``. Primary join on ``class_name`` (the C# class
+        name == the stem for the consumable family), fallback on ``stem``.
+        """
+        from converter.scene_runtime_planner import (
+            _compute_stem_collisions,
+            compute_class_name_collisions,
+        )
+
+        modules_obj = scene_runtime.get("modules")
+        modules: dict[str, object] = (
+            modules_obj if isinstance(modules_obj, dict) else {}
+        )
+        class_name_collisions = compute_class_name_collisions(
+            cast("dict", modules),
+        )
+        stem_collisions = _compute_stem_collisions(cast("dict", modules))
+
+        # Build collision-free name -> module_path indexes (primary class_name,
+        # fallback stem), excluding colliding keys exactly like the planner.
+        by_class_name: dict[str, str] = {}
+        by_stem: dict[str, str] = {}
+        for module in modules.values():
+            if not isinstance(module, dict):
+                continue
+            mp_obj = module.get("module_path")
+            if not isinstance(mp_obj, str) or not mp_obj:
+                continue
+            cn_obj = module.get("class_name", "")
+            cn = cn_obj if isinstance(cn_obj, str) else ""
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            if cn and cn not in class_name_collisions:
+                by_class_name.setdefault(cn, mp_obj)
+            if stem and stem != cn and stem not in stem_collisions:
+                by_stem.setdefault(stem, mp_obj)
+
+        def resolve(class_stem: str) -> str | None:
+            if not class_stem:
+                return None
+            if class_stem in class_name_collisions or class_stem in stem_collisions:
+                return None  # fail-closed on a colliding key
+            mp = by_class_name.get(class_stem)
+            if mp is not None:
+                return mp
+            return by_stem.get(class_stem)
+
+        return resolve
+
+    def _asset_monobehaviour_body(
+        self, asset_path: Path,
+    ) -> dict[str, object] | None:
+        """Re-parse a ScriptableObject ``.asset`` off disk and return its
+        MonoBehaviour body dict (the same doc the SO converter reads), or
+        ``None``. Resume-safe (off-disk parse)."""
+        from unity.yaml_parser import doc_body, parse_documents
+        try:
+            raw = asset_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        for class_id, _fid, doc in parse_documents(raw):
+            if class_id == 114 and "MonoBehaviour" in doc:
+                return doc_body(doc)
+        return None
 
     def _module_plan_path(self, module_name: str) -> str | None:
         """The dotted DataModel path of a runtime-bearing module by name —

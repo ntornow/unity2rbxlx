@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
+from converter.cs_text_scan import _canon_key, _cs_pos_is_code
 from core.unity_types import (
     GuidIndex,
     ParsedScene,
@@ -72,6 +72,23 @@ class RigRootedRetargetFact:
     child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded
     cam_receiver: str = ""  # the C# group-2 camera receiver text (the lowering's RECEIVER ANCHOR)
     ordinal: int = 0  # the n in the credited GetChild(n); -> carrier cam_ordinal
+    # --- NEW equip obligation (Phase 1) — populated ONLY on the unambiguous
+    #     held-prefab-equip shape (Instantiate(prefab)+SetParent(field) in ONE C#
+    #     method). Default "" means "no equip obligation" (ABSTAIN — D8/D11): the
+    #     equip lowering/verifier do not fire for that script and the existing
+    #     rig-retarget path is untouched. The discriminator is
+    #     ``equip_method != "" and prefab_field != ""``.
+    equip_method: str = ""  # C# method hosting Instantiate(prefab)+SetParent(slot)
+    prefab_field: str = ""  # the C# prefab field instantiated (e.g. "riflePrefab")
+    # The UNIFORM display scale the C# equip method applies to the instantiated
+    # prefab (``rifle.transform.localScale = Vector3.one * 0.2f`` -> 0.2). ``None``
+    # means "no scale CAPTURED" — distinct from an explicit ``1.0`` — so the bridge
+    # can collision-check a real explicit 1.0 against a conflicting capture instead
+    # of silently dropping it: the script set no localScale on the equip object, or
+    # set a NON-uniform / non-positive scale (deliberately not lowered, since the
+    # runtime Model:ScaleTo is uniform-only). Carried to runtime so the welded weapon
+    # is sized as the source game displayed it (NOT hardcoded).
+    equip_scale: float | None = None
 
 
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
@@ -136,76 +153,111 @@ _CS_CAM_GETCHILD_RE = re.compile(
 )
 
 
-def _cs_pos_is_code(source: str, pos: int) -> bool:
-    """True if char index ``pos`` is real C# code, not inside a string literal
-    or a comment. Scans from the START of the file (block comments and verbatim
-    strings can open on a prior line, so a per-line scan would miss them),
-    tracking: ``//`` line comments, ``/* */`` block comments, regular
-    ``"..."`` strings (``\\`` escapes), verbatim ``@"..."`` strings (``""`` is an
-    escaped quote, ``\\`` is literal), and ``'...'`` char literals — the forms
-    the textual matchers must avoid firing inside."""
-    i = 0
-    n = len(source)
-    while i < pos:
-        ch = source[i]
-        # Line comment — skip to end of line.
-        if ch == "/" and i + 1 < n and source[i + 1] == "/":
-            nl = source.find("\n", i)
-            if nl == -1 or nl >= pos:
-                return False  # comment runs through pos
-            i = nl + 1
-            continue
-        # Block comment — skip to closing ``*/``.
-        if ch == "/" and i + 1 < n and source[i + 1] == "*":
-            end = source.find("*/", i + 2)
-            if end == -1 or end + 2 > pos:
-                return False  # block comment encloses pos
-            i = end + 2
-            continue
-        # Verbatim string ``@"..."`` — ``""`` escapes a quote, ``\`` is literal.
-        if ch == "@" and i + 1 < n and source[i + 1] == '"':
-            j = i + 2
-            while j < n:
-                if source[j] == '"':
-                    if j + 1 < n and source[j + 1] == '"':
-                        j += 2
-                        continue
-                    break
-                j += 1
-            if j >= pos:
-                return False  # string encloses pos
-            i = j + 1
-            continue
-        # Regular string ``"..."`` — ``\`` escapes.
-        if ch == '"':
-            j = i + 1
-            while j < n:
-                if source[j] == "\\":
-                    j += 2
-                    continue
-                if source[j] == '"':
-                    break
-                j += 1
-            if j >= pos:
-                return False
-            i = j + 1
-            continue
-        # Char literal ``'...'`` — ``\`` escapes.
-        if ch == "'":
-            j = i + 1
-            while j < n:
-                if source[j] == "\\":
-                    j += 2
-                    continue
-                if source[j] == "'":
-                    break
-                j += 1
-            if j >= pos:
-                return False
-            i = j + 1
-            continue
-        i += 1
-    return True
+# --- Equip-obligation matchers (Phase 1) ----------------------------------
+# A first ``Instantiate`` arg that is a literal / call / foreign member access
+# (``Instantiate(new GameObject())``, ``Instantiate(a.b)``) is NOT a lone bare /
+# ``this.``-field prefab -> the bind/chain matchers below do not capture it as a
+# prefab field -> ABSTAIN (D11).
+#
+# A ``<receiver>.SetParent(<slot>)`` call. Group 1 is the FULL receiver chain text
+# preceding ``.SetParent`` (e.g. ``r``, ``r.transform``, ``this.r.transform``);
+# group 2 is the ``<slot>`` argument text. The resolver (a) compares the slot
+# against the recognized rig ``field`` AND (b) binds the receiver back to the
+# Instantiate result symbol — proving the PARENTED object IS the instantiated one
+# The receiver class is captured greedily as a dotted/`this.` chain.
+_CS_SETPARENT_RE = re.compile(
+    r"\b((?:this\.)?[A-Za-z_][\w.]*?)\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
+)
+
+# A directly-chained ``Instantiate(<prefab>)[.transform].SetParent(<slot>)`` —
+# the result symbol is implicit (never bound to a var). Group 1 = optional
+# ``this.`` on the prefab, group 2 = the bare prefab field, group 3 = the slot arg.
+# The optional ``.transform`` between the call and ``.SetParent`` is allowed (and
+# nothing else — a foreign member access breaks the chain -> no match).
+_CS_INSTANTIATE_CHAIN_SETPARENT_RE = re.compile(
+    r"\bInstantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*\)"
+    r"(?:\.transform)?\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
+)
+
+# The Instantiate-result binding ``[var] <sym> = Instantiate(<prefab>, …)`` —
+# binds the spawned object to a local/field ``<sym>`` so a later
+# ``<sym>[.transform].SetParent(<slot>)`` can be proven to parent THAT object.
+# Group 1 = ``<sym>`` (the bound symbol), group 2 = optional ``this.`` on the
+# prefab, group 3 = the bare prefab field. ``var``/a type prefix is optional.
+_CS_INSTANTIATE_BIND_RE = re.compile(
+    r"\b(?:var\s+|[A-Za-z_][\w.<>]*\s+)?"
+    r"(this\.[A-Za-z_]\w*|[A-Za-z_]\w*)\s*=\s*"
+    r"Instantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*(?:[,)])"
+)
+
+# A ``<recv>.transform.localScale = <rhs>;`` assignment on the instantiated
+# prefab object inside the equip method (e.g. ``rifle.transform.localScale =
+# Vector3.one * 0.2f;``). Group 1 = the receiver chain preceding ``.localScale``
+# (``rifle``, ``rifle.transform``, ``this.rifle.transform``); group 2 = the RHS
+# expression up to the statement terminator. The resolver matches the receiver
+# BASE symbol against the proven Instantiate result symbol and parses the RHS as a
+# UNIFORM scale (Unity Vector3) — a non-uniform / unparseable RHS yields no factor
+# (scale stays the None "no-capture" sentinel), since the runtime ScaleTo is uniform-only.
+_CS_LOCALSCALE_RE = re.compile(
+    r"\b((?:this\.)?[A-Za-z_][\w.]*?)\.localScale\s*=\s*([^;]+);"
+)
+# A C# float literal: optional sign, integer/fraction/exponent forms (``0.2``,
+# ``.2``, ``2``, ``2e-1``). The numeric VALUE is captured WITHOUT the trailing
+# ``f``/``F`` suffix (matched separately, outside the group) so ``float()`` parses
+# the captured text directly.
+_CS_FLOAT = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?"
+# RHS uniform-scale forms: ``Vector3.one * f`` / ``f * Vector3.one`` /
+# ``new Vector3(f, f, f)`` (uniform only). A trailing ``f``/``F`` float suffix and
+# an optional sign are tolerated. Anchored to the whole RHS (after strip) so a
+# partial/compound expression does not falsely match.
+_CS_SCALE_ONE_MUL_RE = re.compile(
+    r"\A(?:Vector3\.one\s*\*\s*(" + _CS_FLOAT + r")[fF]?"
+    r"|(" + _CS_FLOAT + r")[fF]?\s*\*\s*Vector3\.one)\Z"
+)
+_CS_SCALE_NEW_VECTOR3_RE = re.compile(
+    r"\Anew\s+Vector3\s*\(\s*(" + _CS_FLOAT + r")[fF]?\s*,\s*"
+    r"(" + _CS_FLOAT + r")[fF]?\s*,\s*(" + _CS_FLOAT + r")[fF]?\s*\)\Z"
+)
+
+
+def _parse_uniform_scale_rhs(rhs: str) -> float | None:
+    """Parse a C# ``localScale`` RHS as a POSITIVE UNIFORM scale factor, else None.
+
+    Recognizes ``Vector3.one * f``, ``f * Vector3.one`` and a ``new Vector3(f,f,f)``
+    whose three components are EQUAL. Returns None (ABSTAIN) for a non-uniform
+    ``new Vector3(x,y,z)`` (the runtime ``Model:ScaleTo`` is uniform-only, so we do
+    not distort), any other/identifier expression, AND a NON-POSITIVE factor
+    (``<= 0`` — a pathological scale ScaleTo would reject; abstain rather than ship a
+    Plan entry that is dead on arrival)."""
+    expr = rhs.strip()
+    m = _CS_SCALE_ONE_MUL_RE.match(expr)
+    if m is not None:
+        factor = float(m.group(1) if m.group(1) is not None else m.group(2))
+        return factor if factor > 0 else None
+    m = _CS_SCALE_NEW_VECTOR3_RE.match(expr)
+    if m is not None:
+        x, y, z = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        if x == y == z and x > 0:
+            return x
+        return None  # non-uniform / non-positive -> abstain
+    return None
+
+# A C# method declaration header ``<modifiers/ret> <Name>(…)`` immediately
+# followed (modulo whitespace/comments) by an opening ``{``. Used to locate the
+# nearest enclosing method body for a code position. The method NAME is group 1.
+# The pattern is intentionally permissive on the return-type/modifier prefix (it
+# only needs the ``<Name>(`` then a ``{`` body) — a control-flow head
+# (``if (…) {``) is excluded because its keyword is not captured as a method name
+# (we reject C# keywords in ``_enclosing_cs_method``).
+_CS_METHOD_DECL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{")
+
+# C# control-flow / statement keywords that the method-decl regex could match as a
+# "method name" (``if (cond) {``). Rejected so a method scope never resolves to a
+# control-flow block.
+_CS_NOT_A_METHOD_NAME: frozenset[str] = frozenset({
+    "if", "for", "foreach", "while", "switch", "do", "else", "lock", "using",
+    "fixed", "catch", "try", "return", "in", "is", "as", "new",
+})
 
 
 # Host-self aliases: in Unity C#, ``transform``, ``this.transform``,
@@ -515,15 +567,6 @@ def _node_by_cs_path(
                 _record(node)
 
     return out
-
-
-def _canon_key(path: Path) -> str:
-    """The canonical .cs path key: ``str(path.resolve())`` when resolvable, else
-    the raw string (a synthetic test path that doesn't exist on disk)."""
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
 
 
 _CAMERA_MAIN_TRANSFORM = "Camera.main.transform"
@@ -929,6 +972,199 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
     return None  # any leading token (a type, a control-flow head) -> abstain
 
 
+def _enclosing_cs_method(source: str, pos: int) -> tuple[str, int, int] | None:
+    """The nearest enclosing C# method ``<name>(…) { … }`` that CONTAINS ``pos``.
+
+    Returns ``(method_name, body_open_idx, body_close_idx)`` where ``body_open_idx``
+    is the index of the method's opening ``{`` and ``body_close_idx`` is the index
+    just past its matching ``}`` (brace-balanced over code positions). Returns None
+    if ``pos`` is not inside any method body.
+
+    Code-position-aware (comments/strings skipped). A control-flow head
+    (``if (cond) {``) is excluded — its keyword is rejected as a method name.
+    Picks the INNERMOST method whose ``{ … }`` body brackets ``pos`` (so a nested
+    local-function body wins over the outer method), which is what binds the equip
+    obligation to one rewrite site."""
+    best: tuple[str, int, int] | None = None
+    for m in _CS_METHOD_DECL_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        name = m.group(1)
+        if name in _CS_NOT_A_METHOD_NAME:
+            continue
+        brace_open = source.index("{", m.end() - 1)
+        body_end = _cs_block_end(source, brace_open)
+        if body_end is None:
+            continue
+        if brace_open < pos < body_end:
+            # Innermost wins: a later (textually-deeper) match that still brackets
+            # ``pos`` is nested inside, so prefer the one with the LATEST open brace.
+            if best is None or brace_open > best[1]:
+                best = (name, brace_open, body_end)
+    return best
+
+
+def _cs_block_end(source: str, open_brace_idx: int) -> int | None:
+    """The index just past the ``}`` matching the ``{`` at ``open_brace_idx``,
+    brace-balanced over code positions only (strings/comments skipped). None if
+    unbalanced (runs off the end)."""
+    depth = 0
+    i = open_brace_idx
+    n = len(source)
+    while i < n:
+        if not _cs_pos_is_code(source, i):
+            i += 1
+            continue
+        ch = source[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _setparent_receiver_base(receiver: str) -> str:
+    """The base symbol of a SetParent receiver chain — strip a trailing
+    ``.transform`` and a leading ``this.``, leaving the spawned-object symbol so it
+    can be matched against the Instantiate-result binding. ``r`` / ``r.transform``
+    / ``this.r.transform`` all reduce to ``r``."""
+    base = receiver
+    if base.endswith(".transform"):
+        base = base[: -len(".transform")]
+    if base.startswith("this."):
+        base = base[len("this.") :]
+    return base
+
+
+def _resolve_equip_obligation(
+    source: str, field: str
+) -> tuple[str, str, float | None] | None:
+    """For an admitted rig fact on C# field ``field``, return
+    ``(equip_method, prefab_field, equip_scale)`` iff the script contains the
+    UNAMBIGUOUS held-prefab-equip shape — else None (ABSTAIN, D8/D11).
+    ``equip_scale`` is the UNIFORM ``localScale`` the method applies to the
+    instantiated prefab (``Vector3.one * 0.2f`` -> 0.2), or ``None`` when no uniform
+    positive scale was captured (no localScale / non-uniform / non-positive).
+
+    Unambiguous shape (ALL required, code-position-aware, in the SAME C# method):
+      1. an ``Instantiate(<prefabField>, …)`` whose first arg is a bare /
+         ``this.``-field identifier (the prefab), bound to a result symbol
+         ``<sym>`` (``[var] <sym> = Instantiate(<prefab>)``) OR directly chained
+         (``Instantiate(<prefab>)[.transform].SetParent(...)``), AND
+      2. a ``<receiver>.SetParent(<slot>)`` whose ``<slot>`` is EXACTLY the
+         recognized rig ``field`` (bare or ``this.``-qualified) AND whose
+         ``<receiver>`` base symbol IS that same ``<sym>`` — i.e. the PARENTED
+         object is provably the INSTANTIATED one, AND
+      3. both in the SAME enclosing method ``M``.
+
+    ABSTAIN (None) on: no qualifying Instantiate; a SetParent whose slot is not
+    ``field``; a SetParent whose receiver is NOT the Instantiate result (parents a
+    DIFFERENT object); the two in DIFFERENT methods; ``>1`` distinct
+    qualifying method (ambiguous — §Edge f); an unresolvable prefab arg (D11).
+    Pure; code-position-aware; keyed entirely on the C# ``field`` already proven to
+    be the MainCamera-child slot."""
+    # Find every SetParent(slot) whose slot is EXACTLY ``field`` (the rig slot),
+    # capturing the receiver base symbol + enclosing method.
+    # method -> list of (receiver_base_symbol, body_open, body_close)
+    setparent_hits: dict[str, list[tuple[str, int, int]]] = {}
+    for m in _CS_SETPARENT_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        slot = m.group(2)
+        if slot != field and slot != f"this.{field}":
+            continue  # SetParent onto a different slot -> not this obligation
+        enc = _enclosing_cs_method(source, m.start())
+        if enc is None:
+            continue
+        recv_base = _setparent_receiver_base(m.group(1))
+        setparent_hits.setdefault(enc[0], []).append((recv_base, enc[1], enc[2]))
+    if not setparent_hits:
+        return None  # no SetParent onto the rig slot -> abstain
+
+    candidates: list[tuple[str, str, float | None]] = []
+    for method, hits in setparent_hits.items():
+        body_open, body_close = hits[0][1], hits[0][2]
+        # (A) Directly-chained Instantiate(prefab)[.transform].SetParent(field) —
+        # the parented object IS the instantiate result by construction.
+        chain_prefabs: set[str] = set()
+        for cm in _CS_INSTANTIATE_CHAIN_SETPARENT_RE.finditer(
+            source, body_open, body_close
+        ):
+            if not _cs_pos_is_code(source, cm.start()):
+                continue
+            cslot = cm.group(3)
+            if cslot != field and cslot != f"this.{field}":
+                continue
+            chain_prefabs.add(cm.group(2))
+        # (B) Symbol-bound: <sym> = Instantiate(prefab) where <sym> is the base
+        # symbol parented by one of this method's SetParent(field) receivers.
+        bind_prefabs: set[str] = set()
+        receiver_bases = {h[0] for h in hits}
+        for bm in _CS_INSTANTIATE_BIND_RE.finditer(source, body_open, body_close):
+            if not _cs_pos_is_code(source, bm.start()):
+                continue
+            sym_base = _setparent_receiver_base(bm.group(1))
+            if sym_base not in receiver_bases:
+                continue  # this Instantiate binds a DIFFERENT symbol -> not it
+            bind_prefabs.add(bm.group(3))
+        method_prefabs = chain_prefabs | bind_prefabs
+        if len(method_prefabs) != 1:
+            # zero -> the parented object isn't a proven Instantiate result (the
+            # over-broad false-positive this strictness avoids); >1 -> ambiguous. Abstain.
+            continue
+        prefab = next(iter(method_prefabs))
+        # Uniform display scale (D17/Bug-2): the C# method may set the spawned
+        # object's ``localScale`` (``rifle.transform.localScale = Vector3.one *
+        # 0.2f``). Capture it from a localScale assignment in THIS method whose
+        # receiver base IS the instantiate result symbol; UNIFORM only (ScaleTo is
+        # uniform). Multiple uniform localScale writes on the object -> the LAST
+        # wins (C# sequential assignment); none / non-uniform / non-positive ->
+        # None (no capture — distinct from an explicit 1.0).
+        scale: float | None = None
+        for sm in _CS_LOCALSCALE_RE.finditer(source, body_open, body_close):
+            if not _cs_pos_is_code(source, sm.start()):
+                continue
+            if _setparent_receiver_base(sm.group(1)) not in receiver_bases:
+                continue  # localScale on a DIFFERENT object -> not the equip prefab
+            parsed = _parse_uniform_scale_rhs(sm.group(2))
+            if parsed is not None:
+                scale = parsed
+        candidates.append((method, prefab, scale))
+
+    # >1 distinct qualifying (method, prefab) -> ambiguous obligation -> ABSTAIN
+    # (the single carrier holds one obligation; bias to the recognizer's abstain).
+    distinct = {(m, p) for m, p, _ in candidates}
+    if len(distinct) != 1:
+        return None
+    method_name = candidates[0][0]
+    # OVERLOAD COLLAPSE (D8 abstain-on-ambiguity): the obligation is keyed by bare
+    # method NAME, but C# permits overloads sharing a name (``GetRifle(int)`` /
+    # ``GetRifle(Transform)``). If >1 C# method declaration shares the resolved
+    # ``equip_method`` name, the Luau-side lowering/verifier cannot disambiguate the
+    # rewrite site, so ABSTAIN rather than bind one arbitrary obligation.
+    if _count_cs_methods_named(source, method_name) > 1:
+        return None
+    return candidates[0]
+
+
+def _count_cs_methods_named(source: str, name: str) -> int:
+    """The number of distinct C# method DECLARATIONS named ``name`` (code positions
+    only). Used to ABSTAIN on overload collapse — two ``GetRifle(…)`` overloads
+    collapse to one bare-name obligation, so the recognizer must not bind either."""
+    count = 0
+    for m in _CS_METHOD_DECL_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        if m.group(1) in _CS_NOT_A_METHOD_NAME:
+            continue
+        if m.group(1) == name:
+            count += 1
+    return count
+
+
 def _resolve_rig_facts(
     source: str,
     host_node: HostNode,
@@ -962,12 +1198,23 @@ def _resolve_rig_facts(
         if child is None:
             continue  # E1–E3 -> abstain
         name = getattr(child, "name", "") or ""
+        # NEW (Phase 1): does this rig fact ALSO carry an equip obligation? The
+        # recognizer keys on the SAME proven slot ``field`` (receiver-agnostic, so
+        # the seeded one-hop and direct forms behave identically). Abstain -> empty
+        # equip fields -> the equip lowering/verifier do not fire (D8/D11).
+        equip = _resolve_equip_obligation(source, field)
+        equip_method = equip[0] if equip is not None else ""
+        prefab_field = equip[1] if equip is not None else ""
+        equip_scale = equip[2] if equip is not None else None
         rig_facts.append(
             RigRootedRetargetFact(
                 field_name=field,
                 child_name=name,
                 cam_receiver=m.group(2),
                 ordinal=ordinal,  # credited GetChild(n) -> carrier cam_ordinal
+                equip_method=equip_method,
+                prefab_field=prefab_field,
+                equip_scale=equip_scale,
             )
         )
     return rig_facts

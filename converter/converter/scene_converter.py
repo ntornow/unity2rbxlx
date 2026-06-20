@@ -1598,7 +1598,10 @@ def convert_scene(
     # suppression carve-out (Piece 4) can fire for runtime-bearing UI
     # controllers. Legacy mode passes the empty set + mode="legacy" so
     # the static-emit path is byte-identical to pre-PR3c.
-    from converter.ui_translator import find_canvas_nodes, convert_canvas
+    from converter.ui_translator import (
+        find_canvas_nodes, convert_canvas, build_component_owner_index,
+        ToggleBinding,
+    )
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
         ui_suppress_ids = (
@@ -1606,12 +1609,34 @@ def convert_scene(
             if scene_runtime_mode == "generic" and scene_runtime
             else frozenset()
         )
+        # Scene-wide component fileID -> owning GameObject fileID map, built
+        # once. Threaded into canvas conversion so a serialized component
+        # reference (e.g. a Unity ``Toggle.graphic``) can be resolved to its
+        # owning GameObject.
+        component_owner_index = build_component_owner_index(parsed_scene.roots)
+        # By-ref accumulator for Toggle ``isOn`` -> checkmark-graphic bindings.
+        # ``convert_canvas`` appends a ``ToggleBinding`` per Toggle with a
+        # resolvable ``graphic``; the populated list is stashed onto
+        # ``scene_runtime["ui_toggle_bindings"]`` below so the host plan
+        # (``_PLAN_KEYS_FOR_HOST``) carries it to the runtime. The rows surface
+        # without a transport attribute on any produced instance.
+        toggle_bindings: list[ToggleBinding] = []
         place.screen_guis = convert_canvas(
             canvas_nodes,
             scene_namespace=_ctx().scene_runtime_namespace,
             scene_runtime_mode=scene_runtime_mode,
             suppress_static_children_ids=ui_suppress_ids,
+            component_owner_index=component_owner_index,
+            toggle_bindings=toggle_bindings,
         )
+        if scene_runtime is not None and toggle_bindings:
+            # Append to (not overwrite) so multi-scene conversions that share
+            # one ``scene_runtime`` dict accumulate every scene's bindings.
+            existing = scene_runtime.get("ui_toggle_bindings")
+            if isinstance(existing, list):
+                existing.extend(toggle_bindings)
+            else:
+                scene_runtime["ui_toggle_bindings"] = list(toggle_bindings)
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 
     # Detect terrain components and convert them to terrain ground parts.

@@ -188,6 +188,7 @@ def _drive_turret_e2e(
         project_context: str = "",
         runtime_mode: str = "legacy",
         is_player_controller: bool = False,
+        send_message_facts: tuple = (),
     ) -> tuple[str, float, list[str]]:
         # The pre-rewrite has ALREADY mutated csharp_source before it reaches
         # here — this is the load-bearing capture proving the real resolver ran.
@@ -293,6 +294,7 @@ def test_cold_no_real_ai_call_no_cache_dependency(tmp_path: Path) -> None:
         project_context: str = "",
         runtime_mode: str = "legacy",
         is_player_controller: bool = False,
+        send_message_facts: tuple = (),
     ) -> tuple[str, float, list[str]]:
         calls.append(class_name or "Turret")
         return _FAKE_TURRET_LUAU, 1.0, []
@@ -378,6 +380,7 @@ def test_scene_hosted_turret_resolves_via_single_scene_fallback(
         project_context: str = "",
         runtime_mode: str = "legacy",
         is_player_controller: bool = False,
+        send_message_facts: tuple = (),
     ) -> tuple[str, float, list[str]]:
         captured["csharp"] = csharp_source
         return _FAKE_TURRET_LUAU, 1.0, []

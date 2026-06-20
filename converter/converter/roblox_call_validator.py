@@ -63,8 +63,11 @@ _PROVEN_ITER_METHODS: frozenset[str] = frozenset(
 
 # Host APIs that return a NON-Roblox component table (a peer MonoBehaviour
 # instance), NOT a real Roblox Instance. A local bound from one of these is
-# tracked as ``component`` provenance: its ``.Parent``/``.Character``/``.Instance``
-# field access must NOT be promoted to proven (the base is not Roblox-typed).
+# tracked as ``component`` provenance. ``component`` also covers a local bound
+# from a ``require(...)``'d module (a plain Lua table, provably not Roblox-typed
+# — see ``_is_require_call``). Either way its ``.Parent``/``.Character``/
+# ``.Instance`` field access must NOT be promoted to proven (the base is not
+# Roblox-typed).
 # Confirmed against runtime/scene_runtime.luau:
 #   findObjectOfType -> _byClass[name][1] (a component instance)
 #   GetComponent     -> peer MonoBehaviour (or built-in fallback)
@@ -213,8 +216,9 @@ def _receiver_chain(line: str, colon_idx: int) -> str:
 
 ProvLit = Literal["proven", "unproven"]
 # Tracked provenance of a local in the per-scope map. ``component`` is an
-# internal-only state (a non-Roblox host-component table); it never surfaces as
-# an :class:`InvalidCall` provenance — a component receiver classifies as
+# internal-only state (a non-Roblox host-component result OR a require'd module
+# — both plain Lua tables, not Roblox Instances); it never surfaces as an
+# :class:`InvalidCall` provenance — a component receiver classifies as
 # ``unproven`` at a call site, and it suppresses ``.Parent`` field-promotion.
 TrackLit = Literal["proven", "unproven", "component"]
 
@@ -257,7 +261,8 @@ def _classify_receiver(expr: str, prov: dict[str, TrackLit]) -> ProvLit | None:
     entirely — receiver is self/self.host/require, never emit). A tracked
     ``component`` local never returns ``proven``: as a bare receiver it is
     ``unproven``, and it suppresses ``.Parent``/``.Character``/``.Instance``
-    field-promotion (the base is a non-Roblox component table).
+    field-promotion (the base is a non-Roblox table — a host-component result
+    or a require'd module).
     """
     expr = expr.strip()
     if not expr:
@@ -385,9 +390,10 @@ def _rhs_provenance(rhs: str, prov: dict[str, TrackLit]) -> TrackLit:
     """Provenance of an assignment RHS (for binding a local).
 
     Distinct from ``_classify_receiver`` only in that a bare untracked identifier
-    is ``unproven`` (not skipped) and self/require RHS yields ``unproven`` rather
-    than None — assignments always bind *some* provenance. A call to a
-    component-returning host API binds ``component``.
+    is ``unproven`` (not skipped) and self RHS yields ``unproven`` rather than
+    None — assignments always bind *some* provenance. A call to a
+    component-returning host API OR a ``require(...)``'d module binds
+    ``component`` (both are non-Roblox tables).
     """
     rhs = rhs.strip()
     # ``a and a:Method()`` / ``a and a.Field`` guard form: take the part after
@@ -395,10 +401,27 @@ def _rhs_provenance(rhs: str, prov: dict[str, TrackLit]) -> TrackLit:
     guard = _strip_and_guard(rhs)
     if _is_component_host_call(guard):
         return "component"
+    if _is_require_call(guard):
+        return "component"
     res = _classify_receiver(guard, prov)
     if res is None:
         return "unproven"
     return res
+
+
+def _is_require_call(rhs: str) -> bool:
+    """True if ``rhs`` is a top-level ``require(...)`` call.
+
+    Mirrors the require-skip in ``_classify_receiver`` (the ``require(``/
+    ``require (`` prefix check): a require'd module is a plain Lua table,
+    provably NOT Roblox-typed, so a local bound from it tracks ``component``.
+    Its ``.Instance``/``.Parent``/``.Character`` field access is therefore NOT
+    promoted to proven and its methods abstain (unproven / report-only). Keyed
+    on the binding RHS, not the variable name, so a real Roblox var bound from
+    ``workspace:FindFirstChild(...)`` is unaffected.
+    """
+    rhs = rhs.strip()
+    return rhs.startswith("require(") or rhs.startswith("require (")
 
 
 def _is_component_host_call(rhs: str) -> bool:

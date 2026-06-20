@@ -12,7 +12,11 @@ from __future__ import annotations
 import glob
 import os
 
-from converter.roblox_call_validator import find_invalid_roblox_calls
+from converter.roblox_call_validator import (
+    _is_require_call,
+    _rhs_provenance,
+    find_invalid_roblox_calls,
+)
 
 _FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "roblox_calls")
 
@@ -365,6 +369,77 @@ def test_dotted_method_definition_not_flagged() -> None:
     assert [ic for ic in out if ic["method"] == "Baz"] == [], (
         f"dotted method definition Baz must not be flagged: {out}"
     )
+
+
+# --- Slice 1.2: require'd module is a non-Roblox table (component) -----------
+
+
+def test_is_require_call_recognizes_require() -> None:
+    """``_is_require_call`` recognizes both require spellings, rejects others."""
+    assert _is_require_call("require(script.Parent.Foo)") is True
+    assert _is_require_call("require (script.Parent.Foo)") is True
+    assert _is_require_call('workspace:FindFirstChild("X")') is False
+    assert _is_require_call("self.host.getComponent(a, b)") is False
+
+
+def test_rhs_provenance_require_binds_component() -> None:
+    """ACCEPTANCE 7: a ``require(...)`` RHS binds ``component`` (not unproven)."""
+    assert _rhs_provenance("require(script.Parent.MusicPlayer)", {}) == "component"
+    assert _rhs_provenance("require (game.ReplicatedStorage.X)", {}) == "component"
+
+
+def test_required_module_instance_field_not_proven() -> None:
+    """ACCEPTANCE 8: ``MusicPlayer.Instance:GetStem("a")`` where MusicPlayer is
+    require'd yields ZERO proven invalids (the ``.Instance`` is not promoted)."""
+    src = 'local MusicPlayer = require(script.Parent.MusicPlayer)\nMusicPlayer.Instance:GetStem("a")'
+    out = find_invalid_roblox_calls(src)
+    proven = [ic for ic in out if ic["receiver_provenance"] == "proven"]
+    assert proven == [], f"require'd module .Instance must not be proven: {out}"
+
+
+def test_required_module_method_chain_no_proven() -> None:
+    """A run of require'd-module field/method calls yields no proven invalids."""
+    src = (
+        "local MusicPlayer = require(script.Parent.MusicPlayer)\n"
+        'MusicPlayer.Instance:SetStem("a")\n'
+        "MusicPlayer.Instance:RestartAllStems()"
+    )
+    out = find_invalid_roblox_calls(src)
+    assert [ic for ic in out if ic["receiver_provenance"] == "proven"] == []
+
+
+# --- Slice 1.2: RBXScriptSignal :Connect via corpus --------------------------
+
+
+def test_descendant_added_connect_no_invalid() -> None:
+    """ACCEPTANCE 10: ``workspace.DescendantAdded:Connect(fn)`` yields ZERO
+    invalids (Connect is now a corpus member)."""
+    assert _methods("workspace.DescendantAdded:Connect(fn)") == []
+
+
+def test_instance_touched_connect_no_invalid() -> None:
+    """ACCEPTANCE 10: ``someInstance.Touched:Connect(fn)`` yields ZERO invalids.
+
+    ``someInstance`` is untracked; ``.Touched`` is not a proven field so the
+    receiver is unproven, but ``Connect`` is a real Roblox member so nothing is
+    flagged at any provenance.
+    """
+    src = 'local part = workspace:FindFirstChild("X")\npart.Touched:Connect(fn)'
+    assert find_invalid_roblox_calls(src) == []
+
+
+# --- Slice 1.2 ADVERSARIAL: require fix did not over-abstain -----------------
+
+
+def test_real_roblox_var_fake_method_still_proven() -> None:
+    """ACCEPTANCE 12: a real Roblox var bound from ``workspace:FindFirstChild``
+    with a fake method STILL flags proven — the require fix did not over-abstain
+    (it keys on the require() binding RHS, which this is NOT)."""
+    src = 'local node = workspace:FindFirstChild("X")\nnode:FakeMethod()'
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "FakeMethod"
+    assert out[0]["receiver_provenance"] == "proven"
 
 
 def test_method_def_does_not_over_skip_real_bug() -> None:

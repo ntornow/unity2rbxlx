@@ -62,6 +62,22 @@ _CACHED_DUMP_PATH = _REPO_ROOT / ".cached_api_dump.json"
 # A class member with MemberType == this is a callable (method).
 _CALLABLE_MEMBER_TYPE = "Function"
 
+# RBXScriptSignal callable members. These belong to the RBXScriptSignal DATA
+# TYPE, which the API dump exposes outside the ``Classes`` array (the section
+# this tool reads), so the MemberType=="Function" filter never captures them.
+# They are stable, well-documented signal methods; vendored here so a valid
+# event connection (``workspace.DescendantAdded:Connect(...)``) is not a false
+# positive. (Disconnect/Fire already arrive via Classes e.g. BindableEvent.)
+_RBXSCRIPTSIGNAL_MEMBERS: tuple[str, ...] = (
+    "Connect", "Once", "Wait", "ConnectParallel",
+)
+_RBXSCRIPTSIGNAL_SIGNATURES: dict[str, str] = {
+    "Connect": "Connect(handler: function): RBXScriptConnection",
+    "Once": "Once(handler: function): RBXScriptConnection",
+    "Wait": "Wait(): Tuple",
+    "ConnectParallel": "ConnectParallel(handler: function): RBXScriptConnection",
+}
+
 
 class CorpusFetchError(RuntimeError):
     """Neither the live fetch nor the cached fallback produced a usable dump."""
@@ -240,10 +256,14 @@ def refresh() -> Path:
         version, dump = _load_cached_dump()
         print(f"source: cached dump at {_CACHED_DUMP_PATH} (version {version})")
 
-    members = extract_callable_members(dump)
+    members = sorted(set(extract_callable_members(dump)) | set(_RBXSCRIPTSIGNAL_MEMBERS))
     print(f"extracted {len(members)} unique callable members")
 
     signatures = extract_signatures(dump)
+    # Merge the RBXScriptSignal signatures; do NOT overwrite a name already
+    # present from ``Classes``.
+    for name, sig in _RBXSCRIPTSIGNAL_SIGNATURES.items():
+        signatures.setdefault(name, sig)
     print(f"extracted {len(signatures)} unique signatures")
 
     old_members = _read_existing_members()

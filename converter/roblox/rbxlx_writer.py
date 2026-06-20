@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import copy
 import logging
+import math
 import struct
 import xml.etree.ElementTree as ET
 import xml.dom.minidom
@@ -58,6 +59,54 @@ def _ref_id() -> str:
     return f"RBX{uuid4().hex[:32].upper()}"
 
 
+# Clamp for non-finite floats at the XML boundary. 1e38 < float32 max
+# (3.4028235e38), so the value round-trips through the binary writer's float32
+# re-encode without becoming inf again (see design-phase1.md §5 edge E-INF).
+_XML_INF_CLAMP: float = 1e38
+
+
+def _xml_text(s: str) -> str:
+    """Return *s* with every code point illegal in XML 1.0 removed (strip).
+
+    Keeps U+0009, U+000A, U+000D; keeps U+0020-U+D7FF, U+E000-U+FFFD,
+    U+10000-U+10FFFF. Drops C0 controls (except tab/LF/CR), U+FFFE, U+FFFF,
+    and lone surrogates U+D800-U+DFFF. Idempotent. Valid input is returned
+    byte-for-byte unchanged. Does NOT touch <, &, >, quotes -- ElementTree
+    still entity-escapes those; do NOT double-escape.
+    """
+    out: list[str] = []
+    for ch in s:
+        cp = ord(ch)
+        if (
+            cp == 0x09
+            or cp == 0x0A
+            or cp == 0x0D
+            or 0x20 <= cp <= 0xD7FF
+            or 0xE000 <= cp <= 0xFFFD
+            or 0x10000 <= cp <= 0x10FFFF
+        ):
+            out.append(ch)
+    # Fast path: nothing was stripped -> return the original object unchanged.
+    if len(out) == len(s):
+        return s
+    return "".join(out)
+
+
+def _finite_val(v: float) -> float:
+    """Return a finite float, leaving each site's own formatting intact.
+
+    Returns *v* UNCHANGED when finite; else nan -> 0.0, +inf -> _XML_INF_CLAMP,
+    -inf -> -_XML_INF_CLAMP. Value-returning (NOT string-returning) so each
+    emission site keeps its ORIGINAL formatting (str(...), f"{...:.4f}",
+    int(...)). On finite input this is byte-identical everywhere (DP8).
+    """
+    if math.isfinite(v):
+        return v
+    if math.isnan(v):
+        return 0.0
+    return _XML_INF_CLAMP if v > 0 else -_XML_INF_CLAMP
+
+
 # Maps Unity fileID → Roblox referent for constraint Part1 resolution.
 # Populated during _make_part, consumed during _make_constraint.
 _unity_fid_to_referent: dict[str, str] = {}
@@ -69,7 +118,7 @@ _unity_fid_to_referent: dict[str, str] = {}
 
 def _add_string(parent: ET.Element, name: str, value: str) -> ET.Element:
     elem = ET.SubElement(parent, "string", name=name)
-    elem.text = value
+    elem.text = _xml_text(value)
     return elem
 
 
@@ -81,7 +130,7 @@ def _add_bool(parent: ET.Element, name: str, value: bool) -> ET.Element:
 
 def _add_float(parent: ET.Element, name: str, value: float) -> ET.Element:
     elem = ET.SubElement(parent, "float", name=name)
-    elem.text = str(value)
+    elem.text = str(_finite_val(value))
     return elem
 
 
@@ -101,18 +150,18 @@ def _add_vector3(
     parent: ET.Element, name: str, x: float, y: float, z: float
 ) -> ET.Element:
     vec = ET.SubElement(parent, "Vector3", name=name)
-    ET.SubElement(vec, "X").text = str(x)
-    ET.SubElement(vec, "Y").text = str(y)
-    ET.SubElement(vec, "Z").text = str(z)
+    ET.SubElement(vec, "X").text = str(_finite_val(x))
+    ET.SubElement(vec, "Y").text = str(_finite_val(y))
+    ET.SubElement(vec, "Z").text = str(_finite_val(z))
     return vec
 
 
 def _add_cframe(parent: ET.Element, name: str, cf: RbxCFrame) -> ET.Element:
     """Serialize a CFrame as a ``<CoordinateFrame>`` element."""
     coord = ET.SubElement(parent, "CoordinateFrame", name=name)
-    ET.SubElement(coord, "X").text = str(cf.x)
-    ET.SubElement(coord, "Y").text = str(cf.y)
-    ET.SubElement(coord, "Z").text = str(cf.z)
+    ET.SubElement(coord, "X").text = str(_finite_val(cf.x))
+    ET.SubElement(coord, "Y").text = str(_finite_val(cf.y))
+    ET.SubElement(coord, "Z").text = str(_finite_val(cf.z))
 
     # RbxCFrame already stores the rotation matrix directly
     for label, val in [
@@ -120,7 +169,7 @@ def _add_cframe(parent: ET.Element, name: str, cf: RbxCFrame) -> ET.Element:
         ("R10", cf.r10), ("R11", cf.r11), ("R12", cf.r12),
         ("R20", cf.r20), ("R21", cf.r21), ("R22", cf.r22),
     ]:
-        ET.SubElement(coord, label).text = str(val)
+        ET.SubElement(coord, label).text = str(_finite_val(val))
     return coord
 
 
@@ -143,14 +192,14 @@ def _add_color3(parent: ET.Element, name: str, r: float, g: float, b: float) -> 
 
 def _add_protected_string(parent: ET.Element, name: str, source: str) -> ET.Element:
     elem = ET.SubElement(parent, "ProtectedString", name=name)
-    elem.text = source  # Will be wrapped in CDATA during pretty-print
+    elem.text = _xml_text(source)  # Will be wrapped in CDATA during pretty-print
     return elem
 
 
 def _add_content(parent: ET.Element, name: str, url: str) -> ET.Element:
     elem = ET.SubElement(parent, "Content", name=name)
     sub = ET.SubElement(elem, "url")
-    sub.text = url
+    sub.text = _xml_text(url)
     return elem
 
 
@@ -161,7 +210,7 @@ def _add_content(parent: ET.Element, name: str, url: str) -> ET.Element:
 def _make_service(root: ET.Element, class_name: str, name: str | None = None) -> ET.Element:
     """Create a top-level service Item."""
     item = ET.SubElement(root, "Item", attrib={
-        "class": class_name,
+        "class": _xml_text(class_name),
         "referent": _ref_id(),
     })
     props = ET.SubElement(item, "Properties")
@@ -172,7 +221,7 @@ def _make_service(root: ET.Element, class_name: str, name: str | None = None) ->
 def _make_item(parent: ET.Element, class_name: str, name: str) -> tuple[ET.Element, ET.Element]:
     """Create an ``<Item>`` with a ``<Properties>`` child. Returns (item, props)."""
     item = ET.SubElement(parent, "Item", attrib={
-        "class": class_name,
+        "class": _xml_text(class_name),
         "referent": _ref_id(),
     })
     props = ET.SubElement(item, "Properties")
@@ -239,28 +288,30 @@ def _make_particle_emitter(parent_xml: ET.Element, pe: RbxParticleEmitter) -> No
     _add_float(props, "Rate", pe.rate)
     # NumberRange for Lifetime
     nr = ET.SubElement(props, "NumberRange", name="Lifetime")
-    nr.text = f"{pe.lifetime_min} {pe.lifetime_max}"
+    nr.text = f"{_finite_val(pe.lifetime_min)} {_finite_val(pe.lifetime_max)}"
     # NumberRange for Speed
     nr_speed = ET.SubElement(props, "NumberRange", name="Speed")
-    nr_speed.text = f"{pe.speed_min} {pe.speed_max}"
+    nr_speed.text = f"{_finite_val(pe.speed_min)} {_finite_val(pe.speed_max)}"
     # NumberSequence for Size
     ns = ET.SubElement(props, "NumberSequence", name="Size")
     if pe.size_sequence:
         # Use full NumberSequence keypoints from sizeOverLifetime
         ns.text = " ".join(
-            f"{t} {v} {e}" for t, v, e in pe.size_sequence
+            f"{_finite_val(t)} {_finite_val(v)} {_finite_val(e)}"
+            for t, v, e in pe.size_sequence
         ) + " "
     else:
-        ns.text = f"0 {pe.size_max} 0 1 {pe.size_min} 0 "
+        ns.text = f"0 {_finite_val(pe.size_max)} 0 1 {_finite_val(pe.size_min)} 0 "
     # SpreadAngle
     vec2 = ET.SubElement(props, "Vector2", name="SpreadAngle")
-    ET.SubElement(vec2, "X").text = str(pe.spread_angle)
-    ET.SubElement(vec2, "Y").text = str(pe.spread_angle)
+    ET.SubElement(vec2, "X").text = str(_finite_val(pe.spread_angle))
+    ET.SubElement(vec2, "Y").text = str(_finite_val(pe.spread_angle))
     # Color -- prefer ColorSequence if available, else single color
     if pe.color_sequence:
         cs = ET.SubElement(props, "ColorSequence", name="Color")
         cs.text = " ".join(
-            f"{t} {r} {g} {b} 0" for t, r, g, b in pe.color_sequence
+            f"{_finite_val(t)} {_finite_val(r)} {_finite_val(g)} {_finite_val(b)} 0"
+            for t, r, g, b in pe.color_sequence
         ) + " "
     elif pe.color != (1.0, 1.0, 1.0):
         _add_color3(props, "Color", *pe.color[:3])
@@ -275,10 +326,11 @@ def _make_particle_emitter(parent_xml: ET.Element, pe: RbxParticleEmitter) -> No
     ts = ET.SubElement(props, "NumberSequence", name="Transparency")
     if pe.transparency_sequence:
         ts.text = " ".join(
-            f"{t} {v} {e}" for t, v, e in pe.transparency_sequence
+            f"{_finite_val(t)} {_finite_val(v)} {_finite_val(e)}"
+            for t, v, e in pe.transparency_sequence
         ) + " "
     else:
-        v = pe.transparency
+        v = _finite_val(pe.transparency)
         ts.text = f"0 {v} 0 1 {v} 0 "
     _add_float(props, "LightEmission", pe.light_emission)
     if pe.texture:
@@ -306,11 +358,11 @@ def _make_particle_emitter(parent_xml: ET.Element, pe: RbxParticleEmitter) -> No
     # Rotation
     if pe.rotation_min != 0 or pe.rotation_max != 360:
         nr_rot = ET.SubElement(props, "NumberRange", name="Rotation")
-        nr_rot.text = f"{pe.rotation_min} {pe.rotation_max}"
+        nr_rot.text = f"{_finite_val(pe.rotation_min)} {_finite_val(pe.rotation_max)}"
     # RotSpeed
     if pe.rot_speed_min != 0 or pe.rot_speed_max != 0:
         nr_rspd = ET.SubElement(props, "NumberRange", name="RotSpeed")
-        nr_rspd.text = f"{pe.rot_speed_min} {pe.rot_speed_max}"
+        nr_rspd.text = f"{_finite_val(pe.rot_speed_min)} {_finite_val(pe.rot_speed_max)}"
     # Attributes from Unity modules without direct Roblox equivalents
     pe_attrs = getattr(pe, "attributes", None) or {}
     if pe_attrs:
@@ -555,10 +607,10 @@ def _make_ui_element(parent_xml: ET.Element, elem: RbxUIElement) -> None:
         else:
             sx, ox, sy, oy = s[0], s[1], s[2], s[3]
         udim2 = ET.SubElement(props, "UDim2", name="Size")
-        ET.SubElement(udim2, "XS").text = str(sx)
-        ET.SubElement(udim2, "XO").text = str(int(ox))
-        ET.SubElement(udim2, "YS").text = str(sy)
-        ET.SubElement(udim2, "YO").text = str(int(oy))
+        ET.SubElement(udim2, "XS").text = str(_finite_val(sx))
+        ET.SubElement(udim2, "XO").text = str(int(_finite_val(ox)))
+        ET.SubElement(udim2, "YS").text = str(_finite_val(sy))
+        ET.SubElement(udim2, "YO").text = str(int(_finite_val(oy)))
 
     if hasattr(elem, "position") and elem.position:
         p = elem.position
@@ -567,10 +619,10 @@ def _make_ui_element(parent_xml: ET.Element, elem: RbxUIElement) -> None:
         else:
             sx, ox, sy, oy = p[0], p[1], p[2], p[3]
         udim2 = ET.SubElement(props, "UDim2", name="Position")
-        ET.SubElement(udim2, "XS").text = str(sx)
-        ET.SubElement(udim2, "XO").text = str(int(ox))
-        ET.SubElement(udim2, "YS").text = str(sy)
-        ET.SubElement(udim2, "YO").text = str(int(oy))
+        ET.SubElement(udim2, "XS").text = str(_finite_val(sx))
+        ET.SubElement(udim2, "XO").text = str(int(_finite_val(ox)))
+        ET.SubElement(udim2, "YS").text = str(_finite_val(sy))
+        ET.SubElement(udim2, "YO").text = str(int(_finite_val(oy)))
 
     if hasattr(elem, "background_color") and elem.background_color:
         _add_color3(props, "BackgroundColor3", *elem.background_color[:3])
@@ -973,7 +1025,10 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
 
         # Color
         if hasattr(part, "color") and part.color:
-            r, g, b = [int(c * 255) if isinstance(c, float) and c <= 1.0 else int(c) for c in part.color[:3]]
+            r, g, b = [
+                int(_finite_val(c) * 255) if isinstance(c, float) and c <= 1.0 else int(_finite_val(c))
+                for c in part.color[:3]
+            ]
             _add_color3uint8(props, "Color3uint8", r, g, b)
 
         # Material (must be token ID, not string name)
@@ -1034,11 +1089,11 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
             cpp_elem = ET.SubElement(props, "CustomPhysicalProperties",
                                      name="CustomPhysicalProperties")
             ET.SubElement(cpp_elem, "CustomPhysics").text = "true"
-            ET.SubElement(cpp_elem, "Density").text = f"{density:.4f}"
-            ET.SubElement(cpp_elem, "Friction").text = f"{friction:.4f}"
-            ET.SubElement(cpp_elem, "Elasticity").text = f"{elasticity:.4f}"
-            ET.SubElement(cpp_elem, "FrictionWeight").text = f"{friction_w:.4f}"
-            ET.SubElement(cpp_elem, "ElasticityWeight").text = f"{elasticity_w:.4f}"
+            ET.SubElement(cpp_elem, "Density").text = f"{_finite_val(density):.4f}"
+            ET.SubElement(cpp_elem, "Friction").text = f"{_finite_val(friction):.4f}"
+            ET.SubElement(cpp_elem, "Elasticity").text = f"{_finite_val(elasticity):.4f}"
+            ET.SubElement(cpp_elem, "FrictionWeight").text = f"{_finite_val(friction_w):.4f}"
+            ET.SubElement(cpp_elem, "ElasticityWeight").text = f"{_finite_val(elasticity_w):.4f}"
 
         # Smooth surfaces (avoid default studs)
         _add_token(props, "TopSurface", 0)     # Smooth
@@ -1202,9 +1257,9 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
                 # Canvas size matches the sprite rect so the image fills the surface
                 canvas = ET.SubElement(sg_props, "UDim2", name="CanvasSize")
                 ET.SubElement(canvas, "XS").text = "0"
-                ET.SubElement(canvas, "XO").text = str(int(rw))
+                ET.SubElement(canvas, "XO").text = str(int(_finite_val(rw)))
                 ET.SubElement(canvas, "YS").text = "0"
-                ET.SubElement(canvas, "YO").text = str(int(rh))
+                ET.SubElement(canvas, "YO").text = str(int(_finite_val(rh)))
 
                 il_item, il_props = _make_item(sg_item, "ImageLabel", f"SpriteImage{face_name}")
                 _add_content(il_props, "Image", sprite_tex)
@@ -1217,11 +1272,11 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
                 ET.SubElement(size, "YO").text = "0"
                 # ImageRectOffset and ImageRectSize as Vector2
                 offset_v = ET.SubElement(il_props, "Vector2", name="ImageRectOffset")
-                ET.SubElement(offset_v, "X").text = str(rx)
-                ET.SubElement(offset_v, "Y").text = str(ry)
+                ET.SubElement(offset_v, "X").text = str(_finite_val(rx))
+                ET.SubElement(offset_v, "Y").text = str(_finite_val(ry))
                 rect_size_v = ET.SubElement(il_props, "Vector2", name="ImageRectSize")
-                ET.SubElement(rect_size_v, "X").text = str(rw)
-                ET.SubElement(rect_size_v, "Y").text = str(rh)
+                ET.SubElement(rect_size_v, "X").text = str(_finite_val(rw))
+                ET.SubElement(rect_size_v, "Y").text = str(_finite_val(rh))
         else:
             # Full sprite (no atlas): use simple Decal
             for face_name, face_val in [("Front", 5), ("Back", 2)]:

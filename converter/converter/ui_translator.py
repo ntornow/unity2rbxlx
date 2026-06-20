@@ -8,13 +8,37 @@ Text/TextMeshPro -> TextLabel, Image -> ImageLabel, Button -> TextButton.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
 from core.unity_types import SceneNode
 from core.roblox_types import RbxScreenGui, RbxUIElement
 from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
+
+# Attribute NAME the converter's Toggle-``isOn`` lowering writes (the
+# transpiled HUD writer does ``toggle:SetAttribute("isOn", true)``). Single
+# source of truth: ``_apply_toggle_properties`` stamps it onto each
+# ``ToggleBinding`` row as ``attr_name`` and the runtime reads ``b.attr_name``
+# (never a hard-coded literal). A convention-drift guard pins this against the
+# contract corpus at converter-build time (test_ui_translator).
+_TOGGLE_ISON_ATTR = "isOn"
+
+
+class ToggleBinding(TypedDict):
+    """One Unity ``Toggle`` -> checkmark-graphic visual binding record.
+
+    Emitted by ``_apply_toggle_properties`` for a Toggle whose serialized
+    ``graphic`` component reference resolves to an owning GameObject, and
+    consumed by the runtime (``scene_runtime.luau``) to drive the checkmark's
+    ``.Visible`` off the Toggle's ``isOn`` attribute. Strictly typed --
+    str/bool only, NO ``Any``.
+    """
+
+    toggle_sri: str    # "<scene>:<toggle_go_fileID>" -- the Toggle GameObject's SRI
+    graphic_sri: str   # "<scene>:<graphic_go_fileID>" -- the checkmark's SRI
+    initial_on: bool   # from m_IsOn
+    attr_name: str     # the isOn attribute NAME the writer uses (= _TOGGLE_ISON_ATTR)
 
 # Unity UI component type -> Roblox class name mapping.
 _UI_CLASS_MAP: dict[str, str] = {
@@ -132,11 +156,35 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
     return isinstance(guid, str) and guid.startswith(_UI_IMAGE_SCRIPT_GUID_PREFIX)
 
 
+def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
+    """Map each component's fileID to its owning GameObject's fileID, scene-wide.
+
+    Walks every node in ``roots`` and all of their ``children`` recursively;
+    for each component on a node, records ``comp.file_id -> node.file_id``.
+    Built scene-wide (not just the canvas subtree) because a serialized
+    component reference (e.g. a Unity ``Toggle.graphic``) may legally point
+    at a component owned by a GameObject outside the canvas subtree.
+
+    Pure: builds and returns a fresh ``dict[str, str]``; no mutation of input.
+    No name matching, no regex -- keyed solely on scene-local fileIDs.
+    """
+    index: dict[str, str] = {}
+    stack: list[SceneNode] = list(roots)
+    while stack:
+        node = stack.pop()
+        for comp in node.components:
+            index[comp.file_id] = node.file_id
+        stack.extend(node.children)
+    return index
+
+
 def convert_canvas(
     canvas_nodes: list[SceneNode],
     scene_namespace: str = "",
     scene_runtime_mode: str = "legacy",
     suppress_static_children_ids: frozenset[str] | None = None,
+    component_owner_index: dict[str, str] | None = None,
+    toggle_bindings: list[ToggleBinding] | None = None,
 ) -> list[RbxScreenGui]:
     """Convert a list of Unity Canvas root nodes to Roblox ScreenGui objects.
 
@@ -164,6 +212,20 @@ def convert_canvas(
             instantiates the content via ``host.instantiatePrefab``.
             Empty / None means no suppression (the generic test fires on
             membership, so legacy passes ``None`` and gets the old path).
+        component_owner_index: Scene-wide
+            ``component fileID -> owning GameObject fileID`` map (built once
+            per scene via ``build_component_owner_index``). Threaded down to
+            element conversion so a serialized component reference can be
+            resolved to its owning GameObject. ``None`` for legacy / synthetic
+            callers (no resolution).
+        toggle_bindings: By-ref accumulator. For each Toggle whose serialized
+            ``graphic`` resolves (via ``component_owner_index``) to an owning
+            GameObject, ``_apply_toggle_properties`` appends a ``ToggleBinding``
+            row here. ``None`` for legacy / synthetic callers (no rows). The
+            caller (``convert_scene``) creates the list, passes it by-ref, and
+            stashes the populated result onto ``ctx.scene_runtime`` -- so the
+            rows surface without riding the (unchanged) return value and without
+            any transport attribute leaking onto a produced instance.
 
     Returns:
         List of RbxScreenGui objects.
@@ -192,6 +254,8 @@ def convert_canvas(
                 suppress_static_children_ids=(
                     suppress_ids if suppression_active else frozenset()
                 ),
+                component_owner_index=component_owner_index,
+                toggle_bindings=toggle_bindings,
             )
             if element is not None:
                 screen_gui.elements.append(element)
@@ -294,6 +358,8 @@ def _apply_canvas_scaler(screen_gui: RbxScreenGui, canvas_node: SceneNode) -> No
 def _convert_ui_element(
     node: SceneNode, scene_namespace: str = "",
     suppress_static_children_ids: frozenset[str] = frozenset(),
+    component_owner_index: dict[str, str] | None = None,
+    toggle_bindings: list[ToggleBinding] | None = None,
 ) -> RbxUIElement | None:
     """Recursively convert a SceneNode (under a Canvas) to an RbxUIElement.
 
@@ -313,13 +379,29 @@ def _convert_ui_element(
             ``host.instantiatePrefab``). Empty frozenset disables the
             carve-out — legacy mode passes empty, so child emit is
             byte-identical to pre-PR3c.
+        component_owner_index: Scene-wide
+            ``component fileID -> owning GameObject fileID`` map, threaded
+            through recursion so a serialized component reference can be
+            resolved to its owning GameObject. ``None`` for legacy / synthetic
+            callers.
+        toggle_bindings: By-ref ``ToggleBinding`` accumulator threaded through
+            recursion; ``_apply_toggle_properties`` appends a row for each
+            Toggle with a resolvable ``graphic``. ``None`` for legacy callers.
 
     Returns:
         An RbxUIElement, or None if the node should be skipped.
-    """
-    if not node.active:
-        return None
 
+    Note on inactive nodes (Gap #4): an inactive Unity GameObject is NOT
+    pruned. Unity inactive objects still EXIST and are commonly woken later
+    by a script ``SetActive(true)`` (e.g. ``SettingPopup → AboutPopup``
+    popups). Pruning the subtree dropped the ``_SceneRuntimeId``-stamped
+    host clones the scene-runtime planner emits deferred-component rows
+    against, so those rows dangled ("UI host clone … never landed"). We
+    therefore EMIT the inactive subtree and KEEP RECURSING into children;
+    the element is created with ``visible=node.active`` (below), so an
+    inactive node lands hidden and the runtime ``_applyPlannerFlagsAndTag``
+    keeps it inactive until a script wakes it.
+    """
     # Determine element class from components.
     element_class = "Frame"  # Default to Frame if no specific UI component.
     ui_properties: dict[str, Any] = {}
@@ -422,8 +504,19 @@ def _convert_ui_element(
             _apply_inputfield_properties(element, comp.properties)
         elif ct in ("Dropdown", "TMP_Dropdown"):
             _apply_dropdown_properties(element, comp.properties)
-        elif ct == "Toggle":
-            _apply_toggle_properties(element, comp.properties)
+        elif ct == "Toggle" or (
+            comp.component_type == "MonoBehaviour" and "m_IsOn" in comp.properties
+        ):
+            # Unity serializes a UI Toggle as a MonoBehaviour (m_Script GUID),
+            # never a literal "Toggle" component_type — identify it by its
+            # defining ``m_IsOn`` field (mirrors the Button m_OnClick heuristic
+            # above). The bare ``ct == "Toggle"`` form is dead on real scenes.
+            _apply_toggle_properties(
+                element, comp.properties,
+                component_owner_index=component_owner_index,
+                scene_namespace=scene_namespace,
+                toggle_bindings=toggle_bindings,
+            )
 
     # Extract background color.
     _apply_color_properties(element, ui_properties)
@@ -451,6 +544,8 @@ def _convert_ui_element(
         child_element = _convert_ui_element(
             child_node, scene_namespace,
             suppress_static_children_ids=suppress_static_children_ids,
+            component_owner_index=component_owner_index,
+            toggle_bindings=toggle_bindings,
         )
         if child_element is not None:
             element.children.append(child_element)
@@ -724,13 +819,61 @@ def _apply_dropdown_properties(element: RbxUIElement, props: dict[str, Any]) -> 
                 element.attributes["_DropdownOptions"] = ",".join(texts)
 
 
-def _apply_toggle_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
-    """Extract Toggle properties."""
-    is_on = props.get("m_IsOn", 1)
-    try:
-        element.attributes["ToggleIsOn"] = bool(int(is_on))
-    except (TypeError, ValueError):
-        pass
+def _apply_toggle_properties(
+    element: RbxUIElement,
+    props: dict[str, object],
+    *,
+    component_owner_index: dict[str, str] | None = None,
+    scene_namespace: str = "",
+    toggle_bindings: list[ToggleBinding] | None = None,
+) -> None:
+    """Extract Toggle properties and (generic) emit a checkmark-binding row.
+
+    Always records ``ToggleIsOn`` (a real attribute other consumers may read).
+
+    Additionally, when ``component_owner_index`` resolves the Toggle's
+    serialized ``graphic`` component reference to an owning GameObject AND a
+    ``toggle_bindings`` accumulator is supplied, appends a ``ToggleBinding`` row
+    so the runtime can bind ``isOn`` -> the checkmark's ``.Visible``. NO
+    transport attribute is written onto the element (the row goes straight to
+    the accumulator, so nothing planner-internal serializes into the produced
+    instance). If ``graphic`` is ``0`` / unresolvable, or either side is
+    missing, no row is appended.
+    """
+    if not hasattr(element, 'attributes'):
+        element.attributes = {}
+    # ``m_IsOn`` crosses the YAML boundary untyped (int/float/bool/str);
+    # ``_coerce_int`` is the file's canonical scalar coercion (accepts a float
+    # like ``1.0`` and a float-string, ``None`` on genuine failure).
+    is_on_int = _coerce_int(props.get("m_IsOn", 1))
+    if is_on_int is None:
+        return
+    initial_on = bool(is_on_int)
+    element.attributes["ToggleIsOn"] = initial_on
+
+    # Emit a binding row iff the serialized ``graphic`` (a *component* fileID)
+    # resolves to its owning GameObject. The Toggle's own element already
+    # carries ``_SceneRuntimeId`` (stamped before this dispatch).
+    if component_owner_index is None or toggle_bindings is None:
+        return
+    graphic_ref = props.get("graphic", {})
+    graphic_comp_fid = (
+        graphic_ref.get("fileID") if isinstance(graphic_ref, dict) else None
+    )
+    if not graphic_comp_fid:
+        return  # graphic:0 / absent -> no binding
+    graphic_go_fid = component_owner_index.get(str(graphic_comp_fid))
+    if not graphic_go_fid:
+        return  # unresolvable component fileID -> no binding
+    toggle_sri = element.attributes.get("_SceneRuntimeId")
+    if not isinstance(toggle_sri, str) or not toggle_sri or not scene_namespace:
+        return  # the Toggle element wasn't SRI-stamped -> can't bind
+    toggle_bindings.append(ToggleBinding(
+        toggle_sri=toggle_sri,
+        graphic_sri=f"{scene_namespace}:{graphic_go_fid}",
+        initial_on=initial_on,
+        attr_name=_TOGGLE_ISON_ATTR,
+    ))
 
 
 def _apply_color_properties(element: RbxUIElement, props: dict[str, Any]) -> None:

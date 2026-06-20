@@ -38,6 +38,10 @@ from converter.child_ref_resolver import (
     ChildRefScript,
     prerewrite_child_index,
 )
+from converter.send_message_resolver import (
+    SendMessageDispatchFact,
+    SendMessageMap,
+)
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +96,15 @@ class TranspiledScript:
     # live by construction (NEW-FINDING-B). ``None`` for every non-re-lowered
     # script.
     roster_binding: dict[str, object] | None = None
+    # Per-script camera-mount equip-request binding carrier from the generic-mode
+    # post-transpile ``camera_mount_equip_lowering``: a JSON-native dict
+    # ``{"prefab": str, "method": str, "remote": str, "present": bool}`` (+ optional
+    # ``multi_site``/``dangling_capvar`` fail-closed sub-flags) or ``None``. Stamped
+    # ONLY on a script whose rig fact carries an equip obligation. Copied onto the
+    # produced ``RbxScript.equip_binding`` so the contract verifier's
+    # ``_check_equip_present`` fail-closed check can assert the IR-declared equip
+    # request was discharged. ``None`` when the script has no equip obligation.
+    equip_binding: dict[str, object] | None = None
 
 
 @dataclass
@@ -155,6 +168,7 @@ def transpile_scripts(
     component_class_paths: frozenset[Path] | None = None,
     player_controller_paths: frozenset[Path] | None = None,
     child_ref_map: ChildRefMap | None = None,
+    send_message_map: SendMessageMap | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -206,6 +220,16 @@ def transpile_scripts(
             tally is stamped onto each produced ``RbxScript.child_ref_resolution``.
             ``None`` (default) for legacy callers / direct unit tests — no
             pre-rewrite, no stamp.
+        send_message_map: Under ``runtime_mode="generic"`` the per-script
+            ``SendMessageDispatchFact`` map built by
+            ``send_message_resolver.build_send_message_map``. Each script's
+            DIRECT ``recv.SendMessage("M", ...)`` / ``BroadcastMessage`` facts
+            are threaded into the per-module reprompt loop's contract verifier
+            (rule ``sm``), which asserts the produced Luau emits a matching
+            ``self.host:sendMessage`` / ``broadcastMessage`` for each fact and
+            reprompts — then fails closed — on a dropped dispatch. Plumbed on
+            the SAME canonical-key route as ``child_ref_map``. ``None`` (default)
+            for legacy callers / direct unit tests — no ``sm`` check runs.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
@@ -257,6 +281,10 @@ def transpile_scripts(
     # Per-script child-ref resolution entry (generic-only), keyed on str(info.path),
     # carried to the TranspiledScript stamp below.
     child_ref_by_path: dict[str, ChildRefScript] = {}
+    # Per-script SendMessage/BroadcastMessage dispatch facts (generic-only), keyed
+    # on str(info.path), threaded into the per-module reprompt loop's verifier
+    # below on the SAME canonical-key route as ``child_ref_by_path``.
+    send_message_by_path: dict[str, tuple[SendMessageDispatchFact, ...]] = {}
     for info in script_infos:
         script_path = info.path
         try:
@@ -265,6 +293,22 @@ def transpile_scripts(
             log.warning("Could not read script %s: %s", script_path, exc)
             result.total_failed += 1
             continue
+
+        # Generic-mode SendMessage facts: associate this script's dispatch
+        # obligations (slice 1.2) by str(path), looked up canonical-first with a
+        # raw fallback (mirrors the child-ref key resolution). Reads the map only;
+        # no source mutation (SendMessage calls aren't pre-rewritten).
+        if runtime_mode == "generic" and send_message_map:
+            try:
+                _sm_canon_key = str(script_path.resolve())
+            except OSError:
+                _sm_canon_key = str(script_path)
+            _sm_entry = (
+                send_message_map.get(_sm_canon_key)
+                or send_message_map.get(str(script_path))
+            )
+            if _sm_entry:
+                send_message_by_path[str(script_path)] = _sm_entry
 
         # Generic-mode child-ref PRE-REWRITE: resolve transform-rooted
         # GetChild(n) sites to named lookups in the C# BEFORE it enters the cache
@@ -467,6 +511,14 @@ def transpile_scripts(
             player_directive = _PLAYER_CONTROLLER_DIRECTIVE if is_player else ""
             context_parts = [project_context, scoped, field_ctx, player_directive]
             context = "\n\n".join(p for p in context_parts if p)
+            # Per-script SendMessage dispatch facts (generic-only). Threaded into
+            # the reprompt loop's verifier (rule ``sm``) on the SAME route
+            # ``is_player`` takes. Empty tuple under legacy / when no facts.
+            sm_facts = (
+                send_message_by_path.get(str(info.path), ())
+                if effective_runtime_mode == "generic"
+                else ()
+            )
             try:
                 if backend == "claude_cli":
                     luau, confidence, warnings = _claude_cli_transpile(
@@ -476,6 +528,7 @@ def transpile_scripts(
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
                         is_player_controller=is_player,
+                        send_message_facts=sm_facts,
                     )
                 elif backend == "anthropic_api" and api_key:
                     luau, confidence, warnings = _ai_transpile(
@@ -485,6 +538,7 @@ def transpile_scripts(
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
                         is_player_controller=is_player,
+                        send_message_facts=sm_facts,
                     )
                 else:
                     return stem, None
@@ -1553,6 +1607,15 @@ ALWAYS put a `-- OnTrigger<Phase>(other)` / `-- OnCollision<Phase>(...)` origin 
 - `GameObject.Find("Name")` → `self.host.findGameObject("Name")`.
 - `GameObject.FindGameObjectsWithTag("Tag")` → `self.host.findGameObjectsWithTag("Tag")`.
 
+### SendMessage / BroadcastMessage (host dispatch — NEVER collapse to :SetAttribute)
+A Unity `recv.SendMessage("M", a)` invokes method `M` on the component(s) of `recv`'s GameObject — it is a real method CALL with real gameplay effect, NOT a flag write. Emit the host primitive that resolves `recv` at runtime and calls the method:
+- `recv.SendMessage("M", a)` → `self.host:sendMessage(recv, "M", a)` (preserve the receiver expression `recv` as the FIRST argument, the method name string SECOND, then the gameplay args).
+- `recv.BroadcastMessage("M", a)` → `self.host:broadcastMessage(recv, "M", a)` (also descends `recv`'s child GameObjects).
+- A bare implicit-this `SendMessage("M")` (no receiver) → `self.host:sendMessage(self.gameObject, "M")`.
+- STRIP any trailing `SendMessageOptions.*` token (e.g. `SendMessageOptions.DontRequireReceiver`) — it is NOT a gameplay argument; never forward it. So `recv.SendMessage("TakeDamage", SendMessageOptions.DontRequireReceiver)` → `self.host:sendMessage(recv, "TakeDamage")` (zero gameplay args).
+- NEVER lower a `SendMessage` to a `:SetAttribute(...)` flag write — that DROPS the dispatch and silently breaks gameplay (e.g. a pickup that flags `hasRifle=true` but never runs `GetItem`/`GetRifle`, so the weapon never mounts). The attribute mirror is an ADDITION made INSIDE the target method (the `Player:GetItem`-style mutator — see "Cross-script shared state" above), never a REPLACEMENT for the dispatch at the call site.
+- CARVE-OUT (do NOT use `sendMessage` here): the players-in-a-radius OverlapSphere loop (`foreach (col in Physics.OverlapSphere(p, r)) if (col.tag=="Player") col.SendMessage("TakeDamage", dmg)`) stays the `self.host.playersInRadius(...)` form from the "Players in a radius" rule above — that is authoritative for the radius/multi-player case. `self.host:sendMessage` is ONLY for a DIRECT single-receiver dispatch (`other.SendMessage(...)`, `doors[n].SendMessage(...)`, a `Find...().SendMessage(...)`, a bare `SendMessage(...)`).
+
 ### Transform
 - `transform.position` → `self.gameObject:GetPivot().Position` (read) / `self.gameObject:PivotTo(CFrame.new(p))` (write).
 - `transform.rotation` → `self.gameObject:GetPivot()` (CFrame holds rotation) / `self.gameObject:PivotTo(self.gameObject:GetPivot() * rot)` (compose).
@@ -1762,6 +1825,7 @@ def _format_contract_survivor_warning(violation) -> str:
 def _refresh_contract_warnings(
     luau_source: str, cached_warnings: list[str],
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> list[str]:
     """Replace cached contract-verifier warnings with a fresh re-verify.
 
@@ -1801,6 +1865,7 @@ def _refresh_contract_warnings(
     ]
     result = verify_module(
         luau_source, is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     if result.ok:
         return non_contract
@@ -1815,6 +1880,7 @@ def _verify_and_reprompt(
     runtime_mode: RuntimeMode,
     reprompt_call,
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> tuple[str, list[str]]:
     """Run the contract verifier; on violations call ``reprompt_call`` ONCE.
 
@@ -1855,6 +1921,7 @@ def _verify_and_reprompt(
 
     initial = verify_module(
         luau_source, is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     if initial.ok:
         return luau_source, []
@@ -1891,8 +1958,19 @@ def _verify_and_reprompt(
             _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
+    if not _reprompt_is_structurally_safe(luau_source, new_luau):
+        # The reprompt response is a structural regression (fragment / lost
+        # return / dropped handlers / collapsed length). Keep the ORIGINAL and
+        # re-surface the original violations as survivors -- operationally
+        # "reprompt didn't fix anything", identical to the empty/None branches
+        # above, so the module still fails-closed downstream.
+        return luau_source, pre_warnings + [
+            _format_contract_survivor_warning(v) for v in initial.violations
+        ]
+
     second = verify_module(
         new_luau, is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     if second.ok:
         # Reprompt fixed everything. Pre-warnings are still surfaced so
@@ -1993,6 +2071,12 @@ def _repair_invalid_roblox_calls(
         new_luau = _strip_code_fences(new_text)
         if not new_luau:
             break
+        if not _reprompt_is_structurally_safe(best, new_luau):
+            # A degraded repair response (fragment / lost return / gutted /
+            # collapsed). Keep the current ``best``; the bounded loop's purpose
+            # is exhausted once a response degrades (retrying the same prompt
+            # yields the same shape), so break rather than continue.
+            break
         best = new_luau
         proven = _proven_invalid_roblox_calls(best)
         if not proven:
@@ -2014,6 +2098,7 @@ def _ai_transpile(
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -2064,6 +2149,7 @@ def _ai_transpile(
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
                     is_player_controller=is_player_controller,
+                    send_message_facts=send_message_facts,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         elif cached_proven_invalids and not cached_errors:
@@ -2154,6 +2240,7 @@ def _ai_transpile(
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _api_reprompt,
         is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     warnings.extend(contract_warnings)
 
@@ -2179,6 +2266,7 @@ def _ai_transpile(
         warnings = _refresh_contract_warnings(
             luau_source, warnings,
             is_player_controller=is_player_controller,
+            send_message_facts=send_message_facts,
         )
 
     # AI transpilation gets a baseline confidence based on output quality.
@@ -2243,6 +2331,109 @@ def _strip_code_fences(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reprompt-degradation guard (slice 1.1)
+#
+# Both reprompt-acceptance paths (``_verify_and_reprompt`` and
+# ``_repair_invalid_roblox_calls``) currently keep an AI reprompt response
+# UNCONDITIONALLY. The cache forensics show a contract reprompt degrading a
+# 108-line module returning a class table into an 8-line ``...`` fragment.
+# This pure guard rejects a structurally-WORSE candidate so the emitted output
+# is never worse than what the reprompt replaced. It is deliberately
+# conservative: false-REJECT (re-ship the original) is the costly error, so a
+# smaller-but-correct reprompt clears every floor.
+# ---------------------------------------------------------------------------
+
+_LEN_COLLAPSE_FRACTION = 0.5
+_FUNCTION_COLLAPSE_FRACTION = 0.5
+
+
+def _has_top_level_return(luau_source: str) -> bool:
+    """True iff ``luau_source`` has a column-0 (top-level) ``return`` statement.
+
+    A module's contract is to ``return`` a table; dropping the top-level
+    ``return`` is the exact ``...``-fragment degradation. Comments and string
+    literals are stripped first (via the contract verifier's shared stripper)
+    so a ``return`` inside a comment or string never counts; then any line whose
+    first non-whitespace token at column 0 is ``return`` qualifies.
+    """
+    from converter.runtime_contract import _strip_strings_and_comments
+
+    stripped = _strip_strings_and_comments(luau_source)
+    for line in stripped.splitlines():
+        # Column-0 ``return`` (no leading whitespace) = a top-level statement.
+        if re.match(r"return\b", line):
+            return True
+    return False
+
+
+def _count_function_defs(luau_source: str) -> int:
+    """Count ``function`` definitions in ``luau_source``.
+
+    Matches both ``function Name(`` / ``function T:Method(`` / ``function T.f(``
+    and the assigned-anonymous form ``T.f = function`` / ``local f = function``.
+    Comments and string literals are stripped first so a ``function`` keyword
+    inside a comment or string never counts.
+    """
+    from converter.runtime_contract import _strip_strings_and_comments
+
+    stripped = _strip_strings_and_comments(luau_source)
+    # ``\bfunction\b`` covers every definition form: ``function Name(...)``,
+    # ``function T:Method(...)``, and ``x = function(...)``. After stripping
+    # strings/comments the only remaining ``function`` tokens are real keywords.
+    return len(re.findall(r"\bfunction\b", stripped))
+
+
+def _reprompt_is_structurally_safe(original_luau: str, candidate_luau: str) -> bool:
+    """True iff ``candidate_luau`` may REPLACE ``original_luau`` after a reprompt.
+
+    Conservative degradation guard: a reprompt response is REJECTED (return
+    ``False`` -> caller keeps ``original_luau``) iff ANY of four standalone,
+    generously-set floors breach; else it is ACCEPTED. Biased to ACCEPT — a
+    false-reject re-ships the original broken module, the costly error.
+
+    The four floors:
+      1. Parse-loss: the candidate fails the luau syntax check while the
+         original parsed. (If the original also failed to parse, this floor
+         does NOT fire — there is no good original to keep. The syntax check
+         returns ``[]`` without raising when luau-analyze is absent, so this
+         floor simply never fires in stripped environments.)
+      2. Return-loss: the original had a top-level ``return`` and the candidate
+         lost it.
+      3. Length collapse: the candidate's stripped length is < 50% of the
+         original's stripped length.
+      4. Function-count floor (only when the original had >= 2 function defs):
+         the candidate's function count is < 50% of the original's. A 1-2
+         function merge stays above the floor and is ACCEPTED; a gutted-but-
+         full-size candidate that dropped most handlers is REJECTED.
+
+    Pure: the only external dependency is the shared luau syntax checker.
+    """
+    # Floor 1 -- parse-loss (only when the original parsed).
+    original_parsed = _luau_syntax_check(original_luau) == []
+    if original_parsed and _luau_syntax_check(candidate_luau) != []:
+        return False
+
+    # Floor 2 -- return-loss.
+    if _has_top_level_return(original_luau) and not _has_top_level_return(candidate_luau):
+        return False
+
+    # Floor 3 -- length collapse.
+    original_len = len(original_luau.strip())
+    candidate_len = len(candidate_luau.strip())
+    if candidate_len < _LEN_COLLAPSE_FRACTION * original_len:
+        return False
+
+    # Floor 4 -- function-count floor (only for modules with >= 2 functions).
+    original_fns = _count_function_defs(original_luau)
+    if original_fns >= 2:
+        candidate_fns = _count_function_defs(candidate_luau)
+        if candidate_fns < _FUNCTION_COLLAPSE_FRACTION * original_fns:
+            return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Claude Code CLI transpilation
 # ---------------------------------------------------------------------------
 
@@ -2253,6 +2444,7 @@ def _claude_cli_transpile(
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
     is_player_controller: bool = False,
+    send_message_facts: tuple[SendMessageDispatchFact, ...] = (),
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
@@ -2292,6 +2484,7 @@ def _claude_cli_transpile(
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
                     is_player_controller=is_player_controller,
+                    send_message_facts=send_message_facts,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         elif cached_proven_invalids and not cached_errors:
@@ -2372,6 +2565,7 @@ def _claude_cli_transpile(
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _cli_reprompt,
         is_player_controller=is_player_controller,
+        send_message_facts=send_message_facts,
     )
     warnings.extend(contract_warnings)
 
@@ -2393,6 +2587,7 @@ def _claude_cli_transpile(
         warnings = _refresh_contract_warnings(
             luau_source, warnings,
             is_player_controller=is_player_controller,
+            send_message_facts=send_message_facts,
         )
 
     # Score confidence.

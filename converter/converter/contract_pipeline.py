@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from converter.child_ref_resolver import build_child_ref_map
+from converter.send_message_resolver import build_send_message_map
 from converter.code_transpiler import (
     TranspilationResult,
     TranspiledScript,
@@ -459,6 +460,14 @@ def transpile_with_contract(
         guid_index=guid_index,
     )
 
+    # Single producer of the SendMessage/BroadcastMessage dispatch facts: parse
+    # each C# script's DIRECT ``recv.SendMessage("M", ...)`` / ``BroadcastMessage``
+    # into per-module obligations (the OverlapSphere players-in-radius shape is
+    # excluded — ``playersInRadius`` owns it). Threaded into the per-module
+    # reprompt loop's verifier (rule ``sm``) so a dropped dispatch reprompts and,
+    # if still absent, fails the build closed. Empty when no script dispatches.
+    send_message_map = build_send_message_map(script_infos)
+
     transpilation = transpile_scripts(
         unity_project_path=unity_project_path,
         script_infos=script_infos,
@@ -471,6 +480,7 @@ def transpile_with_contract(
         component_class_paths=component_class_paths,
         player_controller_paths=player_controller_paths,
         child_ref_map=child_ref_map,
+        send_message_map=send_message_map,
     )
 
     # Build the stem-keyed require graph from the planner's modules table.
@@ -652,6 +662,19 @@ def transpile_with_contract(
     if lowered_retarget:
         log.info("[contract] rifle rig-retarget lowering rebound %d script(s) "
                  "to the _MainCameraRig slot", lowered_retarget)
+
+    # Camera-mount equip lowering: for each rig fact carrying a held-prefab equip
+    # obligation (Instantiate(prefab)+SetParent(rig-slot) in one C# method), rewrite
+    # the AI's emitted ``instantiatePrefab(<prefab>, …)`` equip site to a
+    # client->server equip REQUEST (``equipWeaponRemote:FireServer("<prefab>")``).
+    # Runs AFTER the rig retarget so the request lands on the rig-retargeted slot
+    # expression. Keys on the deterministic ``prefab_field``, NEVER on the AI output
+    # token; the ``equip_binding`` carrier feeds the fail-closed verifier.
+    from converter.camera_mount_equip_lowering import lower_camera_mount_equip
+    lowered_equip = lower_camera_mount_equip(transpilation.scripts, child_ref_map)
+    if lowered_equip:
+        log.info("[contract] camera-mount equip lowering routed %d script(s) to the "
+                 "server equip request (equipWeaponRemote:FireServer)", lowered_equip)
 
     # Roster-consumer re-lowering (allowlisted deterministic lowering pass,
     # Unit 4 Phase 2): rewrite each Addressables-label-roster consumer's

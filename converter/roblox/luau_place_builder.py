@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from typing import Any
 
 from core.roblox_types import (
@@ -43,9 +44,56 @@ log = logging.getLogger(__name__)
 # Maximum output size (Luau Execution API limit)
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024  # 4 MB
 
+# Non-finite float clamp. 1e38 < float32 max (3.4028235e38) so the value
+# survives a float32 re-encode without re-becoming inf.
+_LUAU_INF_CLAMP: float = 1e38
+
+# Bare Luau identifier (used for Enum-member tails).
+_LUAU_IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _finite_num(v: float) -> float:
+    """Return a finite float: nan -> 0.0, +inf -> _LUAU_INF_CLAMP,
+    -inf -> -_LUAU_INF_CLAMP. Finite input is returned UNCHANGED (byte-identical
+    formatting downstream). Value-returning so each site keeps its own
+    int()/.4g formatting (DP8)."""
+    if v != v:  # nan
+        return 0.0
+    if v == float("inf"):
+        return _LUAU_INF_CLAMP
+    if v == float("-inf"):
+        return -_LUAU_INF_CLAMP
+    return v
+
+
+def _luau_ident(s: str, default: str) -> str:
+    """Validate *s* as a bare Luau identifier (Enum-member tails).
+
+    Returns *s* iff it matches \\A[A-Za-z_][A-Za-z0-9_]*\\Z, else *default* (the
+    site's existing fallback). Generic — a ``;``/space/quote/dot in the field
+    falls back to the safe default, neutralizing injection (DP7)."""
+    return s if _LUAU_IDENT_RE.match(s) else default
+
+
+def _long_bracket(s: str) -> str:
+    """Wrap *s* in a Luau long-bracket literal at the lowest non-clashing level.
+
+    Finds the smallest n>=0 such that the close sequence ``']' + '='*n + ']'``
+    does NOT occur in *s*, then returns ``'[' + '='*n + '[' + s + ']' + '='*n +
+    ']'``. Structural — no payload can break out (the chosen close sequence is
+    absent by construction). Does NOT finitize control chars; for the string
+    path use ``_luau_str`` (DP4)."""
+    level = 0
+    while f"]{'=' * level}]" in s:
+        level += 1
+    eq = "=" * level
+    return f"[{eq}[{s}]{eq}]"
+
 
 def _f(v: float) -> str:
-    """Format a float compactly."""
+    """Format a float compactly. nan -> '0', +-inf -> +-_LUAU_INF_CLAMP.
+    Finite input unchanged."""
+    v = _finite_num(v)
     if v == int(v):
         return str(int(v))
     return f"{v:.4g}"
@@ -71,6 +119,7 @@ def _c3(r: float, g: float, b: float) -> str:
 
 def _c3u8(r: float, g: float, b: float) -> str:
     """Color from 0-1 floats via fromRGB (0-255)."""
+    r, g, b = _finite_num(r), _finite_num(g), _finite_num(b)
     ri = int(r * 255) if r <= 1.0 else int(r)
     gi = int(g * 255) if g <= 1.0 else int(g)
     bi = int(b * 255) if b <= 1.0 else int(b)
@@ -78,15 +127,41 @@ def _c3u8(r: float, g: float, b: float) -> str:
 
 
 def _luau_str(s: str) -> str:
-    """Escape a string for Luau. Uses long brackets if it contains quotes/newlines."""
-    if "\n" not in s and '"' not in s and "\\" not in s:
+    """Escape *s* as a Luau string literal, total for control chars (DP4).
+
+    Fast path: a string with no ``\\``, ``"`` or control char (byte < 0x20 or
+    == 0x7F) returns ``f'"{s}"'`` UNCHANGED (byte-identity). Otherwise the
+    quoted path escapes ``\\`` -> ``\\\\``, ``"`` -> ``\\"``, and any byte
+    < 0x20 or == 0x7F as ``\\ddd`` (zero-padded to 3 digits so a following
+    ASCII digit can't merge into the greedy decimal escape).
+    Round-trips byte-exact under Luau string decoding; no long-bracket (it
+    can't finitize control chars)."""
+    needs_escape = False
+    for ch in s:
+        o = ord(ch)
+        if ch == "\\" or ch == '"' or o < 0x20 or o == 0x7F:
+            needs_escape = True
+            break
+    if not needs_escape:
         return f'"{s}"'
-    # Find a bracket level that doesn't clash
-    level = 0
-    while f"]{'=' * level}]" in s:
-        level += 1
-    eq = "=" * level
-    return f"[{eq}[{s}]{eq}]"
+    out = ['"']
+    for ch in s:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif o < 0x20 or o == 0x7F:
+            # Zero-pad to 3 digits: Luau \ddd decimal escapes read GREEDILY up
+            # to 3 digits, so a non-padded \9 immediately before an ASCII digit
+            # (e.g. "\t2" -> "\92") would merge and mis-decode. \ddd is
+            # unambiguous: Luau stops at 3 digits, so a following literal digit
+            # cannot merge into the escape.
+            out.append(f"\\{o:03d}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
 
 
 def _mat_enum(mat: str | int) -> str:
@@ -863,7 +938,7 @@ def _emit_surface_appearance(
     if roughness_map:
         b.line(f"sa.RoughnessMap={_luau_str(roughness_map)}")
     if sa.alpha_mode and sa.alpha_mode != "Overlay":
-        b.line(f"sa.AlphaMode=Enum.AlphaMode.{sa.alpha_mode}")
+        b.line(f"sa.AlphaMode=Enum.AlphaMode.{_luau_ident(sa.alpha_mode, 'Overlay')}")
     b.line(f"sa.Parent={parent_var}")
     b.line("end)")
     # Fallback when SurfaceAppearance creation fails (headless execution
@@ -929,7 +1004,7 @@ def _emit_attachments(b: _LuauBuilder, part: RbxPart, var: str) -> None:
 
 def _emit_light(b: _LuauBuilder, light: RbxLight, parent_var: str) -> None:
     lt = light.light_type or "PointLight"
-    b.line(f"do local l=Instance.new('{lt}')")
+    b.line(f"do local l=Instance.new({_luau_str(lt)})")
     b.line(f"l.Brightness={_f(light.brightness)}")
     b.line(f"l.Color={_c3(*light.color)}")
     b.line(f"l.Range={_f(light.range)}")
@@ -972,7 +1047,7 @@ def _emit_particle(b: _LuauBuilder, pe: RbxParticleEmitter, parent_var: str) -> 
 
 def _emit_constraint(b: _LuauBuilder, c: "RbxConstraint", parent_var: str) -> None:
     ct = c.constraint_type
-    b.line(f"do local c=Instance.new('{ct}')")
+    b.line(f"do local c=Instance.new({_luau_str(ct)})")
     if ct == "HingeConstraint" and c.limits_enabled:
         b.line("c.LimitsEnabled=true")
         b.line(f"c.LowerAngle={_f(c.lower_angle)}")
@@ -1146,12 +1221,8 @@ def _emit_script_inline(b: _LuauBuilder, script: RbxScript, parent_var: str) -> 
     cls = script.script_type or "Script"
     name = script.name or "Script"
     src = script.source or ""
-    # Use long brackets for source to avoid escaping issues
-    level = 0
-    while f"]{'=' * level}]" in src:
-        level += 1
-    eq = "=" * level
-    b.line(f"mkScript({parent_var},{_luau_str(cls)},{_luau_str(name)},[{eq}[{src}]{eq}])")
+    # Use long brackets for source to avoid escaping issues.
+    b.line(f"mkScript({parent_var},{_luau_str(cls)},{_luau_str(name)},{_long_bracket(src)})")
 
 
 # ---------------------------------------------------------------------------
@@ -1186,14 +1257,14 @@ def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> No
     var = f"u{_ui_counter}"
     cls = elem.class_name or "Frame"
     b.block("do")
-    b.line(f"local {var}=Instance.new('{cls}')")
+    b.line(f"local {var}=Instance.new({_luau_str(cls)})")
     b.line(f"{var}.Name={_luau_str(elem.name)}")
     # Position
     px = elem.position
-    b.line(f"{var}.Position=UDim2.new({_f(px[0])},{int(px[1])},{_f(px[2])},{int(px[3])})")
+    b.line(f"{var}.Position=UDim2.new({_f(px[0])},{int(_finite_num(px[1]))},{_f(px[2])},{int(_finite_num(px[3]))})")
     # Size
     sx = elem.size
-    b.line(f"{var}.Size=UDim2.new({_f(sx[0])},{int(sx[1])},{_f(sx[2])},{int(sx[3])})")
+    b.line(f"{var}.Size=UDim2.new({_f(sx[0])},{int(_finite_num(sx[1]))},{_f(sx[2])},{int(_finite_num(sx[3]))})")
     b.line(f"{var}.BackgroundColor3={_c3(*elem.background_color)}")
     if elem.background_transparency > 0:
         b.line(f"{var}.BackgroundTransparency={_f(elem.background_transparency)}")
@@ -1207,12 +1278,12 @@ def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> No
         b.line(f"{var}.Image={_luau_str(elem.image)}")
     # Layout child
     if elem.layout_type:
-        b.line(f"local lay=Instance.new('{elem.layout_type}')")
+        b.line(f"local lay=Instance.new({_luau_str(elem.layout_type)})")
         if elem.layout_type == "UIListLayout":
-            b.line(f"lay.FillDirection=Enum.FillDirection.{elem.layout_direction}")
+            b.line(f"lay.FillDirection=Enum.FillDirection.{_luau_ident(elem.layout_direction, 'Vertical')}")
             b.line(f"lay.Padding=UDim.new(0,{elem.layout_padding})")
-            b.line(f"lay.HorizontalAlignment=Enum.HorizontalAlignment.{elem.layout_h_alignment}")
-            b.line(f"lay.VerticalAlignment=Enum.VerticalAlignment.{elem.layout_v_alignment}")
+            b.line(f"lay.HorizontalAlignment=Enum.HorizontalAlignment.{_luau_ident(elem.layout_h_alignment, 'Left')}")
+            b.line(f"lay.VerticalAlignment=Enum.VerticalAlignment.{_luau_ident(elem.layout_v_alignment, 'Top')}")
         elif elem.layout_type == "UIGridLayout":
             cs = elem.layout_cell_size
             b.line(f"lay.CellSize=UDim2.new(0,{cs[0]},0,{cs[1]})")

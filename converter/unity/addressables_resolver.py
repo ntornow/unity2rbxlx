@@ -33,6 +33,14 @@ from unity.prefab_ref import GuidIndexLike, prefab_id_for_guid
 
 logger = logging.getLogger(__name__)
 
+# A 32-hex Unity guid as it appears in a serialized ``.asset`` (both the
+# ``m_AssetGUID: <hex>`` AssetReference form and the ``{fileID, guid: <hex>,
+# type: N}`` object-ref form). Extracting every guid token and resolving each
+# through the shared ``.prefab`` filter (``prefab_id_for_guid``) is the
+# DETERMINISTIC reachability signal — no field-name allowlist, no AI fingerprint.
+_GUID_TOKEN = re.compile(r"\bguid:\s*([0-9a-fA-F]{32})\b")
+_ASSET_GUID_TOKEN = re.compile(r"\bm_AssetGUID:\s*([0-9a-fA-F]{32})\b")
+
 # Unity YAML preamble + per-document tag lines (same shapes as the .asset/SO path).
 _UNITY_YAML_HEADER = re.compile(r"^%YAML.*\n%TAG.*\n", re.MULTILINE)
 _UNITY_DOC_SEPARATOR = re.compile(r"^--- !u!\d+ &\d+.*$", re.MULTILINE)
@@ -215,4 +223,63 @@ def resolve_scriptable_object_addressables(
         if kept:
             out.by_label[label] = kept
             out.so_guids.update(kept)
+    return out
+
+
+def resolve_so_assetref_prefab_ids(
+    so_guids: set[str],
+    guid_index: GuidIndexLike,
+) -> set[str]:
+    """Return the prefab ids (``"<guid>:<path>"``) reachable from the
+    ``AssetReference`` / object-ref fields of every EMITTED ScriptableObject
+    ``.asset`` (the L0 spawn-closure surface).
+
+    WHY this exists: a heavily-Addressables game (e.g. Trash Dash) references its
+    TrackSegment/obstacle prefabs ONLY from inside a ThemeData SO's
+    ``zones[].prefabList`` / ``collectiblePrefab`` / ``cloudPrefabs`` arrays —
+    they appear in NO ``AddressableAssetsData/AssetGroups/*.asset`` group, so the
+    address/label-sourced ``PrefabAddressables`` never reaches them and the emit
+    gate (``prefab_packages._is_emitted``) never emits them as ``Templates``
+    children. This walks the emitted SOs' serialized refs to recover those
+    prefab ids so the caller can union them into the emit set.
+
+    Gating + generality (D-P4-9 / edge case 1):
+      * ``so_guids`` is the set of guids that produced an EMITTED SO module
+        (positive evidence — the SAME gate ``resolve_scriptable_object_addressables``
+        uses), NOT every SO in the project. A prefab reachable only from a
+        non-emitted SO is excluded.
+      * Only ``.prefab``-typed targets are returned (via the shared
+        ``prefab_id_for_guid`` filter) — Sprites/Meshes/Materials/Scenes are
+        dropped. Keys on the deterministic serialized guid + the guid_index
+        ``.prefab`` classification, NEVER a per-game field name or AI fingerprint.
+
+    PURE. ``guid_index`` is duck-typed (``GuidIndexLike``: ``guid_to_entry`` +
+    ``project_root``). An SO guid that the index cannot resolve to a readable
+    ``.asset`` file contributes nothing (fails soft, not raising).
+    """
+    out: set[str] = set()
+    if not so_guids:
+        return out
+    guid_to_entry = getattr(guid_index, "guid_to_entry", {})
+
+    for so_guid in so_guids:
+        entry = guid_to_entry.get(so_guid)
+        asset_path = getattr(entry, "asset_path", None) if entry is not None else None
+        if asset_path is None:
+            continue
+        try:
+            text = Path(asset_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Every guid token in the .asset — both the ``m_AssetGUID:`` (AssetReference)
+        # and the ``guid:`` (object-ref) spellings. The shared ``.prefab`` filter
+        # narrows to instantiable prefabs; non-prefab targets resolve to ``None``.
+        for m in _ASSET_GUID_TOKEN.finditer(text):
+            pid = prefab_id_for_guid(m.group(1), guid_index)
+            if pid is not None:
+                out.add(pid)
+        for m in _GUID_TOKEN.finditer(text):
+            pid = prefab_id_for_guid(m.group(1), guid_index)
+            if pid is not None:
+                out.add(pid)
     return out

@@ -836,6 +836,37 @@ converter/runtime/scene_runtime.luau (queue site ~:1300) — self-contradictory/
 ## From Unit 2 phase-3 harden (WARN-timing residual — reverted net-negative patch)
 - converter/runtime/scene_runtime.luau — the residual "stripped ref never resolved" WARN has imperfect timing across MULTIPLE async UI-deferred host groups: it can fire PREMATURELY (a ref that a later group will bind) — that's the last-good behavior we kept. A harden attempt to gate it on a _deferredGroupsPending counter + a final drain was REVERTED because it introduced the opposite bug (WARN SUPPRESSED forever when the last group completes as an empty batch — codex). The WARN is DIAGNOSTIC-ONLY; binding is correct either way (cross-domain refs never queued; same-domain incl. missionPopup bind via the original post-placement + per-batch drains). Getting the WARN's exact multi-group async timing right is deferred (no real game exercises it: Trash-Dash's 3 stripped refs are client→client and their targets register). Fix when a real case appears.
 
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 ==== -->
+# Followups — checkmark-toggle-binding-20260617T075020
+
+- **Structurally canonicalize the Toggle `isOn` writer attribute** (r2 attr-fingerprint residual). The binding reads
+  the `"isOn"` attribute the AI-transpiled writer emits; on a future game whose transpile emits a different
+  name/casing it would bind-but-never-update. Make the converter own the attribute on BOTH writer (lowering) and
+  reader (binding) sides so `attr_name` stops being an AI-output fingerprint. Interim guards: A4 convention pin
+  (RED at converter-build time) + the structural source. (D-4 keeps the AI writer untouched in this slice.)
+- **Graphic-only re-clone with a surviving toggle does not re-bind** (E11 residual, OVERRULED-as-unreachable). The
+  per-row `_boundRows` marker keys re-bind off the toggle instance; a checkmark graphic re-created while its toggle
+  survives would keep the stale binding. UNREACHABLE in converter output (a converted checkmark is a child of the
+  toggle's ScreenGui → re-clones with it). The `(toggle,graphic)`-pair marker was tried + reverted (it leaked the
+  listener on the surviving toggle — net-negative). If a future binding kind decouples the endpoints, the proper
+  fix is a pair marker that ALSO tracks+disconnects the per-row connection on re-bind.
+- **PlayerGui one-time capture never recovers after a 10s WaitForChild timeout** (phase MINOR). The client host
+  captures `PlayerGui` once; if that times out, the toggle watch (like every UI service that closes over the same
+  `PlayerGui`) never installs for the session. Pre-existing shared host infra, not toggle-specific; pathological
+  (>10s PlayerGui). Fix belongs in the host's PlayerGui acquisition, not this feature.
+- **Slider→fill (health) visual binding** — DEFERRED; build as `ui_slider_bindings` reusing this mechanism.
+- **Particle/transparency-based hide** (vs `.Visible`) — revisit only if e2e shows a graphic that must dim.
+
+<!-- ==== /drive run: checkmark-toggle-binding-20260617T075020 (e2e-found addendum) ==== -->
+## 2026-06-17 — e2e-found (dispatch)
+- **Broader UI-widget dead-dispatch audit.** `_convert_ui_element` dispatches `Slider`/`InputField`/`Dropdown`/`ScrollRect`
+  on LITERAL component_type names, but real Unity serializes these as `MonoBehaviour` (m_Script GUID) — so their property
+  extraction is likely dead on real scenes too (same class as the Toggle bug fixed here). `Button` and now `Toggle` have
+  MonoBehaviour heuristics; the rest need the same audit. (Slider is already deferred as `ui_slider_bindings`.)
+- **`m_IsOn` Toggle discriminator precision.** Detection is `MonoBehaviour + m_IsOn` (mirrors Button `m_OnClick`). A
+  non-Toggle MonoBehaviour with an `m_IsOn` field could false-positive, but harm is bounded (a spurious binding row needs
+  ALSO a resolvable `graphic`; otherwise just a benign stray `ToggleIsOn` attribute). If a definitive m_Script-GUID→type
+  resolution is added later, key the dispatch off it instead of the field heuristic.
 
 ## ── /drive run addressables-unit3-themes-20260617T080323 — Addressables Unit 3 (Themes) — 2026-06-17T04:00:11Z ──
 
@@ -1034,3 +1065,321 @@ Observed in the Unit-4 e2e cold-boot (2026-06-17), but PRE-EXISTING + roster-unr
 - CASCADE: CharacterInputController (line 1) and CharacterCollider (line 2) both `require(TrackManager)` at the top, so TrackManager returning no table makes BOTH fail "Module code did not return exactly one value". One root (TrackManager), three console errors.
 - Two follow-on angles: (a) transpile robustness — a complex MonoBehaviour (TrackManager) intermittently transpiles to a TODO-stub with no class-table return; (b) require-resilience — the emitted `require(X "..." ) or ServerStorage...` pattern does not guard against X loading to nil/non-table, so one inert module cascades into every requirer. Consider a fail-soft require wrapper or a post-transpile "module returns a class table" verifier.
 - Also: TrackManager is the D-P2-9 scoped-out post-boot consumer; its failure here is the stub/no-return issue, NOT the wrapper-vs-Instance concern (which only bites with a live body).
+
+<!-- promoted from /drive run trash-dash-playable-20260617T192649 (2026-06-18) -->
+# Follow-ups — trash-dash-playable-20260617T192649
+
+Out-of-scope items surfaced during Phase-1 detailed design. Not blocking Phase 1.
+
+- **Rename `component` provenance state → `non_roblox_table`** for naming honesty (it now covers host-component results AND require'd modules). Cosmetic, zero behavior change; touches `TrackLit`, `_COMPONENT_HOST_APIS`, 5+ call sites, and every literal-asserting test. Deferred — pure churn.
+- **Unify all THREE reprompt acceptance gates on `_reprompt_is_structurally_safe`.** The lint-syntax-repair path (`_lint_and_fix` / `_reprompt_fix:2656`) already has a weaker (0.3-length, `"end" in fixed`) sanity check; folding it into the shared guard is a clean consolidation but not load-bearing for Phase 1 (that path was not implicated in the fragment degradations).
+- **rule-a/b runtime-correctness in the FULL state modules** (module-scope side-effects from the C# static/state-machine pattern). Surfaced only by the Phase-1 cold re-convert + playtest; owned by Phase 2 if it gates a run.
+- **~222 semantic_warnings triage** — only if one is shown to gate a run after the Phase-1 re-convert.
+- **Remote Addressables / CDN content loading** — out of scope for this run.
+
+## Phase 2 (DEFERRED to its own /drive run) — Trash Dash downstream Addressables gameplay-spawn closure
+Decided 2026-06-18 (user): ship Phase 1 standalone; Phase 2 is a dedicated new /drive run.
+Scope captured from the Phase-1 live playtest (state machine now boots; these block a playable run):
+1. ConsumableDatabase: `self.consumbales` holds unresolved Addressable address STRINGS, not
+   materialized Consumable objects → `c:GetConsumableType()` throws (ConsumableDatabase:15 OnEnable).
+   = Addressables prototype-materialization gap (design doc Unit-4/Phase-5 consumables).
+2. CoroutineHandler.getInstance() called before any instance Awoke (x2) — boot ordering.
+3. connectGameObjectTriggerSignal: no touch part on nil — trigger wired to an unplaced/nil part.
+4. UI host clone for "...Main.unity:..." never landed; skipping deferred component (x3) — deferred UI clones dropped.
+5. No gameplay spawns (segment/coin/obstacle/character=0; TrackManager:Begin not reached / themes+segments unresolved).
+Anchor: docs/design/addressables-prefab-conversion.md (Units 1-4 merged; this is the residual runtime layer).
+Start a fresh /drive run on this scope; multi-subsystem → expect multiple phases.
+
+## Documented residuals — Phase-1 finalize (codex findings, overruled-at-integration, bounded)
+- `_is_require_call`→`component` assumes every transpiled `require(...)` is a MODULE require (returns a
+  table), which holds for the converter's emission (module deps only; never `require(anInstance)`). If a
+  future emission path ever `require()`s something returning a raw Roblox Instance and then does
+  `.Parent`/`.Instance:Method()`, the validator would abstain on it. No such path today; revisit only if
+  the transpiler starts emitting non-module requires. (codex finalize MAJOR, refuted at integration.)
+- `_has_top_level_return` keys on a column-0 `return`; an unconventionally-indented module-level return
+  would be missed. Idiomatic transpiled modules emit column-0 `return ClassName`. Cheap future hardening:
+  reuse runtime_contract's top-level-statement iteration. (codex finalize MINOR.)
+## Run door-binding-race (2026-06-17)
+
+# Followups — door-binding-race run
+
+- A STATIC scene-baked copy of a runtime-placed prefab may also exist in workspace (a HostilePlane
+  Name tag appears under both Workspace and ReplicatedStorage in the converted rbxlx). Placement-dedup
+  concern, separate from this binding fix — the fix makes binding robust regardless, but the static
+  copy may cause a duplicate/ghost instance. Investigate whether generic mode should suppress the
+  static copy when a runtime placement exists.
+- Respawn/teardown rebind of the `workspace.DescendantAdded` listener: not added. LocalScript/Script
+  lifetime matches the place session; no explicit `:Disconnect()` lifecycle. Detailed design confirms no
+  leak (single connection per global driver, gated on `not _ownerIsContainer`). Revisit only if a
+  teardown/respawn flow is added that destroys+recreates the driver script.
+- The DescendantAdded child-BasePart fallback (decisions.md D3) relies on the child BasePart sharing a
+  matched name OR the Model resolving on its own event. For a generic Model whose root name differs from
+  its only BasePart child name and which is parented incrementally (not one-shot like autogen.py:951-959),
+  binding could miss until a same-named descendant arrives. Not reachable for the door/plane primary
+  cases (one-shot parent). Generic hardening follow-up if a real game exhibits incremental Model assembly.
+
+## slop (deferred to finalize)
+- converter/converter/animation_converter.py:29 — `Any` co-imported with `Literal` (Any pre-existing for parser sigs, not in this diff)
+- converter/converter/animation_converter.py:1305-1311 — "Runtime placement gate" rationale duplicated as Python `#` comment + emitted Luau `--` comments
+
+<!-- ===== /drive run rifle-mount-diag-20260617T215229 (2026-06-18) ===== -->
+# Follow-ups (out of scope for this run)
+
+- **Player-rooted `BroadcastMessage` subtree descent.** Phase-2 decision BC-1/D-P2-4 makes a
+  player-alias `broadcastMessage` a flat per-goId dispatch (no `_goParentId` descendant walk), because
+  no corpus site roots a broadcast at the player and the player embodiment is a logic singleton. If a
+  future game broadcasts to the player subtree (registered child GameObjects under the player rig),
+  add a descent path for the player-alias broadcast branch. Not built now (right-sized, no driver).
+- **Cross-client player-alias routing.** Phase 2 (like Phase 1) resolves within the LOCAL partition /
+  per-client `_player`. A `host:sendMessage` whose player alias names a DIFFERENT client's player would
+  need RemoteEvent funneling (the `PlayerSetSharedFlag` pattern). No corpus site exercises it → out of
+  scope; future relation if a cross-client site appears.
+- **Primitive (number/boolean) `recv` throws in `_isPlayerAlias`/`_resolveReceiverGoId`.** Indexing
+  `recv.IsA` (Slice 2.1) — and the pre-existing `type(recv.FindFirstAncestorWhichIsA)` in
+  `_resolveReceiverGoId` — throws when `recv` is a bare number/boolean (not nil, not a table). Unreachable
+  from real emission (a transpiled `obj.SendMessage(...)` receiver is always a GameObject/Component
+  handle), so no current driver. If a defensive guard is ever wanted, gate both indexings on
+  `type(recv) == "table"`/`"userdata"` first. Found in review-2.1-1; low priority.
+
+## [phase2 codex] flat player-alias broadcast skips descendants (D-P2-4)
+`broadcastMessage` to a player alias dispatches flat per-goId (no subtree descent), unlike the
+non-player path which descends children. Intentional (no corpus BroadcastMessage targets a player).
+IF a future phase attaches descendant broadcast-target components under the player-embodiment
+GameObject, revisit: player-alias broadcast would silently skip them. Low priority; no current site.
+
+## [review-phase2-2] `_playerScriptId`-nil test does not isolate the second guard clause (P2)
+`test_fail_closed_when_player_script_id_nil` verifies the fail-close BEHAVIOR (warn + no
+dispatch + no throw) for `_player` set / `_playerScriptId` nil, but does not tightly guard the
+`not p._playerScriptId` clause specifically: mutating the runtime to drop that clause leaves the
+test green, because the loop's `m.scriptId == nil` comparison matches nothing anyway (real
+`meta.scriptId` is always non-nil). Defense-in-depth, not the line under test. To make it a tight
+guard, seed a `_meta` row with `scriptId = nil` (or assert the clause via a unit on `_playerGoIds`).
+Low priority — the asserted behavior is real and the dedupe/alias guards are surgically proven.
+
+## slop (deferred to finalize)
+scene_runtime.luau:1641-1650 — long intent-comment restating design history (player-alias branch)
+scene_runtime.luau:1662-1666 — long intent-comment (broadcast player branch)
+scene_runtime.luau:1725-1730 — long intent-comment
+test_send_message_dispatch.py:612-640 — long docstring restating design history
+test_send_message_dispatch.py:678-706 — long docstring
+
+## [finalize P2] plain component-table IsA-false branch untested
+A receiver that is a plain table WITH an IsA method returning false (not a Player) should fall through
+pcall→false→playerFromTouch→non-player path. Covered indirectly by the non-player control (no IsA);
+a direct IsA-returns-false case is untested. Low value (no real emission shape); P2.
+
+## [finalize r3 codex — non-blocking taste/refactor, routed not applied]
+- scene_runtime.luau _isPlayerAlias/_playerGoIds doc-comments: codex would trim further; Claude (with design context) marked them KEEP (decoupling + deterministic-key + fail-close are load-bearing). Taste disagreement, not clear slop.
+- scene_runtime.luau "-- Non-player path." minimal section label — could drop; NIT.
+- extract the shared player-alias dispatch/warn block from sendMessage+broadcastMessage into one helper — a REFACTOR (out of de-slop scope; would re-introduce the over-abstraction codex flagged for _playerGoIds). Defer.
+
+## [verify live — NEW BUG] GetRifle transpile drops weaponSlot parenting (rifle mounts at head, not WeaponSlot)
+LIVE (post routing-fix): rifle now picks up + GetRifle runs, but the rifle is parented to the Player
+ROOT at getLookCFrame() (head ~y140), NOT to Workspace.DynamicObjects.Player."Main Camera".WeaponSlot
+(empty, y138). Unity Player.cs:264-272 GetRifle: Instantiate(riflePrefab, weaponSlot.position);
+SetParent(weaponSlot); localScale=0.2; localRotation=identity; localPosition=zero (weaponSlot=cam.GetChild(0)).
+The AI transpiler flattened weaponSlot->getLookCFrame() and SetParent(weaponSlot)->parent=Player root +
+PivotTo(lookCF), losing the FPS hold-slot offset. SEPARATE from this run's SendMessage routing fix; a
+distinct transpile-fidelity defect (non-deterministic AI output dropping a Transform ref + SetParent).
+Acceptance "mounts on the camera WeaponSlot" not met by placement, though routing/mount now works.
+
+## [deferred feature] camera-mount → player-mount (replicated weapon equip)
+See DESIGN-camera-mount-to-player-mount.md + finalize-todo.md. The rifle now picks up + GetRifle runs
+(routing fix), but mounts at head (camera viewmodel intent) not a replicated character mount. Product
+decision: build the Roblox-idiomatic server-replicated character-attached weapon equip as its own run.
+
+## ---- /drive run mesh-fidelity-20260619T232452 (promoted 2026-06-19T16:22:45Z) ----
+
+# Follow-ups — mesh-fidelity-20260619T232452
+
+
+## Phase-1 detailed-design pins (from design review r2 — non-blocking)
+- Bug-2 pop must cover `_embedded_key_candidates` slash variants of the offending key in `uploaded_assets` (cross-OS cached ctx); add that case to the quarantine test.
+- Bug-2: discover offending keys via `mesh_hierarchies.items()` + `is_embedded_mesh_key`, pop those keys from the POST-merge ctx dicts; test the pre-seeded-in-ctx force-rerun case.
+
+## Latent edge (codex, slice-1 review — non-blocking)
+`_quarantine_bad_embedded_meshes` uses `partition("#")` (splits on FIRST '#'). If an embedded prefab/asset
+path itself contained a '#', the slash-variant reconstruction could mis-target. Not an established real
+case (asset paths with '#' aren't known to occur), and `is_embedded_mesh_key` already constrains the shape.
+Revisit only if such paths appear.
+
+## Decimation except-fallback can exceed cap (codex finalize r2 — non-blocking, latent path)
+`decimate_mesh`'s `except Exception` exports the UN-decimated original on ANY backend failure, so output is
+strictly ≤ cap only when decimation succeeds. Acceptable today (no production caller; backend often absent),
+but when decimate_mesh is wired, consider failing loud / quarantining the mesh instead of shipping an
+oversized original on a true decimation failure.
+
+## Real-upload 20k-acceptance verification (deferred from VERIFY — now low-yield)
+The Gate-A open question deferred proving Roblox accepts a >10k–≤20k-face mesh to VERIFY. Finalize revealed
+decimate_mesh has NO production caller AND the converter env lacks a decimation backend, so a live conversion
+would not exercise the clamp at all. Defer the real-upload acceptance check until decimate_mesh is wired into
+the upload path; bug-2 quarantine is covered by the call-site + helper tests.
+
+
+
+## Phase 1 (consumables) — phase-level live-verify checkpoints
+- ASSERT on the cold re-convert: the transpiled `Consumable.new` (and each subtype `.new`) READS its
+  `config` arg (this phase's conversion does — Consumable.luau:27-32; older outputs emitted a no-arg
+  ctor → bool-gate fidelity would regress, degradation safe). Shim test stub reads config so it can't
+  catch a no-arg real ctor (green-test-for-wrong-reason). If a real game emits a no-arg ctor, the
+  bool/scalar fields won't reach the instance.
+- `icon` is a Unity Sprite object-ref (not a .prefab); resolver drops it from post_fields (parity with
+  legacy _value_to_lua nil). If shop/loadout icons must render, Sprite→rbxassetid resolution is a
+  separate concern. Confirm on the playtest whether powerup icons render.
+
+## Phase 3 (ThemeDatabase SO-seed) — discoveries
+- **The entire SO-seed test suite (`tests/test_theme_seed_plan.py`) is written against a FICTIONAL
+  transpiler output shape the AI never emits — a green-test-for-wrong-reason at scale.** The fixtures
+  `THEME_DB_CS` / `THEME_DB_LUAU` assert a `for _,op in ipairs(Module._pendingThemeData)` list-store with
+  a module field + `Register` appender. The REAL transpiled `ThemeDatabase.luau` is a **keyed-dictionary
+  in a LOCAL upvalue** with an uncalled `addTheme` closure — no `_pendingThemeData`, no `ipairs`, no
+  `table.insert`. So `_derive_drain_field`/`_derive_appender_name` (gates c/d) were validated only on a
+  shape that does not occur; the whole list-store seed+shim path has likely NEVER fired on a real SO-store
+  DB. Phase 3's lowering supersedes it for the dict-store shape, but the list-store path's real-input
+  coverage is unproven — audit whether ANY real game emits the list-store shape, or retire that path.
+  ([[enumerate-real-input-space-before-abstraction-lock]], [[green-test-can-pass-for-the-wrong-reason]].)
+- The gate-(b) `_CS_METHOD_HEADER` control-keyword bug is GENERIC: any `_derive_cs_load_ownership` /
+  `_enclosing_method_name` caller mis-derives the enclosing method as `if`/`for`/`while`/etc. whenever a
+  comment or expression precedes a control-flow statement inside the method. Fixed in Phase 3 but worth a
+  grep for other `_CS_METHOD_HEADER` consumers.
+- `ThemeData.AssetReference` prefab-id resolution (zones/prefabList/collectiblePrefab/cloudPrefabs) is
+  DEFERRED to Phase 4 — Phase 3 only makes `currentTheme` non-nil, not the actual segment/coin/cloud spawn.
+
+## From phasedesign3 review (out-of-scope real bugs)
+- **`find_roster_consumers` ignores `<T>` in `LoadAssetsAsync<T>`** (`roster_consumer_lowering.py:83-130`). It keys solely on the label being in `by_label`. A Unity Addressables *label* is many-to-many with assets, so a label applied to both a prefab and an SO puts the same label string in BOTH the prefab `by_label` and the SO `by_label` surfaces. An SO-DB module that calls `LoadAssetsAsync<SOType>("sharedLabel")` would then be claimed by the roster path too. Independent of Phase 3, this means the roster path can mis-claim an SO loader today on a shared-label game (it would rewrite the DB to read tagged prefabs). Consider gating the roster finder on `<T>` resolving to a prefab-bearing type, symmetric with the SO finder's `<SOType>`-resolves-to-SO-module gate.
+
+## From phasedesign3 review round 2 (out-of-scope / residual)
+- **Layer (b) disjointness gate is tautological as stated; layer (a) silently mis-routes a shared-label SO DB to the roster body.** `so_addr_by_label` is pre-narrowed to emitted-SO guids, so the design's layer-(b) test ("label's SO-surface guids resolve to non-empty `so_guid_to_module_path`") is non-empty for ANY label in that map — it cannot discriminate `LoadAssetsAsync<GameObject>("shared")` from `LoadAssetsAsync<ThemeData>("shared")` (the finder has only the captured `<T>` STRING, no type→module map). Disjointness is actually enforced ONLY by layer (a) (roster-claimed-path exclusion, roster wins ties). Side effect: a genuine `<SOType>` DB whose label ALSO tags a prefab is claimed by the roster finder → excluded from the SO finder → rewritten with the roster `GetTagged` body instead of the SO-require body (wrong runtime data source). High severity on shared-label games; none for trash-dash (`themeData` tags only the two SO `.asset` entries — verified). Real fix = make layer (b) load-bearing by binding the captured `<T>` to the emitted-SO type set (so the SO finder POSITIVELY matches only SO-typed loads and the roster finder only prefab-typed loads), symmetric with the filed roster `<T>` gap.
+
+## From phase 3 HARDEN pass (drive-harden, 2026-06-18)
+- **Consumer-lowering whole-region replace SILENTLY DROPS a 5th public method.** `_locate_region`
+  spans the first→last `function <N>.<m>(` and `_canonical_region` re-emits ONLY the 4 known methods
+  (dict getter, loaded getter, accessor, load method). A DB module with an extra public method (e.g.
+  `Reload()`, a 2nd accessor) loses it on lowering (empirically confirmed: `DB.Reload()` destroyed).
+  This is a SHARED characteristic of the established `roster_consumer_lowering.py` precedent (identical
+  first→last region span + 4-method canonical body), NOT a Phase-3 regression. No current-input impact:
+  real Trash-Dash ThemeDatabase + CharacterDatabase each have EXACTLY 4 public methods (verified). A
+  real fix (preserve unknown methods, or fail-closed on a 5th) should apply to BOTH the SO-DB lowering
+  AND the roster precedent — deferred as scope expansion beyond the phase blast radius.
+
+## Tooling — assemble cache-key quirk (reinforced Phase-3 verify)
+- Re-assembling the Phase-3 converter on the #210 diag output via a SYMLINKED .cache/llm cold-re-transpiled
+  ~25 scripts (~111 min, one hit the 1200s ceiling) because the cache entries were flagged "proven-invalid"
+  — NOT the expected fast preserved-scripts skip. The Phase-1 followup already flagged "a pipeline-only
+  change shouldn't invalidate the transpile cache"; this confirms the symlinked-cache reuse path does NOT
+  reliably skip transpile. For a fast faithful re-verify, copy the diag output's scripts/ AND ensure the
+  preserved-scripts assemble path actually rehydrates them (don't rely on the LLM cache); or investigate
+  why diag cache entries are "proven-invalid" at a different converter tip.
+
+## From slice 4.1 implementation (consumable deferral root cause)
+- **Consumable SO `consumbales` field struct-flattening (root cause of the deferred consumable spawn
+  site).** The C# `ConsumableData` is a struct `{gameObject, canBeSpawned}`; the `Consumables` SO
+  materialization (`scriptable_object_converter._value_to_lua`) flattened each entry to a BARE
+  prefab-id STRING (`Consumables.luau:7-11` = `{"8c89..:CoinMagnet.prefab", ...}`). The transpiled
+  `TrackManager:SpawnCoinAndPowerup` then accesses `self.consumableDatabase.consumbales[picked].canBeSpawned`
+  and `.gameObject.Name` — nil at runtime (a string has no such fields). The L1 spawn-call-site
+  lowering DEFERS this site (fail-closed: detected via origin comment, NOT rewritten, loud warning)
+  because no prefab-id-string expression is provably available there. The real fix is in the SO
+  materialization: emit `ConsumableData` entries as a struct `{gameObject = "<prefab-id>", canBeSpawned = ...}`
+  (preserve the struct shape, resolve the inner `gameObject` AssetReference to a prefab-id), so the
+  consumer's `.canBeSpawned`/`.gameObject` access resolves AND the spawn site can be lowered
+  (`self.consumableDatabase.consumbales[picked].gameObject` would then be a prefab-id string). Until
+  then, consumable powerups will not spawn — but they fail SOFT (the warn-and-return abort path the AI
+  emitted is preserved). Out of scope for slice 4.1 (touches scriptable_object_converter, an SO-data
+  concern, not the spawn-call-site lowering). Verify at the phase live verify whether powerups gate the run.
+
+## From Phase 4 detailed design (deeper-residual watch + out-of-scope)
+- **Pooler prefab-id string (watch at slice-4.1 live verify).** `Coin.coinPool =
+  Pooler.new(currentTheme.collectiblePrefab, …)` (TrackManager.luau:222) now receives a
+  `"<guid>:Pickup.prefab"` STRING. Pooler's instantiation path may itself be an unrewritten
+  call site — if so, fold into slice 4.1's call-site lowering; else file.
+- **Newly-emitted segment Template runtime scripts (watch).** Once L0 emits the 24 TrackSegment/
+  obstacle prefabs as Templates, their attached runtime scripts (Obstacle.Spawn, TrackSegment
+  component wiring) may have their own dead call sites / missing wiring surfaced only when a
+  segment first spawns. Re-diagnose at the slice-4.1 live verify (the playable-run gate).
+- **`template_name` dangle is generic.** `scene_runtime_planner.py:1063` stamps `template_name`
+  for EVERY prefab subplan regardless of the `_is_emitted` gate, so the registry can reference a
+  Template that was never emitted (roster_assembly.py:156 guards roster-only). Consider stamping
+  `template_name` only for emitted prefabs, or a converter-time assertion that every referenced
+  `template_name` resolves. Out of scope for Phase 4 (L0 fixes the trash-dash instances).
+- **SO-AssetReference resolver vs the prefab-narrowing two-surface contract.** L0 adds a 3rd
+  prefab-inclusion source (SO AssetReference arrays) alongside scene-placement and AddressableAssetsData
+  groups. Confirm it does not blur the deliberate prefab/SO `by_label` narrowing
+  (addressables_resolver.py:157-170) — it feeds `addr_ids` (the emit set), NOT `by_label`.
+
+## Slice 4.2 followup — CC-evidence for never-placed dormant-holder descendants
+`_walk_scene._visit` still runs `character_controller_scripts.add(script_id)` for a
+MonoBehaviour whose host has an inactive ancestor (the add precedes the gap-#3 suppression
+`continue`). Such a host is never placed, so in principle it should not contribute
+player-avatar (CharacterController) evidence. Low risk in practice: the player rig's CC
+host is normally active. Out of scope for 4.2 (design scoped to the dangling row; touching
+player selection is a separate behavior change). Pin at live verify; fix only if a never-placed
+CC host spuriously trips the unique-and-exclusive player gate.
+
+## Slice 4.1 review — residual blind-spots (output-fingerprint, non-blocking)
+- **Cloud gate** keys on a `-- …Instantiate(…` AI-emitted comment attached to the
+  clone (the design already names this output-fingerprint blind spot). If a future
+  transpiler emits a generic pooler clone WITH an unrelated `Instantiate(` comment
+  block directly above it, the gate would re-fire. Mitigation if it ever occurs:
+  tighten the marker to the full `Instantiate(<ref>) …` origin phrasing or move the
+  cloud trigger to a deterministic upstream fact. No real input exhibits this today.
+- **Premium extraction** rewrites only when the warn `tostring(<EXPR>.name)` literally
+  exposes the prefab-id expr. If a future transpiler routes the name through a temp or
+  helper, premium would fail-soft ABSTAIN (loud warn, not corruption). Acceptable
+  fail-closed; revisit only if a real conversion shows the variant.
+
+## Phase 4 HARDEN — deferred (slop / latent, non-blocking)
+
+- **slop (deferred to finalize):** none material found. The spawn-lowering module is
+  dense with WHY-comments but they are load-bearing (origin-comment anchoring rationale,
+  D-P4-* references) — leave for the finalize de-slop lens to judge, not this stage.
+- **LATENT (not a current-input bug, no fix):** `_locate_cloud` uses `_RE_CLOUD.search`
+  (FIRST match only). If a module ever held a generic-pooler `:Clone()` BEFORE the
+  cloud-origin `:Clone()` in source order, the first (pooler) match fails the attached-
+  comment gate and returns None, silently missing the real cloud site. The real
+  TrackManager.luau has exactly ONE `:Clone()`, so it does not bite; right-sizing per
+  design (gate edge-hardening on evidence the failure occurs). If a future game shows a
+  multi-clone module, iterate `_RE_CLOUD.finditer` and gate each match independently.
+
+## Tooling — cache-quirk ROOT CAUSE PINNED (2026-06-19, finalize verify)
+- The ~111-min cold re-transpiles + TrackManager-stub contamination on every assemble-on-diag verify trace to:
+  `scripts_cache_intact(out, transpiled_scripts)` skips transpile only when `top_level_luau_on_disk >=
+  transpiled_scripts` (the persisted count). write_output's dead-module PRUNE deletes Roblox-dead modules
+  from disk (e.g. RestartRunning.luau) AFTER the count is persisted, so on-disk (59) < persisted (60) →
+  skip NEVER fires → assemble re-transpiles the whole set (and with a dead/invalid cache, stubs the slow
+  ones). FIX (converter): persist `transpiled_scripts` as the POST-prune on-disk count, OR have
+  scripts_cache_intact subtract pruned dead modules. Until then, a faithful re-verify must correct the
+  persisted count to the true on-disk luau count (done manually this run: 60→59). This is the real fix for
+  [[verify-fixed-converter-on-diag-real-modules-output]]'s reliability.
+
+## Verify — preserve-assemble does NOT reproduce the client/server split (2026-06-19)
+- The forced preserve-scripts (skip-transpile) assemble produces a place whose storage split is INCONSISTENT:
+  base classes (Consumable/ConsumableDatabase) land in ServerStorage while their client-side subclasses
+  (CoinMagnet/Score2Multiplier/Invincibility/ExtraLife in ReplicatedStorage) `require` them → on the CLIENT,
+  ServerStorage is invisible → require(nil) → systemic "Attempted to call require with invalid argument(s)"
+  across most modules → nothing loads. The Phase-3 RE-TRANSPILED place did NOT show this (the full pipeline
+  ran Step 4.5 split). So the skip-transpile path either skips or staleley-reuses the storage classification.
+  CONSEQUENCE: assemble-on-diag (preserve-scripts) is NOT a faithful runtime-verify substitute — it's fine for
+  build-time produce checks (seed/lowering present) but the PLACEMENT/split is wrong, so it can't run.
+  A faithful live verify needs the FULL /convert-unity (transpile+split+write_output). [[e2e-never-u2r-only-convert-unity]]
+- COMBINED with the scripts_cache_intact post-prune-count bug (above), the converter currently has NO fast
+  faithful re-verify path: skip-transpile breaks the split; full transpile stubs on a dead apikey / cache-invalid.
+  This is the core tooling blocker for per-phase/aggregate live verification. Worth a dedicated converter fix.
+
+## FU — LoadoutState missionPopup field-ref resolves nil at OnEnable (2026-06-19, gap#4 live re-verify)
+- SYMPTOM: `ReplicatedStorage.LoadoutState` OnEnable throws "attempt to index nil with 'gameObject'" every boot — `self.missionPopup` is nil.
+- DISTINCT from gap#4 host-emission (now FIXED, fd35951): the missionPopup UI HOST subtree now LANDS (MissionPopup + _SceneRuntimeId present in PlayerGui), but the LoadoutState component's SERIALIZED field-reference to it resolves nil at OnEnable — a field-ref RESOLUTION/TIMING issue in scene-runtime component wiring, not host-drop.
+- Pre-existing since Phase-1 verify ("exposed LoadoutState missionPopup nil #4"). Design-phase4 framed it as same host-landing class; live proves host-landing was necessary-but-insufficient — there is an additional ref-resolution mechanism.
+- NEXT: root-cause how scene-runtime injects/resolves a MonoBehaviour's serialized UI-component reference (self.missionPopup) relative to OnEnable ordering and the deferred host-clone landing; likely a deferred-ref-rebind after the host clone lands. Own /drive run.
+
+## FU — gap#4 UI-host clones (ConfirmPopup/OpenURL/missionPopup) — REAL residual, fix attempt reverted (2026-06-19)
+- SYMPTOM (live): 3 deferred UI-host clones under inactive SettingPopup→AboutPopup "never land"; host instances never emitted. ConfirmPopup 1918594629, VisitUnityButton 1834564028, VisitGameChangerButton 375939466 (+ a 4th instance: LoadoutState missionPopup field-ref nil).
+- ROOT CAUSE (proven): _convert_ui_element drops the subtree because SettingPopup's namespaced id is in PR3c _collect_ui_child_suppression_ids (its runtime controller references a prefab/asset) → blanket `return element` drops ALL static children. The Phase-4 inactive-prune fix (ui_translator:394) is INERT here (suppression runs first).
+- FAILED FIX (reverted fd35951): narrowing to skip only `from_prefab_instance` children is INVALID — PR3c legitimately drops AUTHORED static descendants for inventory/list controllers (test_ui_translator_child_suppression.py: InventoryController w/ m_inventoryItemPrefab drops StaticChild/StaticGrandchild, both from_prefab_instance=False). Both cases (SettingPopup vs InventoryController) have a runtime-bearing prefab-ref controller + authored static descendants; no node-level discriminator distinguishes "controller re-instantiates its subtree" (drop correct) from "references a prefab but keeps authored static children" (drop wrong). Codex also flagged: discriminator not propagated into recursion (descendant double-stamp).
+- CORRECT FIX (dedicated effort): make _collect_ui_child_suppression_ids granular — suppress only the static subtree that ACTUALLY corresponds to the controller's instantiated prefab content (tie the prefab ref to the specific child/subtree it replaces), per codex. This is a PR3c redesign, beyond this run's blast radius. Own /drive run.
+## /drive run output-boundary-sanitize-20260620T082237 (2026-06-20T02:28:30Z)
+## From Phase 1 detailed design (output-boundary-sanitize)
+- `rbxlx_writer.py:1382` calls `_write_attributes(lighting_props, pp_attrs)` but
+  `_write_attributes` is UNDEFINED in the module and not imported — latent
+  NameError reachable only when `pp.attributes` is truthy. Unrelated to escaping;
+  pre-existing. Fix separately.
