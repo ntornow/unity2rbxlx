@@ -3449,6 +3449,14 @@ return table.concat(allData, "\\n")'''
         self._subphase_prune_dead_module_closures()
         self._classify_storage()
 
+        # Record the post-prune on-disk top-level script count. The prune above
+        # deletes dead modules from disk AFTER ``transpiled_scripts`` was set in
+        # the transpile phase, so ``scripts_cache_intact`` must compare a later
+        # assemble/upload against THIS count, not the pre-prune total (which
+        # always missed and forced a full re-transpile).
+        from utils.script_cache import count_top_level_scripts
+        self.ctx.cached_script_count = count_top_level_scripts(self.output_dir)
+
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
 

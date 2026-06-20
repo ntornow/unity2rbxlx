@@ -962,7 +962,9 @@ def publish(
         skip: set[str] = {"parse", "extract_assets", "moderate_assets"}
         if (
             "transpile_scripts" in pipeline.ctx.completed_phases
-            and scripts_cache_intact(output_path, pipeline.ctx.transpiled_scripts)
+            and scripts_cache_intact(
+                output_path, pipeline.ctx.expected_cached_script_count()
+            )
         ):
             skip.add("transpile_scripts")
         force_rerun = {"upload_assets", "resolve_assets"}

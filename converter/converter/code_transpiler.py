@@ -246,6 +246,18 @@ def transpile_scripts(
     )
     result = TranspilationResult()
 
+    # Operator visibility: the luau-analyze syntax gate (the lint+reprompt loop
+    # and the degradation guard's parse-loss floor) is INACTIVE when the binary
+    # is absent — generated Luau ships syntactically unverified. Warn loudly
+    # once so a stripped env (e.g. CI without luau-analyze) is not mistaken for
+    # syntax-gated.
+    from utils.luau_analyze import luau_analyze_path
+    if luau_analyze_path() is None:
+        log.warning(
+            "[transpile] luau-analyze not installed — syntax gate INACTIVE; "
+            "generated Luau ships WITHOUT syntax verification or reprompt."
+        )
+
     # Build project context for AI transpilation
     project_context = _build_project_context(script_infos)
     serialized_field_refs = serialized_field_refs or {}

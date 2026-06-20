@@ -1341,7 +1341,11 @@ CC host spuriously trips the unique-and-exclusive player gate.
   design (gate edge-hardening on evidence the failure occurs). If a future game shows a
   multi-clone module, iterate `_RE_CLOUD.finditer` and gate each match independently.
 
-## Tooling — cache-quirk ROOT CAUSE PINNED (2026-06-19, finalize verify)
+## Tooling — cache-quirk ROOT CAUSE PINNED (2026-06-19, finalize verify) — FIXED (ntornow PR, 2026-06-20)
+- FIX LANDED: added `ConversionContext.cached_script_count` (post-prune on-disk top-level count),
+  set at the end of `materialize_and_classify`; the 3 skip-decision callers now compare against
+  `ctx.expected_cached_script_count()` (the recorded post-prune count, falling back to the pre-prune
+  `transpiled_scripts` only when unset/-1). A clean cache is no longer re-transpiled. Original analysis:
 - The ~111-min cold re-transpiles + TrackManager-stub contamination on every assemble-on-diag verify trace to:
   `scripts_cache_intact(out, transpiled_scripts)` skips transpile only when `top_level_luau_on_disk >=
   transpiled_scripts` (the persisted count). write_output's dead-module PRUNE deletes Roblox-dead modules

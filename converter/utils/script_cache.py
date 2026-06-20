@@ -16,6 +16,20 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def count_top_level_scripts(output_dir: Path) -> int:
+    """Count top-level ``scripts/*.luau`` files under ``output_dir``.
+
+    This is the exact set the transpile cache is keyed on (subdirs like
+    ``animations/`` are written by other phases). Returns 0 when ``scripts/``
+    is absent. ``Pipeline`` records this post-prune so a later
+    ``scripts_cache_intact`` compares like-for-like.
+    """
+    scripts = output_dir / "scripts"
+    if not scripts.is_dir():
+        return 0
+    return sum(1 for f in scripts.glob("*.luau") if f.is_file())
+
+
 def scripts_cache_intact(output_dir: Path, expected_count: int) -> bool:
     """True if the transpiled-script cache survived intact.
 
@@ -34,8 +48,4 @@ def scripts_cache_intact(output_dir: Path, expected_count: int) -> bool:
     """
     if expected_count <= 0:
         return False
-    scripts = output_dir / "scripts"
-    if not scripts.is_dir():
-        return False
-    top_level_luau = sum(1 for f in scripts.glob("*.luau") if f.is_file())
-    return top_level_luau >= expected_count
+    return count_top_level_scripts(output_dir) >= expected_count

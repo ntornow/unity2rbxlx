@@ -36,13 +36,17 @@ cache. The items below are where code or docs are stale or wrong.
   the static workspace Gravity value should also change (a) `9.81 × STUDS_PER_METER ≈ 35.0`,
   (b) keep 196.2 for Roblox-native avatar feel, or (c) config knob — playtest (a) before committing.
 
-- [ ] **P1 — Transpile gate: silent pass when luau-analyze is missing; cheap semantic upgrade
-  available.** `utils/luau_analyze.py` returns `[]` when the binary is absent — "syntax-gated"
-  is silently false (likely incl. CI ubuntu jobs). Fail loud / stamp the report. Then: the
-  KNOWN_ISSUES "validator catches syntax, not Roblox API semantics" gap is not a research
-  project — `luau-lsp analyze --definitions:@roblox=globalTypes.d.luau`
-  (JohnnyMorganz/luau-lsp) ships maintained Roblox API types; wire into the existing
-  lint+reprompt loop.
+- **P1 — Transpile gate: silent pass when luau-analyze is missing. — DONE (2026-06-20).**
+  `utils/luau_analyze.py` returns `[]` when the binary is absent, so the `validate` phase
+  emitted `success=True` / 0 fixes — reading as "all scripts validated clean" when nothing
+  was checked. `validate` now FAILS CLOSED (`success=False`, `analyzer_available=False`,
+  explicit error) when `luau_analyze_path()` is None, and stamps `analyzer_available` on the
+  success path; `transpile_scripts` logs a one-time loud warning when the binary is absent so
+  a stripped env (incl. CI) is not mistaken for syntax-gated.
+  - [ ] **P2 — luau-lsp Roblox-API semantic upgrade (deferred).** Beyond syntax: wire
+    `luau-lsp analyze --definitions:@roblox=globalTypes.d.luau` (JohnnyMorganz/luau-lsp,
+    maintained Roblox API types) into the existing lint+reprompt loop to catch Roblox-API
+    semantic errors, not just syntax. Needs the luau-lsp binary + definitions file in the env.
 
 - [ ] **P2 — AI truncation guard.** `code_transpiler` never checks
   `response.stop_reason == "max_tokens"`; truncated-but-syntactically-valid Luau ships

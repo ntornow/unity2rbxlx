@@ -60,6 +60,14 @@ class ConversionContext:
     converted_parts: int = 0
     total_scripts: int = 0
     transpiled_scripts: int = 0
+    # Count of top-level ``scripts/*.luau`` on disk AFTER the dead-module prune.
+    # ``scripts_cache_intact`` compares the live on-disk count against THIS, not
+    # the pre-prune ``transpiled_scripts`` (the prune deletes dead modules from
+    # disk after ``transpiled_scripts`` is set, so the old comparison always
+    # missed and re-transpiled a clean cache). -1 = not yet recorded (a real
+    # count is always >= 0, so 0 is distinguishable from "unset"); see
+    # ``expected_cached_script_count``.
+    cached_script_count: int = -1
     total_materials: int = 0
     converted_materials: int = 0
     total_animations: int = 0
@@ -172,6 +180,16 @@ class ConversionContext:
         if phase not in self.completed_phases:
             self.completed_phases.append(phase)
         self.current_phase = ""
+
+    def expected_cached_script_count(self) -> int:
+        """Count a transpile-cache check should compare on-disk scripts against:
+        the recorded post-prune ``cached_script_count`` when set (>= 0), else the
+        pre-prune ``transpiled_scripts`` (older contexts, or before the first
+        full run recorded a count). The first assemble runs before any prune, so
+        the pre-prune fallback is still correct there."""
+        if self.cached_script_count >= 0:
+            return self.cached_script_count
+        return self.transpiled_scripts
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

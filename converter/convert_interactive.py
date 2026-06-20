@@ -886,7 +886,26 @@ def validate(output_dir: str, write: bool) -> None:
         })
         return
 
-    from utils.luau_analyze import syntax_errors_for_file
+    from utils.luau_analyze import luau_analyze_path, syntax_errors_for_file
+
+    # Fail loud when the analyzer is absent: syntax_errors_for_file returns []
+    # for every file, which would otherwise emit success=True / 0 fixes and read
+    # as "all scripts validated clean" when in fact NOTHING was checked. The
+    # gate fails closed so a stripped env (e.g. CI without luau-analyze) cannot
+    # silently pass unverified Luau.
+    if luau_analyze_path() is None:
+        _emit({
+            "phase": "validate",
+            "success": False,
+            "analyzer_available": False,
+            "files_scanned": len(candidates),
+            "errors": [
+                f"luau-analyze is not installed — the syntax gate did NOT run; "
+                f"{len(candidates)} script(s) are UNVALIDATED. Install luau-analyze "
+                f"(JohnnyMorganz/luau-lsp or a Luau release) to enable the gate.",
+            ],
+        })
+        return
 
     files_with_fixes: list[dict] = []
     total_fixes = 0
@@ -905,6 +924,7 @@ def validate(output_dir: str, write: bool) -> None:
     _emit({
         "phase": "validate",
         "success": True,
+        "analyzer_available": True,
         "files_scanned": len(candidates),
         "files_with_fixes": len(files_with_fixes),
         "total_fixes": total_fixes,
@@ -1061,7 +1081,9 @@ def assemble(unity_project_path: str, output_dir: str,
     if (
         not retranspile
         and "transpile_scripts" in pipeline.ctx.completed_phases
-        and scripts_cache_intact(out_path, pipeline.ctx.transpiled_scripts)
+        and scripts_cache_intact(
+            out_path, pipeline.ctx.expected_cached_script_count()
+        )
     ):
         skip.add("transpile_scripts")
     if no_resolve:
@@ -1248,7 +1270,9 @@ def upload(output_dir: str, api_key: str | None,
     skip: set[str] = {"moderate_assets", "upload_assets", "resolve_assets"}
     if (
         "transpile_scripts" in pipeline.ctx.completed_phases
-        and scripts_cache_intact(out, pipeline.ctx.transpiled_scripts)
+        and scripts_cache_intact(
+            out, pipeline.ctx.expected_cached_script_count()
+        )
     ):
         skip.add("transpile_scripts")
     try:
