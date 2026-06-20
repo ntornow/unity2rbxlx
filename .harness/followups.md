@@ -1377,3 +1377,9 @@ CC host spuriously trips the unique-and-exclusive player gate.
 - ROOT CAUSE (proven): _convert_ui_element drops the subtree because SettingPopup's namespaced id is in PR3c _collect_ui_child_suppression_ids (its runtime controller references a prefab/asset) → blanket `return element` drops ALL static children. The Phase-4 inactive-prune fix (ui_translator:394) is INERT here (suppression runs first).
 - FAILED FIX (reverted fd35951): narrowing to skip only `from_prefab_instance` children is INVALID — PR3c legitimately drops AUTHORED static descendants for inventory/list controllers (test_ui_translator_child_suppression.py: InventoryController w/ m_inventoryItemPrefab drops StaticChild/StaticGrandchild, both from_prefab_instance=False). Both cases (SettingPopup vs InventoryController) have a runtime-bearing prefab-ref controller + authored static descendants; no node-level discriminator distinguishes "controller re-instantiates its subtree" (drop correct) from "references a prefab but keeps authored static children" (drop wrong). Codex also flagged: discriminator not propagated into recursion (descendant double-stamp).
 - CORRECT FIX (dedicated effort): make _collect_ui_child_suppression_ids granular — suppress only the static subtree that ACTUALLY corresponds to the controller's instantiated prefab content (tie the prefab ref to the specific child/subtree it replaces), per codex. This is a PR3c redesign, beyond this run's blast radius. Own /drive run.
+## /drive run output-boundary-sanitize-20260620T082237 (2026-06-20T02:28:30Z)
+## From Phase 1 detailed design (output-boundary-sanitize)
+- `rbxlx_writer.py:1382` calls `_write_attributes(lighting_props, pp_attrs)` but
+  `_write_attributes` is UNDEFINED in the module and not imported — latent
+  NameError reachable only when `pp.attributes` is truthy. Unrelated to escaping;
+  pre-existing. Fix separately.

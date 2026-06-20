@@ -3971,3 +3971,125 @@ verification rests on the unit suite (4016 passed) + the strict <=cap real-path 
   suppression + UI carve-out; ui_translator emit-hidden): correct, thorough tests incl.
   the cross-slice UI-host carve-out asserting `instance_owner_is_ui`. Segment index
   off-by-one (`+1`) correct; cloud passes the already-1-based value through.
+## /drive run output-boundary-sanitize-20260620T082237 (2026-06-20T02:28:30Z)
+
+# Decisions — output-boundary-sanitize
+
+- Harden the choke-point helpers (`_luau_str`, `_add_float`, `_add_string`), not the
+  ~120 individual call sites that already funnel through them.
+  Classification: Mechanical.
+
+- Do not double-escape XML entities — ElementTree + minidom already escape `<&>`/quotes;
+  the fix adds only control-char (U+0000–U+001F) + inf/nan/-inf handling.
+  Classification: Mechanical.
+
+- `rbxl_binary_writer.py` is out of scope — it re-encodes an already-written rbxlx as
+  binary bytes, tolerates arbitrary bytes by construction, and inherits sanitized input.
+  Classification: Taste.
+
+- Single phase — ≲150 production SLOC, no staged-risk dependency between the two
+  boundaries, and the one shared Luau long-bracket contract must stay co-located in one
+  review unit. Fan-out (two independent files) is expressed as parallel slices at
+  /drive-design, not as separate phases.
+  Classification: Taste.
+
+- Control-char canonical form (strip vs replace) and non-finite float sentinel
+  (0.0 vs finite clamp) deferred to phase detailed-design; defaults are strip-illegal
+  and 0.0.
+  Classification: Taste.
+
+## Plan-stage autoplan eng dual-voice review (CEO premise sound; Design/DX phases skipped — no UI/DX surface)
+
+Premise (CEO): CONFIRMED sound — this is a stated repo-TODO P1 (output-boundary
+sanitization). Right problem; no reframing. Not auto-deciding the premise is moot
+(it's /drive Gate A's job), but both voices and the TODO agree it's the right fix.
+
+Eng dual-voice (Claude subagent + codex, both adversarial "find the bypass") — CONVERGED
+on the SAME core correction. P1 findings folded into design.md revision:
+
+- **D1 [P1, Mechanical] Float is a CONTRACT, not a single choke point.** ~10 numeric
+  emitters bypass `_add_float` (particle NumberRange/Sequence/Vector2, UDim2, .4f
+  CustomPhysicalProperties) AND the Luau side has an independent `_f` (line 47) that
+  CRASHES on inf/nan. Fix: a `_finite(float)->str` contract applied at every float→text
+  site across BOTH rbxlx_writer.py and luau_place_builder.py. Enumerate all sites at
+  phase design. Rejected: patch only `_add_float` (ships a half-fix).
+- **D2 [P1, Mechanical] Three long-bracket sites, not two.** `_luau_str` slow path +
+  place_publisher fixup + `_emit_script_inline` (line 1144, script source). Extract ONE
+  helper, route all three. Rejected: route only the two named (leaves the highest-risk
+  script-source site live → "can't drift" violated at birth).
+- **D3 [P1, Taste→resolve at phase design] Control chars need explicit handling on BOTH
+  sides.** XML: strip illegal control chars in `_add_string`, `_add_content`,
+  `_add_protected_string` (CDATA does NOT make control chars legal in XML 1.0), and any
+  attribute value carrying generator-derived names (verify `class_name` reachability).
+  Luau: long-bracket does NOT finitize control chars (`\0`/`\r` emitted raw inside
+  `[==[...]==]`) — the contract "no raw control chars" requires strip or quoted `\ddd`
+  escaping, NOT "fall through to long-bracket". Recommendation: strip on XML side;
+  on Luau side decide strip-vs-quote at phase design (quoted `\ddd` is total + byte-exact).
+- **D4 [OK] Long-bracket level-search has no breakout** (both voices) — keep the
+  structural level search for injection-safety; quoted-escape only marginally better.
+- **D5 [OK] Binary writer out of scope** — sound conditional on float completeness
+  (Claude verified both call sites parse the already-sanitized rbxlx). Note the
+  dependency: an inf leaking through any unfixed numeric emitter poisons BOTH the rbxlx
+  load AND the binary re-encode. Classification: Taste.
+- **D6 [P2] Size re-baseline.** Float finitizer ~10+ sites across 2 files; long-bracket 3
+  sites; XML text-sanitize ~3-4 emitters. ~15-20 touch-points (was "~4"). Still ≲150 SLOC
+  of helper logic; still ONE phase, two parallel slices (rbxlx-writer slice; luau slice).
+
+## Design review round 1 → round 2 deltas (codex P1s folded in)
+- **D7 [P1] Luau numeric contract covers raw int() sites, not just `_f`.** `_c3u8`
+  (int(r*255)) and UDim2 offset int(px[1]) crash on nan/inf outside `_f`. Approach now
+  says finitize every float→Luau-numeric site incl. non-`_f` int() coercions. Mechanical.
+- **D8 [P1] XML contract = "XML-1.0-valid chars only", not just strip-C0.** Also excludes
+  U+FFFE/FFFF + lone surrogates → truly total, matches the goal. Mechanical.
+- **D9 [P2] Out-of-scope wording reconciled.** Script-body CONTENT is out of scope; the
+  `_add_protected_string` control-char sanitize + `_emit_script_inline` long-bracket
+  encoding are IN scope. Mechanical.
+
+## Phase 1 detailed-design decisions (DP1–DP6) — see design-phase1.md
+
+- **DP1** [Taste] `_xml_text`/`_finite` (XML) are module-level helpers in
+  rbxlx_writer.py; `_long_bracket` + Luau `_finite` live in luau_place_builder.py,
+  imported by place_publisher.py. No shared cross-file module.
+- **DP2** [Taste] XML control-char form = STRIP; contract = "XML-1.0-valid chars
+  only" (drops C0 except tab/LF/CR, U+FFFE, U+FFFF, lone surrogates U+D800–DFFF).
+- **DP3** [Taste] XML non-finite sentinel: nan→0.0, ±inf→±1e38 (_XML_INF_CLAMP,
+  below float32 max so the binary re-encode stays finite). CustomPhysicalProperties
+  emits f"{_finite_val(x):.4f}" — the .4f is KEPT (only the value is finitized),
+  byte-identical on finite input (superseded the round-1 "drop .4f" note; see DP8).
+- **DP4** [Taste] Luau control-char form = quoted \ddd escaping on _luau_str fast
+  path (total + byte-exact). Consequence: _luau_str no longer uses long-bracket;
+  the old slow-path level search (L1) is retired; _long_bracket consumed only by
+  _emit_script_inline (L2) + place_publisher fixup (L3).
+- **DP5** [Mechanical] Non-_f raw int() Luau sites (_c3u8, UDim2 offsets 1193/1196)
+  finitize the VALUE before int(); _f finitizes at the top before its int(v) test.
+  Genuinely int-typed numeric fields (text_size/layout_padding/layout_cell_size/
+  segments) are NOT touched (an int can't be inf/nan).
+- **DP6** [Taste] Float finitizer duplicated as a per-file helper (_finite_val in
+  rbxlx_writer; inline value-finitize in _f + int()-guard sites in
+  luau_place_builder) (independent XML-text vs Luau-numeric shapes); only
+  _long_bracket is the one co-located shared contract.
+
+## Phase 1 detailed-design — round 2 (dual-voice P1s folded; DP7–DP8)
+
+- **DP7** [Taste] Bare-identifier Enum-tail Luau sites (`Enum.X.{member}` at
+  866 alpha_mode / 1212 layout_direction / 1214 layout_h_alignment / 1215
+  layout_v_alignment) get a new generic `_luau_ident(s: str, default: str) -> str`
+  validator: returns s iff `^[A-Za-z_][A-Za-z0-9_]*$`, else the site's existing
+  fallback. `_luau_str` cannot serve these (quoting an identifier breaks the
+  `Enum.X.<member>` syntax). The four `Instance.new('{…}')` class-name sites
+  (932 light_type / 975 constraint_type / 1189 class_name / 1210 layout_type)
+  ARE strings → routed through `_luau_str`. Constant-mapped Enum tails
+  (98/507/576/1095) and constant class literals (545 etc.) are NOT routed. This
+  corrects the round-1 FALSE claim that `_luau_str` covered all string sinks and
+  all numerics routed through `_f`. Classification: Taste.
+
+- **DP8** [Taste] The finitizer is VALUE-returning (`_finite_val(v: float) -> float`
+  on the XML side; inline value-finitize at the top of `_f` on the Luau side),
+  NOT string-returning. Each emission site keeps its ORIGINAL formatting
+  (`str(_finite_val(x))`, `f"{_finite_val(d):.4f}"`, `int(_finite_val(x))`) so on
+  finite input the output is byte-identical (acceptance criterion 1). A
+  string-returning `_finite` would break byte-identity (F15 `.4f`→`0.5000`≠`0.5`;
+  an int field forced through `float()`→`100`≠`100.0`). Also retracts the round-1
+  F4 false bug: `_add_color3`'s `max(0.0,min(1.0,x))` already finitizes ALL
+  non-finite input (min(1.0,nan)=1.0, max(0.0,min(1.0,-inf))=0.0) — no fix
+  needed there. Classification: Taste.

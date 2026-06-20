@@ -24,3 +24,12 @@
   and there is no current-input impact (the real ThemeDatabase + CharacterDatabase each have exactly 4 public
   methods; no game in the corpus emits a 5th). Revisit if a future DB needs a 5th method or a 4th
   consumer-lowering shape is added.
+
+## /drive run output-boundary-sanitize-20260620T082237 — architectural follow-ups (2026-06-20T02:26:55Z)
+
+- `converter/roblox/rbxlx_writer.py:1437` — `_write_attributes(lighting_props, pp_attrs)` is
+  CALLED but the function is never DEFINED or imported in the module → a latent `NameError`
+  reachable when post-processing attributes (`pp_attrs`) are truthy. Pre-existing, unrelated
+  to the output-boundary escaping work (out of this run's blast radius). Flagged independently
+  by the phase-design and finalize audits. Fix in a separate change (define/import the writer,
+  or remove the dead call) with a test that exercises the truthy-`pp_attrs` path.
