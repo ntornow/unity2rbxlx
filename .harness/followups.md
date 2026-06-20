@@ -1383,3 +1383,24 @@ CC host spuriously trips the unique-and-exclusive player gate.
   `_write_attributes` is UNDEFINED in the module and not imported — latent
   NameError reachable only when `pp.attributes` is truthy. Unrelated to escaping;
   pre-existing. Fix separately.
+
+
+# Followups — gap4-dynamic-dedup
+
+## FU — genuine-list double-stamp residual (conservative clear-detector abstains on non-canonical clears)
+- The clear-detector only fires on the canonical UNGUARDED FULL `foreach(Transform v in C) Destroy(v)` /
+  `C.DestroyChildren()` clear of a same-field, same-instance, dominating, depth-1 container. It ABSTAINS
+  (KEEP) on cross-method / pooler / helper clears, Addressables-InstantiateAsync-with-cross-method-clear,
+  and any non-canonical clear. On real trash-dash the genuine list controllers (ShopItemList, MissionUI)
+  abstain -> their children are KEPT -> a possible double-stamp IF the game's own runtime clear is dropped
+  by the transpiler (else the game's faithful clear de-dups at runtime). This is the SAFE direction
+  (duplicate, never destroyed UI). FOLLOW-UP only if a real double-stamp is observed in an e2e: extend the
+  detector to cover the cross-method/pooler clear (interprocedural), OR add a non-destructive conversion-
+  time collision WARNING (flag "spawn-into-a-container-with-authored-children" in the conversion report) —
+  both in the deterministic upstream phase, NOT a coherence pack.
+
+## FU — live Studio playtest of the gap#4 fix (optional)
+- The change is deterministic (pure C# analysis, exhaustively unit-tested) so it shipped on the
+  deterministic end-to-end verify (detector keeps SettingPopup/LoadoutState/GameState on the real scene).
+  A live `/e2e-test` Studio playtest (SettingPopup About popups visibly land; LoadoutState.missionPopup
+  resolves; no double-stamp) is available as a confirmatory check post-merge.

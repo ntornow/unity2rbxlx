@@ -4093,3 +4093,25 @@ on the SAME core correction. P1 findings folded into design.md revision:
   F4 false bug: `_add_color3`'s `max(0.0,min(1.0,x))` already finitizes ALL
   non-finite input (min(1.0,nan)=1.0, max(0.0,min(1.0,-inf))=0.0) — no fix
   needed there. Classification: Taste.
+
+
+# Decisions — gap4-dynamic-dedup (Proposal E)
+
+## Context (from gap4-analysis-20260620/synthesis.md — codex-validated x2)
+- Static "delete authored children" gate is UNSOUND (no reliable static signal; destroys real UI).
+- Proposal E (dynamic): keep ALL authored UI + runtime observed-collision dedup. The destroyed-UI
+  class is ELIMINATED; residual is a SAFE-direction double-stamp (logged) in exotic indirection.
+## D0 — HARD CONSTRAINT: no coherence packs / post-transpile AI-output rewrites
+- Implement ONLY in the structural pipeline (scene_converter.py, ui_translator.py) + the hand-written
+  runtime (scene_runtime.luau). NOT script_coherence_packs.py, NOT spawn_call_site_lowering (the core
+  needs no change there — host.instantiatePrefab already receives prefab_id + parent). Prefer REMOVING
+  machinery (the destructive gate; the awaitUiHost deferred-clone if hosts always land statically).
+
+## D4 (user choice) — build a conservative same-method clear-detector at the upfront C# analysis phase
+- Replace the UNSOUND asset-ref suppression trigger with a SOUND one: detect (in script_analyzer.py, the
+  upfront whole-codebase C# analysis — NOT a coherence pack, NOT AI-output) a controller method that
+  Instantiates into a container AND clears that same container (Destroy-loop / Clear over its children)
+  BEFORE the instantiate, in the SAME method. Only those provably-cleared containers get their static
+  children suppressed. Bias to abstain: no same-method clear -> KEEP (safe). Feasible on existing infra
+  (script_analyzer _strip_comments + Instantiate|Destroy regex + _matching_brace_span; lazy_singleton
+  _method_body precedent). Classification: User-Challenge (explicit user direction).
