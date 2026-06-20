@@ -18,7 +18,7 @@ The converter exposes the same `Pipeline` class through two CLIs that share the 
 
 ### Mode 1 — `u2r.py` (non-interactive)
 
-End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop. Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`.
+End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop. Subcommands — conversion: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`; tooling/eval: `snapshot-ids`, `audit-assets`, `eval`, `eval-diff`, `visual-compare`, `smoke-test`. See `python u2r.py --help`. (`convert` requires `--skip-architecture-step`; for a complete game conversion use the `/convert-unity` skill — see `CLAUDE.md` § Entry Points.)
 
 ### Mode 2 — `convert_interactive.py` + `/convert-unity` skill (phase-by-phase)
 
@@ -72,31 +72,35 @@ Upload publishing has two paths with different semantics: interactive `upload` r
 
 1. **Parse**: scene_parser + prefab_parser + guid_resolver -- parse Unity YAML (text + binary via UnityPy)
 2. **Extract Assets**: asset_extractor -- catalog and hash all assets (textures, meshes, audio)
-3. **Moderate Assets** (`moderate_assets`): asset_moderator -- screen filenames, scripts, and audio against Roblox Community Standards before upload; auto-blocklist violations
-4. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as Decal, meshes as Model, audio)
-5. **Resolve Assets** (Studio-required): InsertService:LoadAsset to get:
-   - Mesh Model IDs -> real MeshIds + sub-mesh hierarchy with sizes
-   - Texture Decal IDs -> Image IDs (SurfaceAppearance needs Image, not Decal)
-6. **Materials**: material_mapper -- Unity .mat files -> Roblox SurfaceAppearance with uploaded texture URLs
-7. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI), syntax-gated by `luau-analyze` + AI reprompt loop (replaces the former `luau_validator.py`, removed 2026-04-18)
-8. **Animations**: animation_converter -- transform-only .anim clips -> inline TweenService Luau scripts; humanoid/skeletal clips are unsupported and surfaced to `UNCONVERTED.md` (see `docs/UNSUPPORTED.md`)
-9. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
-10. **Output**: rbxlx_writer -- generate .rbxlx XML; optional sibling .rbxl via `rbxl_binary_writer`
+3. **Plan Scene Runtime** (`plan_scene_runtime`): scene_runtime_planner -- plan the scene-runtime artifact off parsed scenes/prefabs before any script-touching phase. Inert unless `--scene-runtime=generic` opts in; only the planner data lands in `conversion_plan.json`
+4. **Moderate Assets** (`moderate_assets`): asset_moderator -- screen filenames, scripts, and audio against Roblox Community Standards before upload; auto-blocklist violations
+5. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as **Image**, meshes as Model, audio)
+6. **Resolve Assets** (`resolve_assets`): headless via the Open Cloud Luau Execution API (`cloud_api.resolve_meshes_headless` -> `execute_luau`) -- resolve mesh Model IDs -> real MeshIds + sub-mesh hierarchy with sizes. No Decal->Image step (textures upload directly as `Image`). No-ops under `--no-upload` or with no API key/creator id
+7. **Materials**: material_mapper -- Unity .mat files -> Roblox SurfaceAppearance with uploaded texture URLs
+8. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI; Claude CLI backend preferred, Anthropic API fallback when `--api-key` is passed), syntax-gated by `luau-analyze` + AI reprompt loop (replaces the former `luau_validator.py`, removed 2026-04-18)
+9. **Animations**: animation_converter -- transform-only .anim clips -> inline TweenService Luau scripts; humanoid/skeletal clips are unsupported and surfaced to `UNCONVERTED.md` (see `docs/UNSUPPORTED.md`)
+10. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
+11. **Materialize & Classify** (`materialize_and_classify`): emit scripts to disk, run the post-transpile coherence pass, and compute the storage `StoragePlan` -- lifted out of `write_output` so it consumes a persisted plan + populated `rbx_place.scripts`. Runs after `convert_scene` (which creates `rbx_place`)
+12. **Output**: rbxlx_writer -- generate .rbxlx XML; optional sibling .rbxl via `rbxl_binary_writer`
+
+The scene-runtime-topology / contract-verifier subsystem (`contract_pipeline.py`, `scene_runtime_planner.py`) runs within these phases for generic-mode (`--scene-runtime=generic`) conversions. Authoritative ordering lives in `converter/converter/pipeline.py:PHASES`.
 
 ## Asset Resolution (Critical)
 
 After uploading FBX meshes via Open Cloud, the returned IDs are **Model** IDs, not Mesh IDs.
-To use them in MeshPart.MeshId, you must:
-1. `InsertService:LoadAsset(modelId)` in Studio
-2. Extract each MeshPart descendant's `.MeshId`, `.Size`, `.Position`, `.TextureID`
-3. Store this data in `conversion_context.json` as `mesh_hierarchies`
+The `resolve_assets` phase resolves them to MeshPart.MeshId **headlessly** via the Open Cloud
+Luau Execution API (`cloud_api.resolve_meshes_headless` -> `execute_luau` /
+`luau-execution-session-tasks`) — no interactive Studio session required:
+1. `InsertService:LoadAsset(modelId)` runs inside a headless Luau task on a published place
+2. Each MeshPart descendant's `.MeshId`, `.Size`, `.Position`, `.TextureID` is extracted
+3. The data is stored in `conversion_context.json` as `mesh_hierarchies`
 
-Similarly, uploaded texture Decal IDs must be resolved to Image IDs:
-1. `InsertService:LoadAsset(decalId)` -> get Decal descendant
-2. Extract Image ID from `decal.Texture` URL
-3. Replace Decal IDs with Image IDs in `uploaded_assets`
+Textures need **no** resolution step: they upload directly as the `Image` asset type
+(`cloud_api.upload_image`), so SurfaceAppearance gets a usable Image ID without the legacy
+Decal->Image round-trip.
 
-Use `u2r.py resolve` to generate the Luau scripts for these resolutions.
+`u2r.py resolve` (backed by `roblox/studio_resolver.py`) can still emit Studio-side resolution
+scripts for manual/legacy flows.
 
 ## Mesh Sizing
 
@@ -119,7 +123,7 @@ Where:
 
 ## Design Decisions
 
-- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`nav_mesh_runtime`, `event_system`, `event_dispatch`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04; the `character_animator` skeletal-animation runtime was retired in 2026-05 (skeletal animation is unsupported — see `docs/UNSUPPORTED.md`). See `docs/design/inline-over-runtime-wrappers.md`.
+- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`scene_runtime`, `scene_camera_input`, `nav_mesh_runtime`, `event_system`, `event_dispatch`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04; the `character_animator` skeletal-animation runtime was retired in 2026-05 (skeletal animation is unsupported — see `docs/UNSUPPORTED.md`). See `docs/design/inline-over-runtime-wrappers.md`.
 - **Conversion plan rehydration** — `conversion_plan.json` records `{script_type, parent_path}` for every transpiled script so the rehydration path (interactive `assemble --no-retranspile`, `upload` rebuild) reconstructs the exact same Roblox script-container layout as the fresh-transpile path. Phase 3 design.
 - **Upload publishes a rebuild, not the on-disk `.rbxlx`** — there is no `.rbxlx` reader; both publish paths reconstruct `rbx_place` rather than reading the file. See `CLAUDE.md` § Upload semantics. Reader is roadmapped in `docs/FUTURE_IMPROVEMENTS.md`.
 
@@ -161,7 +165,7 @@ Where:
 - Terrain component -> flat ground Part (filtered from regular conversion)
 - Skybox material -> Roblox Sky with 6-face textures
 - Canvas/UI -> ScreenGui with UDim2 layout (auto-sizing text for Best Fit)
-- C# -> Luau script transpilation (AI-powered via Claude CLI)
+- C# -> Luau script transpilation (AI: Claude CLI backend preferred, Anthropic API fallback when `--api-key` is set)
 - Client script detection (UnityEngine.UI, Input, Camera -> LocalScript)
 - Transform-only .anim clips -> inline TweenService Luau scripts (humanoid/skeletal clips unsupported, surfaced to UNCONVERTED.md)
 - Auto-generated FPS controller, HUD, pickup detection

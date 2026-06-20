@@ -1270,7 +1270,7 @@ def resolve(output_dir: str) -> None:
     ctx = json.loads(ctx_path.read_text())
     uploaded = ctx.get("uploaded_assets", {})
     if not uploaded:
-        click.echo("No uploaded assets found. Run conversion with --api-key-file first.")
+        click.echo("No uploaded assets found. Run conversion with --api-key first.")
         return
 
     mesh_count = sum(1 for p in uploaded if p.lower().endswith(('.fbx', '.obj')))

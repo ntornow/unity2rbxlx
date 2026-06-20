@@ -16,17 +16,16 @@ From a full repo audit + external fact-check of platform claims against Roblox C
 scale (0.28 m), 2048-stud part cap, FBX-7500 diagnosis, task-library usage, two-tier publish
 cache. The items below are where code or docs are stale or wrong.
 
-- [ ] **P1 — Architecture docs describe a retired pipeline.** ARCHITECTURE.md/CLAUDE.md list 10
-  phases; `pipeline.py:PHASES` has 12 (`plan_scene_runtime`, `materialize_and_classify` and the
-  whole scene-runtime-topology / contract-verifier / `contract_pipeline.py` subsystem are
-  undocumented). The "Asset Resolution (Critical)" section is obsolete twice: textures upload as
-  `Image` assetType (`cloud_api.upload_image` — no Decal→Image resolution needed) and mesh
-  resolution is headless via the official Open Cloud Luau Execution API (`execute_luau` =
-  `luau-execution-session-tasks`) — not "Studio-required". Also fix: runtime-module list
-  (animator retired; `scene_runtime.luau`/`scene_camera_input.luau` undocumented), AI backend
-  (Claude CLI preferred + Anthropic API fallback), `--api-key` not `--api-key-file` (incl. a
-  stale error msg in `u2r.py`), 6 undocumented u2r subcommands, stale test counts, and convert
-  all hardcoded `file:line` citations to grep-targets.
+- **P1 — Architecture docs describe a retired pipeline. — DONE (2026-06-20).** ARCHITECTURE.md +
+  CLAUDE.md reconciled to the real 12-phase `pipeline.py:PHASES` (added `plan_scene_runtime`,
+  `materialize_and_classify` + a scene-runtime-topology/contract-verifier subsystem note); "Asset
+  Resolution (Critical)" rewritten — textures upload as `Image` (no Decal→Image step), mesh
+  resolution is headless via the Open Cloud Luau Execution API (`resolve_meshes_headless` →
+  `execute_luau`), not Studio-required; runtime-module list corrected (animator retired;
+  scene_runtime/scene_camera_input added); AI backend now states Claude CLI preferred + Anthropic
+  API fallback; `--api-key` replaces `--api-key-file` everywhere (incl. the stale `u2r.py` error
+  msg); 6 previously-undocumented u2r subcommands listed; hardcoded test counts dropped (per the
+  file's own no-stale-snapshots convention); all `file:line` citations converted to grep-targets.
 
 - [ ] **P1 — Workspace gravity comment is false (the comment only — physics divergence handled).**
   PARTIAL: the 5.6× physics divergence is now corrected at runtime via `project_gravity.py` +
@@ -358,21 +357,26 @@ cache. The items below are where code or docs are stale or wrong.
 
 ## Infrastructure
 
-- [ ] **P1 — Converter doesn't wire ScreenGui enable/disable into the state
-  machine.** Trash-dash Mode-2 (2026-05-19): all 4 converted ScreenGuis
-  (`Loadout`, `Game`, `GameOver`, `Leaderboard`) ship with `Enabled=true`,
-  so they render stacked at once — an opaque white wall over the menu.
-  In Unity the `GameManager` state machine shows/hides canvases per state
-  (Loadout / Game / GameOver). The converter neither (a) sets non-initial
-  canvases `Enabled=false` at build time, nor (b) emits state-machine code
-  that toggles `ScreenGui.Enabled` on state transitions. Explore: where
-  Unity `Canvas`/`GameObject.SetActive` and per-state canvas wiring should
-  map to `ScreenGui.Enabled`, and why it is dropped. Note: `RbxScreenGui`
-  (`core/roblox_types.py`) currently has no `enabled` field, and neither writer
-  (`rbxlx_writer.py`, `luau_place_builder.py`) serializes `Enabled` — so the fix
-  needs `Enabled` plumbed through the type + both writers, plus the
-  state->visibility wiring. (This is its own gap — not the `classify_storage`
-  P1, which only mutates scripts.)
+- **P1 — Converter doesn't wire ScreenGui enable/disable into the state
+  machine. — DONE (ntornow#219, 2026-06-20).** `RbxScreenGui.enabled` plumbed
+  through the type + both writers (`rbxlx_writer.py`, `luau_place_builder.py`
+  serialize `Enabled`); static `convert_canvas` sets it from
+  `node.active AND Canvas.m_Enabled`; dynamic `SceneRuntime:setActive` resolves
+  a canvas-owning GameObject → its ScreenGui and toggles `.Enabled`. Live
+  Studio verified both halves. Kept here as a pointer; residuals below.
+  - [ ] **P2 — ScreenGui visibility residuals (followups, ntornow#219).** Two
+    gates collapsed onto one bit (Canvas.m_Enabled vs activeInHierarchy),
+    active-self ≠ activeInHierarchy, `awaitUiHost` boot-race, and the
+    ancestor-cascade are not modelled. Low user impact today.
+
+- [ ] **P1 — LoadoutState `missionPopup` serialized field-ref resolves nil at
+  OnEnable.** Distinct from the #219 host-emission fix (the MissionPopup UI host
+  subtree now LANDS in PlayerGui): the LoadoutState component's serialized
+  reference to it is still nil at `OnEnable` → "attempt to index nil with
+  'gameObject'" every boot. A field-ref RESOLUTION/TIMING gap in scene-runtime
+  component wiring (likely needs a deferred ref-rebind after the deferred host
+  clone lands), not a host-drop. Pre-existing since trash-dash Phase-1 verify;
+  host-landing proved necessary-but-insufficient. Own /drive run.
 
 - [ ] **P1 — Phase 4a.5 agent-override ingestion is unimplemented.**
   `storage_classifier.py` ("Phase 4a.5") is correctly meant to run during Step 4a

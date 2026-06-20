@@ -23,7 +23,7 @@ Converts Unity game projects into playable Roblox experiences. Handles scene hie
 
 There are two CLIs that share the same `Pipeline` class and the same `conversion_context.json` on disk:
 
-1. **`u2r.py` — non-interactive end-to-end CLI.** Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`. **`convert` does NOT perform Step 4a (client/server split)** — it requires `--skip-architecture-step` and ships server-crashing UI modules. For a complete game conversion use the `/convert-unity` skill (entry 2); reserve `u2r.py` for individual phases, `--phase` resumes, and CI.
+1. **`u2r.py` — non-interactive end-to-end CLI.** Subcommands — conversion: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`; tooling/eval: `snapshot-ids`, `audit-assets`, `eval`, `eval-diff`, `visual-compare`, `smoke-test`. See `python u2r.py --help`. **`convert` does NOT perform Step 4a (client/server split)** — it requires `--skip-architecture-step` and ships server-crashing UI modules. For a complete game conversion use the `/convert-unity` skill (entry 2); reserve `u2r.py` for individual phases, `--phase` resumes, and CI.
 
 2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each subcommand maps to a single skill phase, emits structured JSON to stdout, and persists state in `conversion_context.json`. Subcommands:
 
@@ -61,32 +61,36 @@ Unity Project --> [Parser] --> Scene Graph (IR) --> [Converter] --> Roblox Outpu
 ### Pipeline Phases
 1. **Parse**: scene_parser + prefab_parser + guid_resolver -- parse Unity YAML
 2. **Extract Assets**: asset_extractor -- catalog and hash all assets (textures, meshes, audio)
-3. **Moderate Assets**: pre-upload safety screen -- filenames, scripts, audio vs. Roblox Community Standards
-4. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as Decal, meshes as Model, audio)
-5. **Resolve Assets** (Studio-required): InsertService:LoadAsset to get:
-   - Mesh Model IDs → real MeshIds + sub-mesh hierarchy with sizes
-   - Texture Decal IDs → Image IDs (SurfaceAppearance needs Image, not Decal)
-6. **Materials**: material_mapper -- Unity .mat files → Roblox SurfaceAppearance with uploaded texture URLs
-7. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI)
-8. **Animations**: animation_converter -- .anim/.controller → TweenService Luau scripts
-9. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
-10. **Output**: rbxlx_writer -- generate .rbxlx XML
+3. **Plan Scene Runtime** (`plan_scene_runtime`): scene_runtime_planner -- plan the scene-runtime artifact off parsed scenes/prefabs before any script-touching phase; inert unless `--scene-runtime=generic` opts in (only the planner data lands in `conversion_plan.json`)
+4. **Moderate Assets**: pre-upload safety screen -- filenames, scripts, audio vs. Roblox Community Standards
+5. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as **Image**, meshes as Model, audio)
+6. **Resolve Assets**: headless via the Open Cloud Luau Execution API (`cloud_api.resolve_meshes_headless` → `execute_luau`) -- resolves mesh Model IDs → real MeshIds + sub-mesh hierarchy with sizes. No Decal→Image step (textures upload directly as `Image`). No-ops under `--no-upload` or when no API key/creator id is available.
+7. **Materials**: material_mapper -- Unity .mat files → Roblox SurfaceAppearance with uploaded texture URLs
+8. **Scripts**: code_transpiler -- C# → Luau (rule-based + AI; Claude CLI backend preferred, Anthropic API fallback when `--api-key` is passed)
+9. **Animations**: animation_converter -- .anim/.controller → TweenService Luau scripts
+10. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
+11. **Materialize & Classify** (`materialize_and_classify`): emit scripts to disk, run the post-transpile coherence pass, and compute the storage `StoragePlan` -- lifted out of `write_output` so it consumes a persisted plan + populated `rbx_place.scripts`. Runs after `convert_scene` (which creates `rbx_place`)
+12. **Output**: rbxlx_writer -- generate .rbxlx XML
+
+The scene-runtime-topology / contract-verifier subsystem (`contract_pipeline.py`, `scene_runtime_planner.py`) runs within these phases for generic-mode conversions.
 
 Authoritative ordering lives in `converter/converter/pipeline.py:PHASES`.
 
 ### Asset Resolution (Critical)
 After uploading FBX meshes via Open Cloud, the returned IDs are **Model** IDs, not Mesh IDs.
-To use them in MeshPart.MeshId, you must:
-1. `InsertService:LoadAsset(modelId)` in Studio
-2. Extract each MeshPart descendant's `.MeshId`, `.Size`, `.Position`, `.TextureID`
-3. Store this data in `conversion_context.json` as `mesh_hierarchies`
+The `resolve_assets` phase resolves them to MeshPart.MeshId **headlessly** via the Open Cloud Luau
+Execution API (`cloud_api.resolve_meshes_headless` → `execute_luau` /
+`luau-execution-session-tasks`) — no interactive Studio session required:
+1. `InsertService:LoadAsset(modelId)` runs inside a headless Luau task on a published place
+2. Each MeshPart descendant's `.MeshId`, `.Size`, `.Position`, `.TextureID` is extracted
+3. The data is stored in `conversion_context.json` as `mesh_hierarchies`
 
-Similarly, uploaded texture Decal IDs must be resolved to Image IDs:
-1. `InsertService:LoadAsset(decalId)` → get Decal descendant
-2. Extract Image ID from `decal.Texture` URL
-3. Replace Decal IDs with Image IDs in `uploaded_assets`
+Textures need **no** resolution step: they upload directly as the `Image` asset type
+(`cloud_api.upload_image`), so SurfaceAppearance gets a usable Image ID without the legacy
+Decal→Image round-trip.
 
-Use `python u2r.py resolve <output_dir>` (backed by `roblox/studio_resolver.py`) to generate the Luau scripts for these resolutions.
+`python u2r.py resolve <output_dir>` (backed by `roblox/studio_resolver.py`) can still emit
+Studio-side resolution scripts for manual/legacy flows.
 
 ### Mesh Sizing
 Roblox MeshPart uses Size and InitialSize:
@@ -113,8 +117,8 @@ Where:
 ## Running Tests
 ```bash
 cd converter
-python -m pytest tests/ -m "not slow" -v   # Fast suite: 1305 tests
-python -m pytest tests/ -v                  # Full suite: 1340 tests (includes 35 slow e2e)
+python -m pytest tests/ -m "not slow" -v   # Fast suite (run before every PR)
+python -m pytest tests/ -v                  # Full suite (adds the slow e2e tests)
 ```
 **Run the full fast suite (`pytest -m "not slow"`) before any PR, not just touched files** — shared-constant edits break tests elsewhere (e.g. a frozen cache-key prompt).
 
@@ -126,7 +130,7 @@ python -m pytest tests/ -v                  # Full suite: 1340 tests (includes 3
 ```bash
 cd converter
 # Full conversion with upload
-python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key-file ../apikey
+python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key ../apikey --skip-architecture-step
 
 # After upload, resolve assets via Studio MCP (required for proper mesh/texture IDs)
 # Then regenerate rbxlx using the updated conversion_context.json
@@ -145,8 +149,8 @@ Two paths publish to Roblox; they have different "what gets published" semantics
 
 | Path | What it publishes | When to use |
 |---|---|---|
-| **Interactive `upload`** (`convert_interactive.py upload`) | A **fresh rebuild** of `rbx_place` from source. Re-runs `parse → … → convert_scene` in-memory and feeds the result to the headless place builder. **Hand-edits to `converted_place.rbxlx` between `assemble` and `upload` are silently dropped.** A runtime warning (`convert_interactive.py:1011`) surfaces this. | Skill-driven flow when you want a one-shot publish after assemble; or when source has changed and you want a fresh build. |
-| **`u2r.py publish`** | **Replays cached chunks** — `<output>/place_builder_chunks.json` first, then `<output>/place_builder.luau` for older conversions (`roblox/place_publisher.py:publish_cached_chunks`, two-tier fallback). Both shapes preserve the assembled state byte-for-byte. Falls back to a fresh Pipeline rebuild **only when both cache shapes are missing**. | When you want to re-publish the assembled state without re-running the converter (e.g., after a transient upload failure), or when the Unity project has been moved/archived. See `u2r.py:208–290` and `roblox/place_publisher.py:153–230`. |
+| **Interactive `upload`** (`convert_interactive.py upload`) | A **fresh rebuild** of `rbx_place` from source. Re-runs `parse → … → convert_scene` in-memory and feeds the result to the headless place builder. **Hand-edits to `converted_place.rbxlx` between `assemble` and `upload` are silently dropped.** A runtime warning (the `upload` command in `convert_interactive.py`) surfaces this. | Skill-driven flow when you want a one-shot publish after assemble; or when source has changed and you want a fresh build. |
+| **`u2r.py publish`** | **Replays cached chunks** — `<output>/place_builder_chunks.json` first, then `<output>/place_builder.luau` for older conversions (`roblox/place_publisher.py:publish_cached_chunks`, two-tier fallback). Both shapes preserve the assembled state byte-for-byte. Falls back to a fresh Pipeline rebuild **only when both cache shapes are missing**. | When you want to re-publish the assembled state without re-running the converter (e.g., after a transient upload failure), or when the Unity project has been moved/archived. See the `publish` command in `u2r.py` and `roblox/place_publisher.py:publish_cached_chunks`. |
 | **Studio manual publish** | Whatever is in the local `converted_place.rbxlx` (you edit it in Studio first). | When you want to publish a hand-edited `.rbxlx`. There is no `.rbxlx` reader on the dest side, so this is the only path that publishes the reviewed file directly. Roadmapped in `docs/FUTURE_IMPROVEMENTS.md`. |
 
 The known limitation — interactive `upload` publishes a fresh rebuild, not the reviewed `.rbxlx` — is addressed by this documentation + the runtime warning + the `u2r.py publish` cached-chunks fast path. Implementing an `.rbxlx` reader is roadmap work.
@@ -177,7 +181,7 @@ User-facing documentation lives outside this file:
 ## CLI Commands
 ```bash
 # Convert a Unity project to Roblox
-python u2r.py convert <unity_project> -o <output_dir> [--api-key-file <key>] [--no-upload] [--no-ai] [--scene <scene.unity>|all] [--phase <phase>]
+python u2r.py convert <unity_project> -o <output_dir> --skip-architecture-step [--api-key <key|path>] [--no-upload] [--no-ai] [--scene <scene.unity>|all] [--phase <phase>]
 
 # Analyze a Unity project without converting
 python u2r.py analyze <unity_project>
@@ -245,13 +249,13 @@ After uploading, run these steps via Studio MCP `execute_luau`:
 - Water region detection and sizing
 
 ### Scripts
-- C# → Luau transpilation (AI via Claude CLI with on-disk cache, 99.7% success)
+- C# → Luau transpilation (AI: Claude CLI backend preferred, Anthropic API fallback when `--api-key` is set; on-disk cache)
 - `luau-analyze` syntax check + AI reprompt loop on transpile output (replaces the former regex-based `luau_validator.py`, removed 2026-04-18)
 - Client/Server/Module script auto-detection and reclassification
 - Cross-script dependency injection (require() calls auto-inserted)
 - Utility function auto-injection (Mathf, LINQ, Vector3 helpers)
 - DOTween → TweenService code generation
-- 5 runtime Luau modules auto-injected (animator, nav mesh, event system, physics bridge, cinemachine)
+- Stateful runtime Luau modules auto-injected as needed (scene_runtime, scene_camera_input, nav_mesh, event_system, event_dispatch, physics_bridge, cinemachine, object_pool, pickup, sub_emitter); the legacy character_animator runtime was retired (skeletal animation unsupported)
 
 ### UI & Scene
 - Canvas/UI → ScreenGui with UDim2 layout, UIListLayout/UIGridLayout
