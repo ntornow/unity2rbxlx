@@ -1032,7 +1032,12 @@ class TestValidate:
         assert payload["success"] is False
         assert any("No .lua/.luau files" in e for e in payload["errors"])
 
-    def test_dry_run_does_not_write_files(self, tmp_path):
+    def test_dry_run_does_not_write_files(self, tmp_path, monkeypatch):
+        # Pin the analyzer present + clean so the test is deterministic on any
+        # env (validate now fails closed when luau-analyze is absent, e.g. CI).
+        import utils.luau_analyze as la
+        monkeypatch.setattr(la, "luau_analyze_path", lambda: "/usr/bin/luau-analyze")
+        monkeypatch.setattr(la, "syntax_errors_for_file", lambda p, timeout=10.0: [])
         runner = CliRunner()
         out_dir = tmp_path / "out"
         scripts_dir = out_dir / "scripts"
@@ -1074,6 +1079,12 @@ class TestTranspileValidateWorkflow:
     ):
         import convert_interactive
         from converter.code_transpiler import TranspilationResult, TranspiledScript
+
+        # Pin the analyzer present + clean so validate runs deterministically on
+        # any env (it now fails closed when luau-analyze is absent, e.g. CI).
+        import utils.luau_analyze as la
+        monkeypatch.setattr(la, "luau_analyze_path", lambda: "/usr/bin/luau-analyze")
+        monkeypatch.setattr(la, "syntax_errors_for_file", lambda p, timeout=10.0: [])
 
         unity = tmp_path / "FakeProject"
         (unity / "Assets").mkdir(parents=True)
