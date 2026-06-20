@@ -40,13 +40,234 @@ from core.unity_types import (
 )
 from core.roblox_types import RbxPart, RbxPlace, RbxScript, ScriptType
 from converter.animation_converter import AnimationConversionResult
-from converter.code_transpiler import TranspilationResult
+from converter.code_transpiler import TranspilationResult, TranspiledScript
 from converter.material_mapper import MaterialMapping
 from converter.scriptable_object_converter import AssetConversionResult
 from converter.sprite_extractor import SpriteExtractionResult
 from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (camera-mount -> player-mount equip, D13) — the field-name -> prefab_id
+# bridge. Phase 1's lowered request fires the C# prefab FIELD NAME
+# (``equipWeaponRemote:FireServer("riflePrefab")``); the server clone path
+# ``clonePrefabTemplate(prefab_id, ...)`` needs a ``prefab_id`` key into
+# ``Plan.prefabs``. The mapping field-name -> prefab_id lives ONLY in the
+# per-component ``SceneRuntimeReference`` rows (``{from, field, target_kind,
+# target_ref}``) the planner already seeds into ``scene_runtime``. This helper
+# joins the equip-emitting scripts (keyed by ``equip_binding``) with those rows
+# to build the flat ``{field_name: prefab_id}`` map (D13b), failing CLOSED on a
+# same-field-name-different-prefab collision across equip scripts (the gate that
+# makes the flat map safe — without it a same-named field could silently misbind).
+# ---------------------------------------------------------------------------
+
+
+def _instance_id_to_script_id(
+    scene_runtime: Mapping[str, object],
+) -> dict[str, str]:
+    """Build ``{instance_id: script_id}`` from every ``instances`` list under the
+    ``scenes`` and ``prefabs`` blocks of ``scene_runtime``. The reference rows are
+    keyed by ``from`` = instance_id; the equip join needs the OWNING script_id of
+    each row, which lives on the instance."""
+    out: dict[str, str] = {}
+    for block_key in ("scenes", "prefabs"):
+        block = scene_runtime.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for sub in block.values():
+            if not isinstance(sub, dict):
+                continue
+            instances = sub.get("instances")
+            if not isinstance(instances, list):
+                continue
+            for inst in instances:
+                if not isinstance(inst, dict):
+                    continue
+                iid = inst.get("instance_id")
+                sid = inst.get("script_id")
+                if isinstance(iid, str) and isinstance(sid, str) and sid:
+                    out[iid] = sid
+    return out
+
+
+def _iter_prefab_reference_rows(
+    scene_runtime: Mapping[str, object],
+) -> "list[dict[str, object]]":
+    """Collect every ``target_kind == "prefab"`` reference row across the
+    ``scenes`` and ``prefabs`` blocks. Each row carries ``from`` (instance_id),
+    ``field``, and ``target_ref`` (the prefab_id)."""
+    rows: list[dict[str, object]] = []
+    for block_key in ("scenes", "prefabs"):
+        block = scene_runtime.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for sub in block.values():
+            if not isinstance(sub, dict):
+                continue
+            references = sub.get("references")
+            if not isinstance(references, list):
+                continue
+            for row in references:
+                if isinstance(row, dict) and row.get("target_kind") == "prefab":
+                    rows.append(cast("dict[str, object]", row))
+    return rows
+
+
+def build_equip_prefabs_bridge(
+    scripts: "list[TranspiledScript]",
+    scene_runtime: Mapping[str, object],
+    guid_index: object | None,
+) -> dict[str, str]:
+    """Build the D13b ``{field_name: prefab_id}`` equip bridge.
+
+    For each script carrying an equip obligation (``equip_binding`` non-None with
+    a ``prefab`` field name), resolve that field to a ``prefab_id`` via the prefab
+    reference rows owned by an instance of THAT script (joined on the script's
+    canonical ``script_id``). Build the flat field-name -> prefab_id map.
+
+    FAIL CLOSED (``RuntimeError``) on a same-field-name-different-prefab collision
+    across equip scripts — the build-time gate that converts the flat map's silent
+    misbinding into a loud stop (D13b). Within a single equip obligation, the
+    field resolves to exactly one prefab_id by construction (one field on one
+    script's instances); a single field that resolves to two prefab_ids across
+    DISTINCT equip scripts is the collision case.
+
+    Returns an empty dict when no script carries an equip obligation (the common
+    non-equip game) or when the reference rows do not resolve the field (the
+    handler then abstains at runtime, D11)."""
+    inst_to_script = _instance_id_to_script_id(scene_runtime)
+    prefab_rows = _iter_prefab_reference_rows(scene_runtime)
+
+    equip_prefabs: dict[str, str] = {}
+    # Per-field provenance so a collision message names the offending scripts.
+    field_provenance: dict[str, tuple[str, str]] = {}  # field -> (prefab_id, script_id)
+
+    for ts in scripts:
+        eb = ts.equip_binding
+        if not eb:
+            continue
+        field_name = str(eb.get("prefab") or "")
+        if not field_name:
+            continue
+        script_id = _script_id_for_source_path(ts.source_path, guid_index)
+        if not script_id:
+            # Cannot key the script to its reference rows -> the field stays
+            # unresolved (runtime abstain). A missing script_id is not a
+            # collision, so no fail-close.
+            continue
+        # Resolve the field's prefab_id from THIS script's prefab reference rows.
+        # Collect ALL target_refs across EVERY matching row (across all authored
+        # instances of this script class) — a single instance taking the first
+        # row would silently misbind when two instances of the SAME script class
+        # share the field name but reference DIFFERENT prefabs (same-script
+        # multi-instance collision). The resolved set must be exactly one.
+        resolved_set: set[str] = set()
+        for row in prefab_rows:
+            if row.get("field") != field_name:
+                continue
+            frm = row.get("from")
+            if not isinstance(frm, str):
+                continue
+            if inst_to_script.get(frm) != script_id:
+                continue
+            target_ref = row.get("target_ref")
+            if isinstance(target_ref, str) and target_ref:
+                resolved_set.add(target_ref)
+        if not resolved_set:
+            continue
+        if len(resolved_set) > 1:
+            refs = ", ".join(repr(r) for r in sorted(resolved_set))
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} on script {script_id!r} maps to multiple "
+                f"different prefabs across that script's instances ({refs}) — "
+                "refusing to ship a flat field->prefab_id map that would "
+                "silently misbind one of them (D13b build-time collision "
+                "fail-close). File D13a (scriptId-scoped resolution) to support "
+                "this game."
+            )
+        resolved = next(iter(resolved_set))
+        prior = field_provenance.get(field_name)
+        if prior is not None and prior[0] != resolved:
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} maps to two different prefabs across equip "
+                f"scripts ({prior[0]!r} from script {prior[1]!r} vs "
+                f"{resolved!r} from script {script_id!r}) — refusing to ship a "
+                "flat field->prefab_id map that would silently misbind one of "
+                "them (D13b build-time collision fail-close). File D13a "
+                "(scriptId-scoped resolution) to support this game."
+            )
+        equip_prefabs[field_name] = resolved
+        field_provenance.setdefault(field_name, (resolved, script_id))
+
+    return equip_prefabs
+
+
+def build_equip_scales_bridge(
+    scripts: "list[TranspiledScript]",
+    equip_prefabs: Mapping[str, str],
+) -> dict[str, float]:
+    """Build the D17/Bug-2 ``{prefab_id: uniform_scale}`` map for the runtime weld,
+    reusing the field->prefab_id resolution in ``equip_prefabs`` (no second path).
+
+    Keyed by prefab_id (the runtime equip path holds that, not the C# field name).
+    The carrier ``scale`` is ``None`` when nothing was captured (no localScale /
+    non-uniform / non-positive) and is skipped; a captured value (incl an explicit
+    ``1.0``) enters the per-prefab_id collision check, so two carriers capturing
+    DIFFERENT scales for one prefab_id fail closed (RuntimeError). Only non-1.0
+    captures are emitted (1.0 is the runtime no-op)."""
+    captured: dict[str, float] = {}  # prefab_id -> captured scale (incl explicit 1.0)
+    for ts in scripts:
+        eb = ts.equip_binding
+        if not eb:
+            continue
+        field_name = str(eb.get("prefab") or "")
+        if not field_name:
+            continue
+        prefab_id = equip_prefabs.get(field_name)
+        if not prefab_id:
+            continue  # field unresolved (runtime abstains) -> no scale entry
+        scale = eb.get("scale")
+        if scale is None or not isinstance(scale, (int, float)):
+            continue  # nothing captured (None sentinel) -> no opinion on scale
+        scale = float(scale)
+        prior = captured.get(prefab_id)
+        if prior is not None and prior != scale:
+            raise RuntimeError(
+                "[contract] camera-mount equip scale bridge: prefab_id "
+                f"{prefab_id!r} maps to two different scales ({prior} vs {scale}) "
+                "across equip carriers — refusing to ship an ambiguous scale."
+            )
+        captured[prefab_id] = scale
+    # Emit only the runtime-meaningful (non-1.0) scales; an explicit 1.0 participated
+    # in the collision check above but needs no Plan entry (runtime ScaleTo no-op).
+    return {pid: s for pid, s in captured.items() if s != 1.0}
+
+
+def _script_id_for_source_path(
+    source_path: str,
+    guid_index: object | None,
+) -> str:
+    """Resolve a transpiled script's ``.cs`` ``source_path`` to its canonical
+    ``script_id`` (the .cs GUID), the key the planner uses for reference-row
+    instances. Uses the guid_index reverse lookup (``guid_for_path``); returns
+    ``""`` when unresolvable (caller leaves the field unresolved -> runtime
+    abstain, never a fail-close)."""
+    if not source_path:
+        return ""
+    guid_for_path = getattr(guid_index, "guid_for_path", None)
+    if not callable(guid_for_path):
+        return ""
+    try:
+        guid = guid_for_path(Path(source_path))
+    except (AttributeError, KeyError, TypeError):
+        # Expected missing-index shapes (the index lacks the path / a stub method
+        # signature mismatch) -> abstain. Anything else surfaces.
+        return ""
+    return guid if isinstance(guid, str) and guid else ""
 
 
 # ---------------------------------------------------------------------------
@@ -2609,6 +2830,28 @@ class Pipeline:
             self.ctx.scene_runtime["runtime_bearing_paths"] = sorted(
                 str(p) for p in contract_result.runtime_bearing_paths
             )
+            # Phase 2 (D13): build the field-name -> prefab_id equip bridge now
+            # that BOTH inputs exist — the equip-emitting scripts' ``equip_binding``
+            # (produced by the camera-mount equip lowering inside
+            # ``transpile_with_contract``) AND the per-component prefab reference
+            # rows ``plan_scene_runtime`` seeded into ``ctx.scene_runtime``. This
+            # MUST run here (post-transpile), NOT in ``plan_scene_runtime`` which
+            # runs before the equip facts exist. The map reaches the emitted
+            # SceneRuntimePlan via the ``equip_prefabs`` entry in
+            # ``_PLAN_KEYS_FOR_HOST`` (else the live handler reads nil). Fails
+            # CLOSED on a same-field-name-different-prefab collision (D13b gate).
+            self.ctx.scene_runtime["equip_prefabs"] = build_equip_prefabs_bridge(
+                contract_result.transpilation.scripts,
+                self.ctx.scene_runtime,
+                self.state.guid_index,
+            )
+            # D17/Bug-2: the prefab_id -> uniform display scale map, reusing the
+            # field->prefab_id resolution above. Reaches the runtime weld via the
+            # ``equip_scales`` Plan key; absent prefab_id -> runtime ScaleTo no-op.
+            self.ctx.scene_runtime["equip_scales"] = build_equip_scales_bridge(
+                contract_result.transpilation.scripts,
+                self.ctx.scene_runtime["equip_prefabs"],
+            )
         else:
             # Legacy path -- must stay byte-identical. Do NOT thread
             # ``runtime_mode`` or any other new kwargs here; legacy emit is a
@@ -3466,6 +3709,9 @@ return table.concat(allData, "\\n")'''
                     # the dead-module exemption (a re-lowered roster consumer is
                     # live by construction; its canonical body is inert).
                     roster_binding=ts.roster_binding,
+                    # Generic-mode camera-mount equip-request binding carrier (or
+                    # None) for the equip-present fail-closed check.
+                    equip_binding=ts.equip_binding,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -5100,6 +5346,7 @@ script.Disabled = true
         child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
         rig_binding_lookup = self._load_rig_binding_for_rehydration()
         roster_binding_lookup = self._load_roster_binding_for_rehydration()
+        equip_binding_lookup = self._load_equip_binding_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -5170,6 +5417,13 @@ script.Disabled = true
             rob = roster_binding_lookup.get(name)
             if rob is not None:
                 script.roster_binding = rob
+            # Restore the camera-mount equip-request carrier so the equip-present
+            # fail-closed check has the IR anchor + discharge stamp on a
+            # preserve/resume assemble (else it would abstain on every rehydrated
+            # script). The check still INDEPENDENTLY scans ``source``.
+            eqb = equip_binding_lookup.get(name)
+            if eqb is not None:
+                script.equip_binding = eqb
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -5377,6 +5631,55 @@ script.Disabled = true
             }
         return out
 
+    def _load_equip_binding_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Load the persisted per-script camera-mount equip-request carrier from
+        ``conversion_plan.json`` into ``name -> {prefab, method, remote, present}``
+        (+ optional ``multi_site``/``dangling_capvar`` sub-flags).
+
+        Mirrors the ``rig_binding`` rehydration. Returns ``{}`` on a
+        missing/malformed plan or a plan that pre-dates the field; a malformed row
+        is dropped (absent -> ``None`` -> the equip-present check abstains, the same
+        safe pre-field default). All FOUR core keys must be well-formed (str prefab/
+        method/remote, bool present) or the row is dropped — a partial carrier would
+        let the fail-closed check anchor on a missing prefab and exempt blind."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("equip_binding")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, object]] = {}
+        for name, eb in block.items():
+            if not isinstance(name, str) or not isinstance(eb, dict):
+                continue
+            prefab = eb.get("prefab")
+            method = eb.get("method")
+            remote = eb.get("remote")
+            present = eb.get("present")
+            if not (isinstance(prefab, str) and isinstance(method, str)
+                    and isinstance(remote, str) and isinstance(present, bool)):
+                continue
+            row: dict[str, object] = {
+                "prefab": prefab,
+                "method": method,
+                "remote": remote,
+                "present": present,
+            }
+            for flag in ("multi_site", "dangling_capvar"):
+                val = eb.get(flag)
+                if isinstance(val, bool):
+                    row[flag] = val
+            out[name] = row
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -5472,6 +5775,16 @@ script.Disabled = true
             s.name: s.roster_binding
             for s in self.state.rbx_place.scripts
             if s.roster_binding is not None
+        }
+
+        # Persist each camera-mount equip carrier so a preserve/resume assemble that
+        # rehydrates from disk can restore the equip-present check's IR anchor +
+        # discharge stamp (without it the check would abstain on that path). Keyed by
+        # script name; ``None`` carriers are dropped (absent == no equip obligation).
+        equip_binding: dict[str, dict[str, object]] = {
+            s.name: s.equip_binding
+            for s in self.state.rbx_place.scripts
+            if s.equip_binding is not None
         }
 
         # Animation routing (Phase 4.5): per-clip target + reason.
@@ -5597,6 +5910,7 @@ script.Disabled = true
                 "child_ref_resolution": child_ref_resolution,
                 "rig_binding": rig_binding,
                 "roster_binding": roster_binding,
+                "equip_binding": equip_binding,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),

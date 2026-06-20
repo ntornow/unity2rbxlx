@@ -24,6 +24,17 @@ import re
 
 from core.roblox_types import RbxScript
 
+# Phase 2 (camera-mount -> player-mount equip): the RemoteEvent .Name + the
+# client _services handle are imported from the Phase-1 lowering module so the
+# Phase-2 declaration / WaitForChild literals can NEVER drift from the constants
+# Phase 1's emitted request fires against (D10's "name can't drift"). The import
+# is at module top -- ``camera_mount_equip_lowering`` does not import ``autogen``,
+# so there is no cycle.
+from converter.camera_mount_equip_lowering import (
+    EQUIP_REMOTE_NAME,
+    EQUIP_REMOTE_SERVICE,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -658,6 +669,19 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # at boot. LOAD-BEARING — without the allowlist entry the recomputed key is
     # elided from the emitted plan and the shim sees ``{}`` (dead registry).
     "addressable_db_seeds",
+    # Phase 2 (camera-mount -> player-mount equip, D13): the conversion-time
+    # ``{field_name: prefab_id}`` bridge the server EquipWeapon handler consults
+    # (``SceneRuntime:resolveEquipPrefabId``) to map the client-sent prefab FIELD
+    # NAME to a concrete ``prefab_id`` for ``clonePrefabTemplate``. Built by the
+    # post-transpile bridge step in ``pipeline.py`` onto ``ctx.scene_runtime``.
+    # LOAD-BEARING — without the allowlist entry the recomputed key is elided
+    # from the emitted plan and the live handler reads ``nil`` (dead equip).
+    "equip_prefabs",
+    # D17/Bug-2: the ``{prefab_id: uniform_scale}`` map the runtime weld applies
+    # (``Model:ScaleTo``) so the held weapon is sized as the source game showed it.
+    # Same allowlist requirement as ``equip_prefabs`` — elided if absent; an absent
+    # prefab_id entry is a runtime no-op (scale 1.0).
+    "equip_scales",
     # Phase 1 consumable prototype materialization: per-DB seed records the boot
     # shim replays to materialize a consumable-style SO's array of in-prefab
     # component refs into component instances. LOAD-BEARING — without the
@@ -940,6 +964,13 @@ local services = {
     -- server services table omits it. The GameServer creates this remote, so a
     -- bounded WaitForChild resolves it on the client.
     playerTeleportRemote = RS:WaitForChild("PlayerTeleport", 10),
+    -- Client equip-request remote (D10) -- CLIENT ONLY (the server table OMITS
+    -- it; the server already HOLDS the remote object it declared). The client's
+    -- Phase-1 lowered request FireServers the prefab FIELD NAME through this
+    -- handle; the server owns the replicated character-hand weld. The
+    -- SceneRuntimeServer creates this remote, so a bounded WaitForChild resolves
+    -- it. The Phase-1 nil-guard means a 10s miss degrades to a safe no-op.
+    __EQUIP_CLIENT_INJECTION__
     -- CFrame type-guard for the teleport request (the host injects this rather
     -- than calling the ``typeof`` builtin directly so the predicate is testable).
     isCFrame = function(v) return typeof(v) == "CFrame" end,
@@ -1254,8 +1285,132 @@ local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
 SceneRuntime.seedConsumableDatabases(Plan, services)
 SceneRuntime.seedLazySingletons(Plan, services, engine, "server")
+__EQUIP_SERVER_HANDLER__
 engine:start("server")
 '''
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (camera-mount -> player-mount equip) -- the ``EquipWeapon`` RemoteEvent
+# declaration + server handler + client ``_services`` injection.
+#
+# The entrypoint sources above are PLAIN triple-quoted strings whose Luau bodies
+# contain LITERAL ``{`` braces, so an f-string / ``.format`` over the whole body
+# would clash with Luau table braces (the same constraint the GameServer
+# head/funnel/tail splice already respects). So the brace-bearing fragments below
+# are plain strings carrying two SENTINELS (``__EQUIP_REMOTE_NAME__`` /
+# ``__EQUIP_REMOTE_SERVICE__``) that appear nowhere else in the Luau, and the
+# sentinel ``.replace`` binds them to the Phase-1 constants -- the literal
+# ``.Name``/``WaitForChild``/service-handle can never drift from the request the
+# client fires (D10). The fragments are spliced into the entrypoint sources via a
+# second ``.replace`` on the ``__EQUIP_CLIENT_INJECTION__`` /
+# ``__EQUIP_SERVER_HANDLER__`` markers placed inline above.
+# ---------------------------------------------------------------------------
+
+# Client ``_services`` injection (CLIENT ONLY). One assignment line, dropped into
+# the client services table beside ``playerTeleportRemote``.
+_EQUIP_CLIENT_INJECTION_FRAGMENT: str = (
+    '__EQUIP_REMOTE_SERVICE__ = RS:WaitForChild("__EQUIP_REMOTE_NAME__", 10),'
+)
+
+# Server-side ``EquipWeapon`` RemoteEvent declaration + ``OnServerEvent`` handler
+# + ``CharacterAdded`` re-equip. Declared in SceneRuntimeServer (D14) because the
+# handler needs ``engine`` (Plan + clonePrefabTemplate in scope). Spliced AFTER
+# ``local engine = SceneRuntime.new(services, Plan)`` so ``engine`` is bound.
+#
+# CONNECT-BEFORE-PARENT: Roblox does NOT buffer OnServerEvent
+# for listeners connected AFTER a FireServer lands, so the ordering is strictly
+# create -> OnServerEvent:Connect -> THEN .Parent = RS. The client's
+# WaitForChild("EquipWeapon") cannot resolve (so cannot FireServer) until the
+# remote is parented, which happens only after the handler is connected -- the
+# race window is closed by construction.
+_EQUIP_SERVER_HANDLER_FRAGMENT: str = '''\
+-- Camera-mount weapon equip (D5/D7/D10): the client REQUESTS an equip via the
+-- prefab FIELD NAME; the server OWNS the replicated character-hand weld. The
+-- weapon is server-parented under the requesting player's Character so Roblox
+-- auto-replicates it to every client (other players see the held gun). Declared
+-- here (not GameServerManager) because the handler needs Plan + clonePrefabTemplate.
+local equipWeaponRemote = Instance.new("RemoteEvent")
+equipWeaponRemote.Name = "__EQUIP_REMOTE_NAME__"          -- == EQUIP_REMOTE_NAME (Phase 1 constant)
+-- NB: do NOT parent to RS yet -- connect the handler FIRST (below).
+equipWeaponRemote.OnServerEvent:Connect(function(player, fieldName)
+    -- 1. Validate the client-sent arg (untrusted): non-empty short identifier.
+    if type(fieldName) ~= "string" or fieldName == "" or #fieldName > 64
+        or not string.match(fieldName, "^[%w_]+$") then
+        return
+    end
+    -- 2. Resolve the requesting player's Character (D7: the OnServerEvent arg).
+    local character = player.Character
+    if not character then return end
+    -- 3. field name -> prefab_id via the conversion-time field-name map (D13b).
+    local prefabId = engine:resolveEquipPrefabId(fieldName)
+    if not prefabId then return end
+    -- 4./5. clone + weld under the Character (server-owned -> auto-replicates).
+    local welded = engine:equipWeaponOnCharacter(character, prefabId)
+    if welded then
+        engine:rememberEquip(player, prefabId)
+    end
+end)
+-- THE handler is now connected -> only NOW make the remote reachable to clients
+-- (closes the connect/parent race; the client WaitForChild cannot resolve, so
+-- cannot FireServer, until the listener is live).
+equipWeaponRemote.Parent = RS
+-- 6. Re-equip on respawn (self-healing). A hand limb present at CharacterAdded can
+--    be REPLACED by the appearance/rig load a moment later, destroying the mount
+--    weld (Part0 = old limb) so the weapon detaches. Instead of guessing a stable
+--    instant, re-equip whenever a hand limb ARRIVES under the Character (bounded
+--    window) so the mount converges onto the final limb. equipWeaponOnCharacter
+--    removes the prior _EquippedWeapon first, so repeated re-equips are idempotent.
+local REEQUIP_HAND_LIMBS = {RightHand = true, ["Right Arm"] = true}
+local REEQUIP_HEAL_WINDOW = 10  -- seconds to watch for a post-spawn limb swap
+local function reequipOnRespawn(p, char)
+    -- DescendantAdded (matching the runtime's late-HRP watcher; depth-robust).
+    -- Connect before the initial equip so a hand arriving in between is not missed.
+    local conn = char.DescendantAdded:Connect(function(child)
+        if REEQUIP_HAND_LIMBS[child.Name] then
+            task.spawn(function() engine:reequipLastWeapon(p, char) end)
+        end
+    end)
+    task.delay(REEQUIP_HEAL_WINDOW, function() conn:Disconnect() end)
+    task.spawn(function() engine:reequipLastWeapon(p, char) end)
+end
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function(char)
+        reequipOnRespawn(p, char)
+    end)
+end)
+for _, p in Players:GetPlayers() do
+    if p.Character then
+        reequipOnRespawn(p, p.Character)
+    end
+    p.CharacterAdded:Connect(function(char)
+        reequipOnRespawn(p, char)
+    end)
+end'''
+
+
+def _bind_equip_remote_name(fragment: str) -> str:
+    """Bind the two equip-remote sentinels in ``fragment`` to the Phase-1
+    constants. A standalone helper so the splice + the unit test share the exact
+    same substitution (the literal ``.Name``/``WaitForChild`` cannot drift)."""
+    return (
+        fragment
+        .replace("__EQUIP_REMOTE_NAME__", EQUIP_REMOTE_NAME)
+        .replace("__EQUIP_REMOTE_SERVICE__", EQUIP_REMOTE_SERVICE)
+    )
+
+
+# Splice the equip fragments into the entrypoint sources at the inline markers.
+# Done once at import time so ``generate_scene_runtime_*_entrypoint`` emit the
+# final wired sources (and the unit tests read the same constants).
+_SCENE_RUNTIME_CLIENT_SOURCE = _SCENE_RUNTIME_CLIENT_SOURCE.replace(
+    "__EQUIP_CLIENT_INJECTION__",
+    _bind_equip_remote_name(_EQUIP_CLIENT_INJECTION_FRAGMENT),
+)
+_SCENE_RUNTIME_SERVER_SOURCE = _SCENE_RUNTIME_SERVER_SOURCE.replace(
+    "__EQUIP_SERVER_HANDLER__",
+    _bind_equip_remote_name(_EQUIP_SERVER_HANDLER_FRAGMENT),
+)
 
 
 def generate_scene_runtime_client_entrypoint() -> RbxScript:

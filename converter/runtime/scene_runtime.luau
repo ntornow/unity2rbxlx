@@ -3168,6 +3168,228 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 end
 
 -- ---------------------------------------------------------------------
+-- Phase 2: camera-mount -> player-mount weapon equip (server-side)
+-- ---------------------------------------------------------------------
+-- The client's Phase-1 lowered request fires the prefab FIELD NAME through the
+-- ``EquipWeapon`` RemoteEvent; the SceneRuntimeServer entrypoint's OnServerEvent
+-- handler delegates to the methods below. They are SERVER-CALLABLE PLAIN methods
+-- (no ``isClient`` gate -- they run only from the server entrypoint's
+-- OnServerEvent / CharacterAdded, never from a ``_tick`` bracket). They use only
+-- ``self._services`` (clonePrefabTemplate) + ``self._plan`` (equip_prefabs), so
+-- the test harness drives them with stub services. The weapon is server-parented
+-- under the requesting player's Character so Roblox auto-replicates it to every
+-- client (the load-bearing "other players see the held gun" win, D5/D6).
+
+-- Field-name -> prefab_id bridge (D13). Reads the conversion-time-seeded
+-- ``self._plan.equip_prefabs`` map ``{ [fieldName] = prefab_id }`` built by the
+-- post-transpile pipeline step. Returns the prefab_id or nil (unknown field ->
+-- the handler no-ops, D11 parity). Pure read.
+function SceneRuntime:resolveEquipPrefabId(fieldName)
+	if type(fieldName) ~= "string" or fieldName == "" then return nil end
+	local map = self._plan and self._plan.equip_prefabs
+	if type(map) ~= "table" then return nil end
+	local prefabId = map[fieldName]
+	if type(prefabId) ~= "string" or prefabId == "" then return nil end
+	return prefabId
+end
+
+-- D17/Bug-2: the uniform display scale for a weapon prefab, from the Plan's
+-- ``equip_prefabs`` sibling ``equip_scales`` map (keyed by prefab_id, captured from
+-- the C# ``localScale = Vector3.one * f``). Returns 1 (no-op) when absent / invalid
+-- so the common no-scale game welds at native template size. Keyed by prefab_id so
+-- BOTH the manual equip and the respawn re-equip (which hold prefab_id, not the
+-- field name) resolve the same scale.
+function SceneRuntime:resolveEquipScale(prefabId)
+	local map = self._plan and self._plan.equip_scales
+	if type(map) ~= "table" then return 1 end
+	local s = map[prefabId]
+	if type(s) == "number" and s > 0 then return s end
+	return 1
+end
+
+-- Bounded wait (seconds) for a respawned Character's hand limb to be parented
+-- before the re-equip gives up. Generous enough to absorb the normal
+-- one-/two-frame R15 limb-parenting delay without an unbounded stall.
+local EQUIP_HAND_WAIT_TIMEOUT = 5
+
+-- R15 right-hand resolver with ONE documented fallback (D15). R15 has a
+-- dedicated ``RightHand`` part; R6 has none, so ``"Right Arm"`` is the closest
+-- grip analog. The full rig-variant matrix is OUT OF SCOPE -- this single
+-- fallback keeps an R6 character from a hard no-op. Returns nil when neither
+-- resolves (caller then no-ops, no weld).
+function SceneRuntime:_resolveRightHand(character)
+	if not character then return nil end
+	local hand = character:FindFirstChild("RightHand")
+	if hand and hand:IsA("BasePart") then return hand end
+	hand = character:FindFirstChild("Right Arm")
+	if hand and hand:IsA("BasePart") then return hand end
+	return nil
+end
+
+-- Respawn-tolerant hand resolver (CharacterAdded fires BEFORE the R15 limbs
+-- are parented, so a one-shot ``FindFirstChild`` no-ops on respawn). A BOUNDED
+-- POLL that checks BOTH limb names every tick and returns whichever appears
+-- first, so:
+--   * R6 (has "Right Arm", never "RightHand") resolves on the FIRST check -- no
+--     stall (an earlier ``WaitForChild("RightHand", timeout)``-then-fallback
+--     spent the FULL timeout unarmed every respawn, since R6 never grows a
+--     "RightHand").
+--   * R15 with a late-arriving "RightHand" resolves the tick it lands.
+--   * neither present within the bounded deadline -> nil so the caller no-ops
+--     (no unbounded wait).
+-- "RightHand" is checked first so R15 prefers its dedicated grip part. The
+-- deadline is a fixed iteration cap over the engine's ``task.wait`` yield floor
+-- (no os.clock/tick dependency); ``timeout`` seconds / the per-frame wait gives
+-- the ~5s cap. The yield floor matches the rest of the runtime
+-- (``self._services.task.wait``).
+function SceneRuntime:_resolveRightHandBounded(character, timeout)
+	if not character then return nil end
+	local function pick()
+		local hand = character:FindFirstChild("RightHand")
+		if hand and hand:IsA("BasePart") then return hand end
+		hand = character:FindFirstChild("Right Arm")
+		if hand and hand:IsA("BasePart") then return hand end
+		return nil
+	end
+	-- First check before any yield: a limb already present (R6 / fast R15)
+	-- resolves immediately.
+	local hand = pick()
+	if hand then return hand end
+	-- Bounded poll: ~one check per engine frame, capped at ``timeout`` seconds'
+	-- worth of frames (60 fps assumed -> a fixed iteration count, no real clock).
+	local waitFn = self._services and self._services.task and self._services.task.wait
+	local maxIters = math.max(1, math.floor((timeout or EQUIP_HAND_WAIT_TIMEOUT) * 60))
+	for _ = 1, maxIters do
+		if waitFn then waitFn() end
+		hand = pick()
+		if hand then return hand end
+	end
+	return nil
+end
+
+-- The weld core (the NEW rigging surface, D16). Clones the prefab template
+-- SERVER-SIDE under the Character (so Roblox auto-replicates it), normalizes a
+-- Model to a weldable BasePart anchor, welds it to the right hand with a
+-- ``WeldConstraint`` (rigid static-offset attachment; no C0/C1, no joint the
+-- Animate script fights), and makes every weapon part CanCollide=false /
+-- Massless=true so the gun neither blocks movement nor drags the humanoid's
+-- physics. Double-equip safety (Edge d): a prior ``_EquippedWeapon`` under THIS
+-- character is removed before welding the new one. Returns the clone, or nil on
+-- any safe no-op (no hand / clone failed / no weldable part).
+-- ``waitForHand`` (respawn path): when true, the hand is resolved with a BOUNDED
+-- WaitForChild so a just-spawned Character whose limbs land a frame later still
+-- equips; the already-spawned OnServerEvent path passes nil/false for the fast
+-- one-shot resolve.
+function SceneRuntime:equipWeaponOnCharacter(character, prefabId, waitForHand)
+	local hand
+	if waitForHand then
+		hand = self:_resolveRightHandBounded(character, EQUIP_HAND_WAIT_TIMEOUT)
+	else
+		hand = self:_resolveRightHand(character)
+	end
+	if not hand then return nil end
+	-- Double-equip safety: remove any existing equipped weapon first.
+	local existing = character:FindFirstChild("_EquippedWeapon")
+	if existing then existing:Destroy() end
+	-- Clone server-side, parented under the Character (clonePrefabTemplate
+	-- parents to ``parent``).
+	local clone = self._services.clonePrefabTemplate(prefabId, character, nil)
+	if not clone then return nil end
+	clone.Name = "_EquippedWeapon"
+	-- D17/Bug-2: apply the captured uniform display scale BEFORE positioning/welding
+	-- (the C# equip set ``localScale = Vector3.one * f``; the converted template is
+	-- at native size). ScaleTo scales geometry about the model pivot; doing it before
+	-- PivotTo/weld means the subsequent placement lands the scaled weapon on the hand.
+	-- Model -> ScaleTo (uniform); single BasePart -> scale Size. No-op when scale == 1.
+	local equipScale = self:resolveEquipScale(prefabId)
+	if equipScale ~= 1 then
+		if clone:IsA("Model") then
+			clone:ScaleTo(equipScale)
+		elseif clone:IsA("BasePart") then
+			clone.Size = clone.Size * equipScale
+		end
+	end
+	-- Normalize Model -> a weldable BasePart anchor (PrimaryPart or first
+	-- BasePart). A non-Model non-BasePart clone is unweldable -> drop it.
+	local weldPart = clone
+	if clone:IsA("Model") then
+		weldPart = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart", true)
+		if not weldPart then clone:Destroy(); return nil end
+	elseif not clone:IsA("BasePart") then
+		clone:Destroy(); return nil
+	end
+	-- Reset EVERY BasePart in the clone so the live weapon is VISIBLE
+	-- (templates are emitted Transparency=1.0 / hidden) and moves as one rigid
+	-- body welded to the hand (parts default Anchored=true; an anchored part
+	-- ignores its WeldConstraint and stays pinned in world space). CanCollide
+	-- /Massless keep the gun from blocking or dragging the humanoid's physics.
+	local function normalizePart(p)
+		p.Transparency = 0
+		p.Anchored = false
+		p.CanCollide = false
+		p.Massless = true
+	end
+	for _, d in clone:GetDescendants() do
+		if d:IsA("BasePart") then normalizePart(d) end
+	end
+	if clone:IsA("BasePart") then normalizePart(clone) end
+	-- Relocate the WHOLE clone to the hand as a unit (a multi-part Model keeps
+	-- its internal offsets), then weld. (First-person muzzle offset is a
+	-- DEFERRED live-tune, D4 -- a zero offset lands the gun ON the hand.)
+	-- For a Model, pin PrimaryPart to the chosen anchor BEFORE PivotTo so the
+	-- ANCHOR lands exactly at hand.CFrame. Without this pin PivotTo uses the
+	-- bounding-box pivot, leaving the anchor at an arbitrary offset that the
+	-- subsequent hand WeldConstraint would freeze (gun floats off the hand).
+	if clone:IsA("Model") then
+		clone.PrimaryPart = weldPart
+		clone:PivotTo(hand.CFrame)
+	else
+		weldPart.CFrame = hand.CFrame
+	end
+	-- For a multi-part Model, weld every OTHER descendant BasePart to the chosen
+	-- primary anchor first so the model is internally rigid, then weld the
+	-- anchor to the hand.
+	if clone:IsA("Model") then
+		for _, d in clone:GetDescendants() do
+			if d:IsA("BasePart") and d ~= weldPart then
+				local inner = Instance.new("WeldConstraint")
+				inner.Part0 = weldPart
+				inner.Part1 = d
+				inner.Parent = weldPart
+			end
+		end
+	end
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = hand
+	weld.Part1 = weldPart
+	weld.Parent = weldPart
+	return clone
+end
+
+-- Per-player last-equip memory (server-only engine state, keyed by the Player
+-- instance). Recorded by the handler after a successful equip; a stale entry for
+-- a departed player is harmless (the key just lingers).
+function SceneRuntime:rememberEquip(player, prefabId)
+	self._lastEquip = self._lastEquip or {}
+	self._lastEquip[player] = prefabId
+end
+
+-- Re-equip on respawn (Edge e). A NEW Character has no welded weapon, so re-run
+-- the last successful equip for this player.
+function SceneRuntime:reequipLastWeapon(player, character)
+	local prefabId = self._lastEquip and self._lastEquip[player]
+	if not prefabId or not character then return end
+	-- NB: do NOT gate on ``character.Parent ~= nil`` here. On respawn the new
+	-- Character is parented to workspace a beat AFTER CharacterAdded fires, so its
+	-- Parent is transiently nil when this runs — a parent guard would no-op the
+	-- whole re-equip (and the limb-arrival self-heal in the emitted entrypoint
+	-- already covers a hand that lands later). equipWeaponOnCharacter parents the
+	-- weapon UNDER the character, so it rides along once the character is parented;
+	-- a truly-departed character resolves no hand and no-ops there.
+	self:equipWeaponOnCharacter(character, prefabId, true)
+end
+
+-- ---------------------------------------------------------------------
 -- Slice 1.1: deferred UI-host gameObject resolution (generic boot race)
 -- ---------------------------------------------------------------------
 -- A UI-owned instance (``inst.instance_owner_is_ui == true``) binds its

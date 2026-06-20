@@ -824,3 +824,153 @@ class TestAllowlistIsolation:
                 f"replaces the legacy emit-time subphases with the host "
                 f"runtime; this orchestrator must not invoke them."
             )
+
+
+# ---------------------------------------------------------------------------
+# Criterion 10 — LIVE pipeline registration wiring
+#
+# Drives the REAL ``transpile_with_contract`` so the ``lower_camera_mount_equip``
+# REGISTRATION call (contract_pipeline.py, after the rig lowering) actually runs +
+# stamps the ``equip_binding`` carrier on the produced ``TranspiledScript`` AND the
+# carrier flows onto an ``RbxScript`` via the pipeline copy. Without this, deleting
+# the registration call (or the TranspiledScript->RbxScript copy line) stays green
+# because every other test drives the lowering/verifier directly or asserts the
+# pre-seeded corpus fixture (the project's
+# "unit-test-proves-the-unit-not-that-the-pipeline-calls-it" lesson).
+# ---------------------------------------------------------------------------
+
+from converter.code_transpiler import TranspilationResult  # noqa: E402
+from core.roblox_types import RbxScript  # noqa: E402
+from core.unity_types import (  # noqa: E402
+    GuidEntry,
+    GuidIndex,
+    PrefabComponent,
+    PrefabLibrary,
+    PrefabNode,
+    PrefabTemplate,
+)
+
+_EQUIP_GUID = "44444444444444444444444444444444"
+
+# The AI's emitted equip-shape Luau the lowering rewrites (the corpus GetRifle shape).
+_EQUIP_LUAU = (
+    "local Player = {}\n"
+    "Player.__index = Player\n\n"
+    "function Player:GetRifle()\n"
+    "    if self.riflePrefab then\n"
+    "        local slot = self:_resolveWeaponSlot() or self.gameObject\n"
+    "        local rifle = self.host.instantiatePrefab(self.riflePrefab, slot, slot:GetPivot())\n"
+    "        if rifle then rifle:PivotTo(slot:GetPivot()) end\n"
+    "    end\n"
+    "    self.gotWeapon = true\n"
+    "end\n\n"
+    "return Player\n"
+)
+
+_EQUIP_CS = (
+    "using UnityEngine;\n"
+    "public class Player : MonoBehaviour {\n"
+    "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+    "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+    "  void GetRifle() {\n"
+    "    var r = Instantiate(riflePrefab);\n"
+    "    r.transform.SetParent(weaponSlot);\n"
+    "  }\n"
+    "}\n"
+)
+
+
+def _equip_prefab_library() -> PrefabLibrary:
+    def _mono(guid: str) -> PrefabComponent:
+        return PrefabComponent(
+            component_type="MonoBehaviour", file_id="100",
+            properties={"m_Script": {"fileID": 11500000, "guid": guid, "type": 3}},
+        )
+
+    def _node(name, *, tag="Untagged", children=None, comp_guid=None) -> PrefabNode:
+        return PrefabNode(
+            name=name, file_id=name, active=True, tag=tag,
+            children=children or [],
+            components=[_mono(comp_guid)] if comp_guid else [],
+        )
+
+    cam = _node("MainCamera", tag="MainCamera", children=[_node("WeaponSlot")])
+    player = _node("Player", children=[cam], comp_guid=_EQUIP_GUID)
+    template = PrefabTemplate(prefab_path=Path("/p/Player.prefab"),
+                              name="Player", root=player)
+    return PrefabLibrary(prefabs=[template])
+
+
+def test_c10_live_registration_stamps_equip_binding(tmp_path: Path, monkeypatch):
+    """The REAL ``transpile_with_contract`` runs ``lower_camera_mount_equip`` and the
+    carrier reaches an ``RbxScript``. Deleting the registration call (or the
+    TranspiledScript->RbxScript copy line) FAILS this test."""
+    proj = tmp_path / "project"
+    (proj / "Assets").mkdir(parents=True)
+    cs_path = proj / "Assets" / "Player.cs"
+    cs_path.write_text(_EQUIP_CS)
+
+    guid_index = GuidIndex(project_root=proj)
+    guid_index.guid_to_entry[_EQUIP_GUID] = GuidEntry(
+        guid=_EQUIP_GUID, asset_path=cs_path,
+        relative_path=Path("Assets/Player.cs"), kind="script",
+    )
+
+    transpiled = TranspiledScript(
+        source_path=str(cs_path),
+        output_filename="Player.luau",
+        csharp_source=_EQUIP_CS,
+        luau_source=_EQUIP_LUAU,
+        strategy="ai",
+        confidence=0.9,
+        script_type="ModuleScript",
+    )
+
+    import converter.contract_pipeline as cp
+
+    def _fake_transpile_scripts(*args, **kwargs):
+        return TranspilationResult(scripts=[transpiled], total_transpiled=1,
+                                   total_ai=1)
+
+    monkeypatch.setattr(cp, "transpile_scripts", _fake_transpile_scripts)
+
+    scene_runtime = {
+        "modules": {
+            _EQUIP_GUID: {"stem": "Player", "class_name": "Player",
+                          "runtime_bearing": True, "character_attached": False,
+                          "is_loader": False},
+        },
+        "scenes": {}, "prefabs": {}, "domain_overrides": {},
+    }
+    result = cp.transpile_with_contract(
+        unity_project_path=proj,
+        script_infos=[_ScriptInfo(cs_path, "Player", suggested_type="ModuleScript")],
+        scene_runtime=scene_runtime,
+        use_ai=False,
+        prefab_library=_equip_prefab_library(),
+        guid_index=guid_index,
+    )
+
+    ts = next((s for s in result.transpilation.scripts
+               if s.source_path == str(cs_path)), None)
+    assert ts is not None
+    # The registration call ran -> the equip request landed + the carrier is stamped.
+    assert ts.equip_binding is not None, (
+        "lower_camera_mount_equip did not stamp equip_binding — the contract_pipeline "
+        "registration call was not invoked"
+    )
+    assert ts.equip_binding["present"] is True
+    assert ts.equip_binding["prefab"] == "riflePrefab"
+    assert ts.equip_binding["method"] == "GetRifle"
+    assert 'FireServer("riflePrefab")' in ts.luau_source
+
+    # The pipeline copy line carries the carrier onto the produced RbxScript.
+    rbx = RbxScript(
+        name=ts.output_filename.replace(".luau", ""),
+        source=ts.luau_source,
+        script_type=ts.script_type,
+        source_path=ts.output_filename,
+        equip_binding=ts.equip_binding,
+    )
+    assert rbx.equip_binding is not None
+    assert rbx.equip_binding["present"] is True
