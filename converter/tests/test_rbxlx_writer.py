@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.roblox_types import (
     RbxPart, RbxCFrame, RbxScript, RbxPlace, RbxLightingConfig,
-    RbxScreenGui, RbxUIElement,
+    RbxScreenGui, RbxUIElement, RbxPostProcessing,
 )
 
 
@@ -109,6 +109,29 @@ class TestRbxlxWriter:
 
         content = output.read_text()
         assert "Lighting" in content
+
+    def test_post_processing_attributes_serialize(self, tmp_path):
+        """Post-processing extra attributes must serialize. The writer called an
+        undefined ``_write_attributes`` here — any truthy ``pp.attributes`` raised
+        NameError at this point. Guards both the helper and that reachable path."""
+        from roblox.rbxlx_writer import write_rbxlx
+        pp = RbxPostProcessing(
+            attributes={"VignetteIntensity": 0.5, "MotionBlur": True, "Profile": "urp"}
+        )
+        place = RbxPlace(post_processing=pp)
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)  # pre-fix: NameError: _write_attributes
+
+        content = output.read_text()
+        assert 'name="AttributesSerialize"' in content
+
+    def test_empty_post_processing_attributes_emit_nothing(self, tmp_path):
+        """Empty attributes dict must not emit an AttributesSerialize element."""
+        from roblox.rbxlx_writer import write_rbxlx
+        place = RbxPlace(post_processing=RbxPostProcessing())
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        assert 'name="AttributesSerialize"' not in output.read_text()
 
     def test_write_with_ui(self, tmp_path):
         from roblox.rbxlx_writer import write_rbxlx

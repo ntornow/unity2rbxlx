@@ -27,12 +27,12 @@
 
 ## /drive run output-boundary-sanitize-20260620T082237 — architectural follow-ups (2026-06-20T02:26:55Z)
 
-- `converter/roblox/rbxlx_writer.py:1437` — `_write_attributes(lighting_props, pp_attrs)` is
+- ~~`converter/roblox/rbxlx_writer.py:1437` — `_write_attributes(lighting_props, pp_attrs)` is
   CALLED but the function is never DEFINED or imported in the module → a latent `NameError`
-  reachable when post-processing attributes (`pp_attrs`) are truthy. Pre-existing, unrelated
-  to the output-boundary escaping work (out of this run's blast radius). Flagged independently
-  by the phase-design and finalize audits. Fix in a separate change (define/import the writer,
-  or remove the dead call) with a test that exercises the truthy-`pp_attrs` path.
+  reachable when post-processing attributes (`pp_attrs`) are truthy.~~ **DONE (2026-06-20):**
+  defined the canonical `_write_attributes(props, attrs)` helper (encode + `AttributesSerialize`
+  BinaryString) and routed the two existing inline attribute-emit sites through it; regression
+  test exercises the truthy-`pp.attributes` path (proven to NameError pre-fix).
 
 
 ## /drive run screengui-state-visibility-20260620T115219 — architectural follow-ups (2026-06-20T11:02:29Z)

@@ -7,8 +7,9 @@ coordinates in Vertices/Normals arrays and flip polygon winding in
 PolygonVertexIndex arrays without the sub-mesh loss that assimp's
 FBX→OBJ→FBX round-trip causes.
 
-Supports FBX versions < 7500 (32-bit offsets); 7500+ support (64-bit offsets)
-is straightforward but not currently required.
+Supports FBX versions < 7500 (32-bit offsets) and >= 7500 (64-bit offsets;
+FBX 2016+). The 64-bit branches live in ``_read_node``/``_write_node`` (the
+``<QQQ>`` header + 25-byte null sentinel).
 """
 
 from __future__ import annotations
@@ -118,13 +119,16 @@ def read_fbx(path: str | Path) -> tuple[int, list[FbxNode], bytes]:
     if not data.startswith(FBX_HEADER):
         raise ValueError("Not an FBX binary file")
     ver = struct.unpack_from("<I", data, 23)[0]
-    if ver >= 7500:
-        raise NotImplementedError(f"FBX version {ver} (>= 7500) uses 64-bit offsets; not supported")
+    # FBX 7500+ (FBX 2016+) uses 64-bit offsets; _read_node handles the <QQQ>
+    # header for ver >= 7500. The root-terminator peek matches the offset width
+    # (<Q> for 7500+, <I> otherwise) so a 64-bit end_offset is never mis-read
+    # as the zero terminator.
     pos = 27
+    offset_fmt = "<Q" if ver >= 7500 else "<I"
     roots: list[FbxNode] = []
     while pos < len(data):
         # Peek at end_offset; if 0, that's the root-level terminator
-        end_offset = struct.unpack_from("<I", data, pos)[0]
+        end_offset = struct.unpack_from(offset_fmt, data, pos)[0]
         if end_offset == 0:
             break
         node, pos = _read_node(data, pos, ver)
@@ -280,7 +284,11 @@ def mirror_fbx_handedness(src_path: str | Path, dst_path: str | Path) -> bool:
     """
     try:
         ver, roots, footer = read_fbx(src_path)
-    except (ValueError, NotImplementedError):
+    except (ValueError, NotImplementedError, struct.error):
+        # struct.error: a truncated/corrupt FBX (e.g. a malformed 7500 file
+        # whose 64-bit header runs past EOF). Before 7500 reads were enabled
+        # such files hit the early NotImplementedError; now they reach the
+        # struct unpack. Degrade to a raw upload rather than crash the phase.
         return False
 
     geoms = _find_geometry_nodes(roots)

@@ -319,25 +319,16 @@ cache. The items below are where code or docs are stale or wrong.
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
 
-- [ ] **P1 — `read_fbx` rejects FBX version >= 7500 (64-bit offsets).**
-  `fbx_binary.py:read_fbx` raises `NotImplementedError` for FBX 7500+
-  (FBX 2016 and newer — extremely common for modern Unity assets). Effect:
-  `mirror_fbx_handedness` catches the error and returns `False`, so the
-  pipeline (`pipeline.py:1122-1123`) uploads the **raw original** — no
-  handedness mirror, no bounding-box computation, no sub-mesh resolution.
-  Modern FBX silently degrade. Found in the trash-dash conversion run
-  (2026-05-18): `Cat.fbx` / `CatBase.fbx` / `Racoon.fbx` are all 7500;
-  raw upload of these heavily-rigged multi-skin character FBX is rejected
-  by Roblox Open Cloud with "Failed to parse the uploaded file".
-  NEARLY DONE: `_read_node` / `_write_node` ALREADY handle the 7500 64-bit
-  EndOffset / NumProperties / PropertyListLen header fields + 25-byte NULL sentinel (the
-  `ver >= 7500` `<QQQ>`/24-byte branches are implemented in tree). The ONLY thing still
-  rejecting 7500 is the early `raise NotImplementedError` gate at the top of `read_fbx` —
-  remove it so the existing 64-bit path runs (then test against a real 7500 file). Keep the
-  32-bit path — Blender still exports 7400. Note: even with 7500 read support, complex skinned-character FBX still
-  cannot go through the Open Cloud mesh endpoint (see next item) — this fix recovers
-  handedness + bbox for *static* 7500 meshes. Alternative worth a spike: Open Cloud now
-  accepts `.gltf/.glb` for Model uploads (Oct 2025), which may bypass FBX patching entirely.
+- **P1 — `read_fbx` rejects FBX version >= 7500 (64-bit offsets). — DONE (2026-06-20).**
+  Removed the early `raise NotImplementedError` gate in `fbx_binary.read_fbx`; the
+  already-implemented `<QQQ>` 64-bit `_read_node`/`_write_node` path now runs, and the
+  root-terminator peek is width-aware (`<Q>` for 7500+). `mirror_fbx_handedness` also catches
+  `struct.error` so a truncated/corrupt 7500 file still degrades to a raw upload instead of
+  crashing the upload phase. Verified end-to-end on real 7500 files (trash-dash meshes:
+  read + handedness mirror round-trip, geometry preserved) + dependency-free synthetic
+  round-trip/truncation regression tests. Recovers handedness + bbox for *static* 7500 meshes.
+  STILL OUT OF SCOPE (see next item): complex skinned-character FBX cannot go through the Open
+  Cloud mesh endpoint regardless; `.gltf/.glb` Model uploads (Oct 2025) remain a possible spike.
 
 - [ ] **P2 — Skinned/animation-only FBX uploaded as meshes and rejected.**
   Two sub-cases found in the trash-dash run (2026-05-18):
