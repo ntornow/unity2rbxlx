@@ -500,14 +500,20 @@ def _token_is_shadowing_member(token: str, class_body: str) -> bool:
           ``static`` / ``const``.
     """
     t = re.escape(token)
+    # Only a declaration at THIS class's OWN top level (brace-depth 0 within
+    # ``class_body``, the span BETWEEN the class braces) shadows the outer field.
+    # A same-named member declared INSIDE a nested type (depth > 0) belongs to
+    # that nested type, not this class, and must NOT make the outer class abstain
+    # — mirrors ``_iter_method_bodies`` gating method heads on ``_depth_at == 0``.
     # (i) PROPERTY: ``<Type> <token> =>`` or ``<Type> <token> {``. Require a
     # preceding type token so a bare reference (``container { ... }`` inside a
     # method) cannot match — a declaration is ``<Type> <token>`` then ``=>``/``{``.
-    if re.search(
+    for pm in re.finditer(
         rf"\b[A-Za-z_][\w.<>\[\],?\s]*?\b{t}\s*(?:=>|\{{)",
         class_body,
     ):
-        return True
+        if _depth_at(class_body, pm.start()) == 0:
+            return True
     # (ii) MODIFIED: a ``new``/``static``/``const`` member named ``token``. Match
     # a modifier list (one or more access/decl keywords, at least one of which is
     # new/static/const) followed by ``<Type> <token>`` terminated by ``;``/``=``/
@@ -517,6 +523,8 @@ def _token_is_shadowing_member(token: str, class_body: str) -> bool:
         rf"((?:\b(?:{_MODS})\b\s+)+)[A-Za-z_][\w.<>\[\],?]*\s+{t}\s*(?:[;={{(]|=>)",
         class_body,
     ):
+        if _depth_at(class_body, dm.start()) != 0:
+            continue
         mods = dm.group(1)
         if re.search(r"\b(?:new|static|const)\b", mods):
             return True

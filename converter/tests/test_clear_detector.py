@@ -454,6 +454,58 @@ public class Derived : Base {
     assert detect_cleared_containers(src, "Derived") == frozenset()
 
 
+def test_nested_type_member_shadow_does_not_block_outer():
+    """DEPTH GATE for the shadow check: a same-named member declared INSIDE a
+    NESTED type belongs to that nested type, NOT the outer class — so it must
+    NOT make the outer class abstain. The OUTER class has a top-level serialized
+    ``container`` field doing the canonical clear+spawn (which emits), and a
+    nested type declares its OWN ``public Transform container { get; }`` property
+    (a shadow form, but at brace-depth > 0). The outer class must STILL emit
+    ``{"container"}``.
+
+    Pre-fix ``_token_is_shadowing_member`` scanned the WHOLE class body
+    (including nested types) and the nested property wrongly made the outer
+    class abstain → EMPTY. After the depth gate, only depth-0 declarations
+    shadow → the outer class emits ``container``."""
+    src = _wrap("Outer", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+
+    class Config {
+        public Transform container { get; private set; }
+    }
+""")
+    assert detect_cleared_containers(src, "Outer") == frozenset({"container"})
+
+
+def test_top_level_property_member_shadow_still_abstains():
+    """Round-3 regression: a TOP-LEVEL (depth-0) ``public new Transform container
+    => ...;`` expression-bodied property still shadows the inherited serialized
+    field → abstain (EMPTY). The depth gate must NOT loosen depth-0 shadows."""
+    src = """
+using UnityEngine;
+
+public class Base : MonoBehaviour {
+    public Transform container;
+}
+
+public class Derived : Base {
+    public GameObject prefab;
+    public ScrollRect scroll;
+    public new Transform container => scroll.content;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+}
+"""
+    assert detect_cleared_containers(src, "Derived") == frozenset()
+
+
 def test_plain_serialized_field_container_still_emits():
     """Positive regression: a PLAIN instance-field container (no property syntax,
     no ``new``/``static``/``const`` modifier) with the canonical clear+spawn is
