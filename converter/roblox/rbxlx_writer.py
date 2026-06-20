@@ -364,12 +364,7 @@ def _make_particle_emitter(parent_xml: ET.Element, pe: RbxParticleEmitter) -> No
         nr_rspd = ET.SubElement(props, "NumberRange", name="RotSpeed")
         nr_rspd.text = f"{_finite_val(pe.rot_speed_min)} {_finite_val(pe.rot_speed_max)}"
     # Attributes from Unity modules without direct Roblox equivalents
-    pe_attrs = getattr(pe, "attributes", None) or {}
-    if pe_attrs:
-        encoded = _encode_attributes(pe_attrs)
-        if encoded:
-            elem = ET.SubElement(props, "BinaryString", name="AttributesSerialize")
-            elem.text = encoded
+    _write_attributes(props, getattr(pe, "attributes", None) or {})
 
 
 def _make_sound(parent_xml: ET.Element, sound: RbxSound) -> None:
@@ -706,11 +701,7 @@ def _make_ui_element(parent_xml: ET.Element, elem: RbxUIElement) -> None:
         _add_token(layout_props, "VerticalAlignment", v_map.get(v_align, 0))
 
     # Serialize attributes (e.g., _OnClick for button event handlers)
-    elem_attrs = getattr(elem, "attributes", None) or {}
-    if elem_attrs:
-        encoded = _encode_attributes(elem_attrs)
-        attr_elem = ET.SubElement(props, "BinaryString", name="AttributesSerialize")
-        attr_elem.text = encoded
+    _write_attributes(props, getattr(elem, "attributes", None) or {})
 
     # Recurse into children
     children = getattr(elem, "children", None) or []
@@ -886,6 +877,19 @@ def _encode_attributes(attrs: dict[str, RbxAttrValue]) -> str:
             buf.append(0x06)  # Float64 type
             buf.extend(struct.pack('<d', value))
     return base64.b64encode(bytes(buf)).decode('ascii')
+
+
+def _write_attributes(props: ET.Element, attrs: dict[str, RbxAttrValue]) -> None:
+    """Serialize ``attrs`` as the canonical ``AttributesSerialize`` BinaryString
+    under ``props``. No-op when the dict is empty or encodes to nothing. This is
+    the single writer of ``name="AttributesSerialize"`` — every instance that
+    carries Unity-derived attributes routes through here."""
+    if not attrs:
+        return
+    encoded = _encode_attributes(attrs)
+    if encoded:
+        elem = ET.SubElement(props, "BinaryString", name="AttributesSerialize")
+        elem.text = encoded
 
 
 def _emit_collection_tags(props: ET.Element, tags: list[str]) -> None:

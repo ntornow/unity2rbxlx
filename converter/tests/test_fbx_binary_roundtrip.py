@@ -17,6 +17,8 @@ import numpy as np
 import pytest
 
 from converter.fbx_binary import (
+    FbxNode,
+    FbxProperty,
     _find_geometry_nodes,
     _negate_axis,
     mirror_fbx_handedness,
@@ -178,3 +180,67 @@ class TestMirrorHandedness:
 
         for orig, after in zip(_vertex_arrays(original_roots), _vertex_arrays(twice_roots)):
             np.testing.assert_allclose(after, orig, atol=1e-9)
+
+
+class TestFbx7500SixtyFourBit:
+    """FBX 7500+ (FBX 2016+) uses 64-bit offsets. read_fbx used to reject these
+    outright with NotImplementedError, so every modern Unity FBX silently
+    degraded to face-decal rendering (no handedness mirror, no bbox). The
+    early gate is gone; these guard the 64-bit read/write path with no external
+    fixture so they run even when the SimpleFPS submodule is absent."""
+
+    def _build_geometry_tree(self) -> FbxNode:
+        verts = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        geom = FbxNode(
+            name=b"Geometry",
+            properties=[FbxProperty("L", 1234)],
+            children=[FbxNode(name=b"Vertices", properties=[FbxProperty("d", verts)])],
+        )
+        return FbxNode(name=b"Objects", children=[geom])
+
+    def test_read_does_not_reject_7500(self, tmp_path: Path) -> None:
+        out = tmp_path / "v7500.fbx"
+        write_fbx(out, 7500, [self._build_geometry_tree()])
+        ver, _roots, _footer = read_fbx(out)  # no NotImplementedError
+        assert ver == 7500
+
+    def test_roundtrip_preserves_structure_and_vertices(self, tmp_path: Path) -> None:
+        out = tmp_path / "v7500.fbx"
+        write_fbx(out, 7500, [self._build_geometry_tree()])
+
+        _ver, roots, _footer = read_fbx(out)
+        geoms = _find_geometry_nodes(roots)
+        assert len(geoms) == 1
+        vchild = next(c for c in geoms[0].children if c.name == b"Vertices")
+        assert list(vchild.properties[0].value) == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+    def test_mirror_handedness_degrades_on_truncated_7500(self, tmp_path: Path) -> None:
+        """A malformed/truncated 7500 file must degrade to False (raw upload),
+        not crash the upload phase. With the early reject gate gone, the 64-bit
+        header unpack runs off the end of the buffer and raises struct.error;
+        mirror_fbx_handedness must absorb it like any unsupported file."""
+        full = tmp_path / "full7500.fbx"
+        write_fbx(full, 7500, [self._build_geometry_tree()])
+        # Lop off most of the body so the 64-bit node header unpack overruns.
+        raw = full.read_bytes()
+        truncated = tmp_path / "trunc7500.fbx"
+        truncated.write_bytes(raw[:30])  # header + version + a few bytes only
+        dst = tmp_path / "out.fbx"
+        assert mirror_fbx_handedness(truncated, dst) is False
+        assert not dst.exists()
+
+    def test_mirror_handedness_roundtrips_7500(self, tmp_path: Path) -> None:
+        src = tmp_path / "src7500.fbx"
+        dst = tmp_path / "dst7500.fbx"
+        write_fbx(src, 7500, [self._build_geometry_tree()])
+
+        assert mirror_fbx_handedness(src, dst)
+        ver, roots, _footer = read_fbx(dst)
+        assert ver == 7500
+        # X and Y negated, Z preserved (the 2-axis handedness flip)
+        vchild = next(
+            c for c in _find_geometry_nodes(roots)[0].children if c.name == b"Vertices"
+        )
+        assert list(vchild.properties[0].value) == [
+            0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0,
+        ]
