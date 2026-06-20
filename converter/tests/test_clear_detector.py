@@ -1,0 +1,549 @@
+"""gap#4 — the SOUND clear-intent container detector.
+
+``detect_cleared_containers`` (unity/script_analyzer.py) returns the serialized
+container FIELD NAMES a class provably clears-then-populates in a SINGLE method
+via the canonical ``foreach (Transform c in container) Destroy(c.gameObject)`` +
+``Instantiate(prefab, container)`` shape. It is the replacement for the unsound
+"references any asset/prefab → delete the UI host's authored children" gate that
+destroyed real UI.
+
+The detector is biased HARD to abstain: over-detection deletes authored UI, so
+EVERY ambiguity case returns the empty set. These tests pin both the positive
+canonical shape and each abstain case enumerated in the design.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from unity.script_analyzer import analyze_script, detect_cleared_containers
+
+
+def _wrap(class_name: str, body: str) -> str:
+    return f"""
+using UnityEngine;
+
+public class {class_name} : MonoBehaviour {{
+{body}
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Positive — the canonical clear-all-then-populate shape.
+# ---------------------------------------------------------------------------
+
+def test_canonical_clear_then_spawn_emits_field():
+    src = _wrap("InventoryController", """
+    public Transform containerTransform;
+    public GameObject itemPrefab;
+
+    void Refresh() {
+        foreach (Transform c in containerTransform) {
+            Destroy(c.gameObject);
+        }
+        Instantiate(itemPrefab, containerTransform);
+    }
+""")
+    assert detect_cleared_containers(src, "InventoryController") == frozenset(
+        {"containerTransform"}
+    )
+
+
+def test_canonical_destroy_no_gameobject_suffix_emits():
+    src = _wrap("Grid", """
+    public Transform grid;
+    public GameObject cell;
+    void Build() {
+        foreach (Transform t in grid) Destroy(t);
+        Instantiate(cell, grid);
+    }
+""")
+    assert detect_cleared_containers(src, "Grid") == frozenset({"grid"})
+
+
+def test_setparent_spawn_after_clear_emits():
+    src = _wrap("ListView", """
+    public Transform content;
+    public GameObject rowPrefab;
+    void Reload() {
+        foreach (Transform child in content) Destroy(child.gameObject);
+        var row = Instantiate(rowPrefab);
+        row.transform.SetParent(content);
+    }
+""")
+    assert detect_cleared_containers(src, "ListView") == frozenset({"content"})
+
+
+def test_destroychildren_clear_emits():
+    src = _wrap("Roster", """
+    public Transform listRoot;
+    public GameObject entry;
+    void Repopulate() {
+        listRoot.DestroyChildren();
+        Instantiate(entry, listRoot);
+    }
+""")
+    assert detect_cleared_containers(src, "Roster") == frozenset({"listRoot"})
+
+
+def test_two_containers_each_canonical_union():
+    src = _wrap("DualPanel", """
+    public Transform left;
+    public Transform right;
+    public GameObject p;
+    void RefreshLeft() {
+        foreach (Transform c in left) Destroy(c.gameObject);
+        Instantiate(p, left);
+    }
+    void RefreshRight() {
+        foreach (Transform c in right) Destroy(c.gameObject);
+        Instantiate(p, right);
+    }
+""")
+    assert detect_cleared_containers(src, "DualPanel") == frozenset(
+        {"left", "right"}
+    )
+
+
+def test_instantiate_worldpositionstays_false_emits():
+    """``Instantiate(prefab, container, false)`` — the 3-arg
+    worldPositionStays overload — captures the 2nd (parent) arg, NOT the
+    trailing ``false``, so the cleared container is detected."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container, false);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+def test_instantiate_worldpositionstays_true_emits():
+    """``Instantiate(prefab, container, true)`` — captures the 2nd (parent)
+    arg, NOT the trailing ``true``."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container, true);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+def test_instantiate_position_rotation_parent_form_abstains():
+    """The 4-arg ``Instantiate(prefab, pos, rot, container)`` overload captures
+    the 2nd arg (``pos``, a Vector3 position expression) which is NOT a cleared
+    container field, so the detector correctly ABSTAINS — even though
+    ``container`` is genuinely cleared, the spawn does not resolve to it."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, pos, rot, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Abstain cases — each returns the empty set.
+# ---------------------------------------------------------------------------
+
+def test_local_var_shadow_container_abstains():
+    """A method-LOCAL ``var container = ...`` that SHADOWS a serialized field
+    of the same name: the canonical clear+spawn target the LOCAL, not the
+    field, so the resolver would suppress the WRONG (real) field's UI subtree.
+    A serialized field is declared at CLASS level, never in a method — so a
+    container token declared as a local CANNOT be proven to be the field →
+    ABSTAIN."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject itemPrefab;
+    void Rebuild() {
+        var container = someOtherTransform;
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(itemPrefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_parameter_container_abstains():
+    """The container token is a method PARAMETER, not the serialized field, so
+    the cleared transform is whatever the caller passed — abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Fill(Transform container) {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_guarded_clear_abstains():
+    """The clear is wrapped in an ``if`` (guard asymmetry) → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    bool refresh;
+    void Tick() {
+        if (refresh) {
+            foreach (Transform c in container) Destroy(c.gameObject);
+        }
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_range_for_clear_abstains():
+    """A range ``for`` clear is not the canonical full-clear shape → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        for (int i = 0; i < container.childCount; i++) {
+            Destroy(container.GetChild(i).gameObject);
+        }
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_filtered_destroy_abstains():
+    """A per-child ``if`` filter inside the foreach is a partial clear → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        foreach (Transform c in container) {
+            if (c.CompareTag("Keep")) continue;
+            Destroy(c.gameObject);
+        }
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_component_filtered_destroy_abstains():
+    """A component-gated destroy is not an unconditional full clear → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        foreach (Transform c in container) {
+            if (c.GetComponent<Image>() != null) Destroy(c.gameObject);
+        }
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_wrong_container_abstains():
+    """Clears ``C`` but spawns into ``D`` (no clear of D) → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform containerC;
+    public Transform containerD;
+    public GameObject prefab;
+    void Tick() {
+        foreach (Transform c in containerC) Destroy(c.gameObject);
+        Instantiate(prefab, containerD);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_pre_clear_spawn_abstains():
+    """A spawn into ``C`` BEFORE the clear breaks dominance → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        Instantiate(prefab, container);
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_cross_method_clear_and_spawn_abstains():
+    """Clear in one method, spawn in another — not a same-method shape → abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Clear() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+    }
+    void Spawn() {
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_transform_self_target_abstains():
+    """A spawn/clear over ``transform`` (the host's own transform, not a
+    serialized container field) is excluded."""
+    src = _wrap("Ctrl", """
+    public GameObject prefab;
+    void Tick() {
+        foreach (Transform c in transform) Destroy(c.gameObject);
+        Instantiate(prefab, transform);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_lambda_split_abstains():
+    """A clear/spawn moved into a lambda body → abstain (deferred scope)."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        Schedule(() => {
+            foreach (Transform c in container) Destroy(c.gameObject);
+            Instantiate(prefab, container);
+        });
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_clear_only_no_spawn_abstains():
+    """A bare clear with no Instantiate into the container → abstain (not a
+    populate)."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    void Tick() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_nested_class_clear_not_attributed_to_outer():
+    """FIX 1 (depth-1 enforcement): a canonical clear+spawn declared in a
+    NESTED class inside the MonoBehaviour must NOT be attributed to the OUTER
+    class. ``_iter_method_bodies`` only returns methods at the class body's own
+    depth (0 within the between-braces source), so the nested method is
+    skipped → the outer class clears nothing → abstain.
+
+    Pre-fix this mis-attributed the nested method to the outer class and
+    spuriously emitted ``container`` — an unsound (UI-destroying) hit."""
+    src = _wrap("Outer", """
+    public Transform container;
+    public GameObject prefab;
+
+    class Inner {
+        public Transform container;
+        public GameObject prefab;
+        void Refresh() {
+            foreach (Transform c in container) Destroy(c.gameObject);
+            Instantiate(prefab, container);
+        }
+    }
+""")
+    assert detect_cleared_containers(src, "Outer") == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — unrelated lambda no longer blanket-abstains; depth gate stays sound.
+# ---------------------------------------------------------------------------
+
+def test_unrelated_lambda_still_emits():
+    """FIX 2 (drop blanket ``=>`` abstain): an UNRELATED lambda elsewhere in a
+    method that ALSO has a legit depth-1 clear+spawn no longer suppresses the
+    container. The depth gates keep soundness; an unrelated lambda does not
+    move the real clear/spawn out of depth 1."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    public System.Collections.Generic.List<Item> items;
+    void Refresh() {
+        items.ForEach(x => x.Init());
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+def test_lambda_containing_spawn_still_abstains_via_depth_gate():
+    """FIX 2 soundness: a clear+spawn that lives INSIDE a lambda body sits at
+    brace-depth > 1, so the ``clear_depth != 1`` gate abstains — even without
+    the removed blanket ``=>`` guard."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Tick() {
+        Schedule(() => {
+            foreach (Transform c in container) Destroy(c.gameObject);
+            Instantiate(prefab, container);
+        });
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Member-shadow abstention — a token THIS class declares as a property or a
+# new/static/const member HIDES an inherited serialized field of the same name;
+# the clear used the hiding member, not the field the resolver suppresses by
+# name, so the detector must abstain (over-detection destroys authored UI).
+# ---------------------------------------------------------------------------
+
+def test_property_member_shadow_abstains():
+    """A ``public new Transform container => ...;`` expression-bodied PROPERTY
+    HIDES the inherited serialized ``Base.container`` field. The clear+spawn use
+    the property accessor, not the field — abstain so the resolver does not
+    suppress (destroy) the authored UI under ``Base.container``."""
+    src = """
+using UnityEngine;
+
+public class Base : MonoBehaviour {
+    public Transform container;
+}
+
+public class Derived : Base {
+    public GameObject prefab;
+    public ScrollRect scroll;
+    public new Transform container => scroll.content;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+}
+"""
+    assert detect_cleared_containers(src, "Derived") == frozenset()
+
+
+def test_static_member_shadow_abstains():
+    """A ``public new static Transform container;`` member HIDES the inherited
+    serialized ``Base.container`` instance field — a static member is not the
+    per-instance serialized field the resolver would suppress, so abstain."""
+    src = """
+using UnityEngine;
+
+public class Base : MonoBehaviour {
+    public Transform container;
+}
+
+public class Derived : Base {
+    public GameObject prefab;
+    public new static Transform container;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+}
+"""
+    assert detect_cleared_containers(src, "Derived") == frozenset()
+
+
+def test_nested_type_member_shadow_does_not_block_outer():
+    """DEPTH GATE for the shadow check: a same-named member declared INSIDE a
+    NESTED type belongs to that nested type, NOT the outer class — so it must
+    NOT make the outer class abstain. The OUTER class has a top-level serialized
+    ``container`` field doing the canonical clear+spawn (which emits), and a
+    nested type declares its OWN ``public Transform container { get; }`` property
+    (a shadow form, but at brace-depth > 0). The outer class must STILL emit
+    ``{"container"}``.
+
+    Pre-fix ``_token_is_shadowing_member`` scanned the WHOLE class body
+    (including nested types) and the nested property wrongly made the outer
+    class abstain → EMPTY. After the depth gate, only depth-0 declarations
+    shadow → the outer class emits ``container``."""
+    src = _wrap("Outer", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+
+    class Config {
+        public Transform container { get; private set; }
+    }
+""")
+    assert detect_cleared_containers(src, "Outer") == frozenset({"container"})
+
+
+def test_top_level_property_member_shadow_still_abstains():
+    """Round-3 regression: a TOP-LEVEL (depth-0) ``public new Transform container
+    => ...;`` expression-bodied property still shadows the inherited serialized
+    field → abstain (EMPTY). The depth gate must NOT loosen depth-0 shadows."""
+    src = """
+using UnityEngine;
+
+public class Base : MonoBehaviour {
+    public Transform container;
+}
+
+public class Derived : Base {
+    public GameObject prefab;
+    public ScrollRect scroll;
+    public new Transform container => scroll.content;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+}
+"""
+    assert detect_cleared_containers(src, "Derived") == frozenset()
+
+
+def test_plain_serialized_field_container_still_emits():
+    """Positive regression: a PLAIN instance-field container (no property syntax,
+    no ``new``/``static``/``const`` modifier) with the canonical clear+spawn is
+    NOT a shadowing member, so it STILL emits."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+# ---------------------------------------------------------------------------
+# Wiring — analyze_script populates ScriptInfo.cleared_container_fields.
+# ---------------------------------------------------------------------------
+
+def test_analyze_script_populates_field(tmp_path):
+    cs = tmp_path / "InventoryController.cs"
+    cs.write_text(_wrap("InventoryController", """
+    public Transform containerTransform;
+    public GameObject itemPrefab;
+    void Refresh() {
+        foreach (Transform c in containerTransform) Destroy(c.gameObject);
+        Instantiate(itemPrefab, containerTransform);
+    }
+"""), encoding="utf-8")
+    info = analyze_script(cs)
+    assert info.cleared_container_fields == frozenset({"containerTransform"})
+
+
+def test_analyze_script_empty_when_no_clear(tmp_path):
+    cs = tmp_path / "Plain.cs"
+    cs.write_text(_wrap("Plain", """
+    public GameObject prefab;
+    void Tick() { Instantiate(prefab); }
+"""), encoding="utf-8")
+    info = analyze_script(cs)
+    assert info.cleared_container_fields == frozenset()
