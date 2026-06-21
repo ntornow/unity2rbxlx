@@ -4347,3 +4347,183 @@ class TestSliderFillPathResize:
         second = run_packs([s])
         assert second == 0
         assert s.source == after_first
+
+    # ----------------------------------------------------------------------
+    # SECOND SHAPE: the faithful GENERIC inlined HUD (NO setSliderValue). The
+    # fill is resolved inline by a guessed name and resized with a full UDim2.
+    # The pack must rewrite the RESOLUTION to the injected _resolveSliderFill
+    # helper while leaving the resize line as-is.
+    # ----------------------------------------------------------------------
+
+    # The REAL AI-emitted generic HUD shape (captured from generic-hud-shape
+    # .luau — the faithful OOP require-module HUD). Embedded verbatim so the
+    # rewrite test is tautology-free without depending on the gitignored output.
+    REAL_GENERIC_HUD = (
+        'local Player = require(game:GetService("ReplicatedStorage")'
+        ':FindFirstChild("Player", true) or game:GetService("ServerStorage")'
+        ':FindFirstChild("Player", true))\n'
+        "\n"
+        "local HudControl = {}\n"
+        "HudControl.__index = HudControl\n"
+        "\n"
+        "function HudControl.new(config)\n"
+        "\tlocal self = setmetatable({}, HudControl)\n"
+        "\treturn self\n"
+        "end\n"
+        "\n"
+        "function HudControl:Awake()\n"
+        "\tlocal rs = game:GetService(\"ReplicatedStorage\")\n"
+        "\n"
+        "\tlocal function ensureEvent(name)\n"
+        "\t\tlocal existing = rs:FindFirstChild(name)\n"
+        "\t\tif existing then return existing end\n"
+        "\t\tlocal b = Instance.new(\"BindableEvent\")\n"
+        "\t\tb.Name = name\n"
+        "\t\tb.Parent = rs\n"
+        "\t\treturn b\n"
+        "\tend\n"
+        "\n"
+        "\tlocal moduleFrame  = self.gameObject:FindFirstChild(\"Module\")\n"
+        "\tlocal itemModFrame = self.gameObject:FindFirstChild(\"ItemModule\")\n"
+        "\tlocal ammoGroup    = moduleFrame and moduleFrame:FindFirstChild(\"Ammo\")\n"
+        "\tlocal ammoTotalLbl = ammoGroup and ammoGroup:FindFirstChild(\"Total\")\n"
+        "\tlocal ammoCurLbl   = ammoGroup and ammoGroup:FindFirstChild(\"Cur\")\n"
+        "\tlocal healthFrame  = moduleFrame and moduleFrame:FindFirstChild(\"Health\")\n"
+        "\tlocal healthFill   = healthFrame and healthFrame:FindFirstChild(\"Fill\")\n"
+        "\tlocal pauseMenu    = self.gameObject:FindFirstChild(\"Pause\")\n"
+        "\n"
+        "\tif ammoTotalLbl then\n"
+        "\t\tammoTotalLbl.Text = tostring(Player.maxAmmo)\n"
+        "\tend\n"
+        "\n"
+        "\tlocal healthEvt = ensureEvent(\"HealthUpdate\")\n"
+        "\tself.host:connect(healthEvt.Event, function(curHealth)\n"
+        "\t\tif healthFill then\n"
+        "\t\t\tlocal pct = curHealth / Player.maxHealth\n"
+        "\t\t\thealthFill.Size = UDim2.new(pct, 0, 1, 0)\n"
+        "\t\tend\n"
+        "\tend)\n"
+        "\n"
+        "\tlocal itemEvt = ensureEvent(\"ItemUpdate\")\n"
+        "\tself.host:connect(itemEvt.Event, function(itemName)\n"
+        "\t\tlocal item = itemModFrame and itemModFrame:FindFirstChild(itemName)\n"
+        "\t\tif item then\n"
+        "\t\t\titem.Visible = true\n"
+        "\t\tend\n"
+        "\tend)\n"
+        "end\n"
+        "\n"
+        "return HudControl\n"
+    )
+
+    def _generic_hud_script(self) -> RbxScript:
+        return RbxScript(
+            name="HudControl",
+            source=self.REAL_GENERIC_HUD,
+            script_type="ModuleScript",
+        )
+
+    def test_rewrites_generic_inlined_shape(self) -> None:
+        """(a) The faithful generic inlined HUD gets its guessed-fill RESOLUTION
+        rewritten to the injected _resolveSliderFill helper; the resize line is
+        left as-is; unrelated FindFirstChild lines are untouched."""
+        s = self._generic_hud_script()
+        n = run_packs([s])
+        assert n >= 1
+        # Resolution rewritten to the helper (generic — frame receiver captured).
+        assert "local healthFill = _resolveSliderFill(healthFrame)" in s.source
+        # Helper injected once (definition, not a call site).
+        assert "local function _resolveSliderFill(frame)" in s.source
+        assert s.source.count("local function _resolveSliderFill(frame)") == 1
+        # Reads the converter-emitted attribute, fail-loud segment walk.
+        assert 'frame:GetAttribute("SliderFillElement")' in s.source
+        assert 'local nextSlash = string.find(path, "/", cursor, true)' in s.source
+        assert 'if segment == "" then' in s.source
+        # The guessed-fill resolution literal is GONE.
+        assert 'healthFrame:FindFirstChild("Fill")' not in s.source
+        # The resize line is LEFT AS-IS (already a full UDim2 for the LTR case).
+        assert "healthFill.Size = UDim2.new(pct, 0, 1, 0)" in s.source
+        # Unrelated inline FindFirstChild lines (variable arg / non-guessed
+        # literal) are untouched — no over-rewrite.
+        assert 'self.gameObject:FindFirstChild("Module")' in s.source
+        assert "itemModFrame:FindFirstChild(itemName)" in s.source
+        assert 'moduleFrame:FindFirstChild("Health")' in s.source
+
+    def test_generic_shape_idempotent_twice_call(self) -> None:
+        """(b) Idempotency: a second run_packs over the rewritten generic HUD
+        makes 0 edits and is byte-identical (helper injected once, no guessed
+        literal remains to re-match)."""
+        s = self._generic_hud_script()
+        first = run_packs([s])
+        assert first >= 1
+        after_first = s.source
+        second = run_packs([s])
+        assert second == 0
+        assert s.source == after_first
+
+    def test_generic_shape_handles_plain_assignment_form(self) -> None:
+        """Both emitted forms rewrite: the plain
+        ``local x = frame:FindFirstChild("Fill")`` (no ``and`` guard)."""
+        src = (
+            "local Player = require(x)\n"
+            "\n"
+            "local HudControl = {}\n"
+            "\n"
+            "function HudControl:Awake()\n"
+            '\tlocal healthFrame = self.gameObject:FindFirstChild("Health")\n'
+            '\tlocal healthFill = healthFrame:FindFirstChild("Fill")\n'
+            "\tif healthFill then healthFill.Size = UDim2.new(p, 0, 1, 0) end\n"
+            "end\n"
+        )
+        s = RbxScript(name="HudControl", source=src, script_type="ModuleScript")
+        n = run_packs([s])
+        assert n >= 1
+        assert "local healthFill = _resolveSliderFill(healthFrame)" in s.source
+        assert "local function _resolveSliderFill(frame)" in s.source
+        # The "Health" resolution (non-guessed literal) is untouched.
+        assert 'self.gameObject:FindFirstChild("Health")' in s.source
+
+    def test_generic_guard_warns_on_unrewritten_inline(self, caplog) -> None:
+        """(d) The coverage guard LOUDLY warns when an inlined guessed-fill
+        resolution survives the pack (here a parenthesised receiver the rewrite
+        abstains on rather than emitting a broken call)."""
+        import logging
+        src = (
+            "function Hud:Awake()\n"
+            '\tlocal f = (a or b):FindFirstChild("Fill")\n'
+            "end\n"
+        )
+        s = RbxScript(name="HudControl", source=src, script_type="ModuleScript")
+        with caplog.at_level(logging.WARNING):
+            run_packs([s])
+        # Abstained — no broken call emitted.
+        assert '(a or b):FindFirstChild("Fill")' in s.source
+        assert "_resolveSliderFill" not in s.source
+        assert any(
+            "slider_fill_path_resize" in r.message
+            and "inlined guessed-fill" in r.message
+            for r in caplog.records
+        ), "un-rewritten inlined guessed-fill resolution must be loudly flagged"
+
+    def test_legacy_setter_still_rewritten_no_regression(self) -> None:
+        """(c) The legacy ``setSliderValue`` shape STILL gets rewritten to the
+        canonical setter (no regression) and does NOT inject the inline helper
+        (the setter body owns its own path resolution)."""
+        s = self._hud_script()
+        n = run_packs([s])
+        assert n >= 1
+        assert packs_module._CANONICAL_SLIDER_SETTER in s.source
+        assert 'slider:GetAttribute("SliderFillElement")' in s.source
+        assert 'FindFirstChild("Fill")' not in s.source
+        # The inline helper is NOT injected for the legacy-only shape.
+        assert "local function _resolveSliderFill(frame)" not in s.source
+
+    def test_inline_resolution_inside_setter_not_double_handled(self) -> None:
+        """A ``slider:FindFirstChild("Fill")`` INSIDE a setSliderValue body is
+        owned by the legacy span rewrite, NOT the inline rewrite (no helper
+        injected, no broken double-rewrite)."""
+        s = self._hud_script()  # legacy REAL_GUESSED_SETTER (guess inside body)
+        run_packs([s])
+        # Rewritten by the canonical setter path; inline helper not injected.
+        assert packs_module._CANONICAL_SLIDER_SETTER in s.source
+        assert "local function _resolveSliderFill(frame)" not in s.source

@@ -676,6 +676,23 @@ def transpile_with_contract(
         log.info("[contract] camera-mount equip lowering routed %d script(s) to the "
                  "server equip request (equipWeaponRemote:FireServer)", lowered_equip)
 
+    # Slider-fill lowering (allowlisted deterministic lowering pass): generic mode
+    # skips the legacy coherence packs, so the inlined guessed-fill slider
+    # resolution (``healthFrame:FindFirstChild("Fill")``) the AI emits for a Unity
+    # ``Slider.value`` resize is never rewritten and the health bar stays frozen.
+    # Rewrite each inlined guessed-fill resolution to ``_resolveSliderFill(<frame>)``
+    # (injecting the helper once per modified script), which reads the converter-
+    # emitted ``SliderFillElement`` relative path attribute and walks it to the real
+    # fill child. Keys on that DETERMINISTIC upstream attribute, NEVER on an
+    # AI-output fingerprint or a per-game string; shares ONE string-level
+    # implementation with the legacy pack (slider_fill_common). See
+    # slider_fill_lowering.py.
+    from converter.slider_fill_lowering import lower_slider_fill
+    lowered_slider = lower_slider_fill(transpilation.scripts)
+    if lowered_slider:
+        log.info("[contract] slider-fill lowering rewrote %d script(s) to resolve "
+                 "the SliderFillElement fill child", lowered_slider)
+
     # Roster-consumer re-lowering (allowlisted deterministic lowering pass,
     # Unit 4 Phase 2): rewrite each Addressables-label-roster consumer's
     # LoadDatabase/GetCharacter/dictionary/loaded to return the component object

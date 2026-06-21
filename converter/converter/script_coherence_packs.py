@@ -41,6 +41,36 @@ from converter.child_index_lowering import (
     source_has_child_index,
 )
 
+# The guessed-fill slider rewrite primitives (regexes, the ``_resolveSliderFill``
+# helper + its injection gate, the inline RESOLUTION rewrite, and the
+# setSliderValue/guessed-fill detectors) live in ``slider_fill_common`` so the
+# GENERIC contract-pipeline lowering (``slider_fill_lowering``) reuses the SAME
+# string-level implementation -- ONE source of truth for legacy + generic. Aliased
+# to the original private names so the legacy pack body below is unchanged.
+from converter.slider_fill_common import (
+    _ANY_GUESS_FILL_RE,
+    _SLIDER_FILL_HELPER,  # noqa: F401  (re-export)
+    _SLIDER_FILL_HELPER_DEF,  # noqa: F401  (re-export)
+    _SLIDER_FILL_HELPER_TOKEN,
+    _SLIDER_GUESS_FILL_SIGS,
+    _INLINE_GUESS_FILL_RE,  # noqa: F401  (re-export)
+    _FILL_RECEIVER_RE,  # noqa: F401  (re-export)
+)
+from converter.slider_fill_common import (
+    free_function_setter_start as _free_function_setter_start,
+)
+from converter.slider_fill_common import has_guessed_fill as _has_guessed_fill
+from converter.slider_fill_common import (
+    has_inline_guessed_fill as _has_inline_guessed_fill,
+)
+from converter.slider_fill_common import has_slider_setter as _has_slider_setter
+from converter.slider_fill_common import (
+    inject_slider_fill_helper as _inject_slider_fill_helper,  # noqa: F401
+)
+from converter.slider_fill_common import (
+    rewrite_inline_guessed_fill as _rewrite_inline_guessed_fill,
+)
+
 if TYPE_CHECKING:
     from core.roblox_types import RbxScript
 
@@ -5204,13 +5234,6 @@ def _fix_fps_camera_yaw_from_player_pivot(scripts: list["RbxScript"]) -> int:
 # loud (no guessed-name fallback), and resize the fill anchor/direction-aware.
 # ---------------------------------------------------------------------------
 
-# The guessed-fill anchor tokens (any one identifies the buggy body shape).
-_SLIDER_GUESS_FILL_SIGS = (
-    'slider:FindFirstChild("Fill")',
-    'FindFirstChild("Bar")',
-    'FindFirstChild("Foreground")',
-)
-
 # The path-aware, fail-loud, anchor/direction-aware replacement body. Generic:
 # reads ``SliderFillElement``/``SliderDirection`` off the slider Frame; no
 # hardcoded child names. Treats the incoming value as a [0,1] fraction (clamp),
@@ -5288,100 +5311,76 @@ _CANONICAL_SLIDER_SETTER = '''local function setSliderValue(slider, percentage)
 end'''
 
 
-def _has_guessed_fill(src: str) -> bool:
-    """True if ``src`` contains any guessed-fill anchor token."""
-    return any(sig in src for sig in _SLIDER_GUESS_FILL_SIGS)
-
-
-def _free_function_setter_start(src: str, from_index: int = 0) -> int:
-    """Index of the next FREE-FUNCTION ``setSliderValue`` definition start at or
-    after ``from_index``, or -1.
-
-    Covers ``local function setSliderValue`` and ``function setSliderValue``.
-    The apply rewrites ONLY this form, because the canonical replacement body
-    is itself a free function — splicing it over a method-form definition
-    (``function T:setSliderValue``) would break the call contract. A
-    method-form guessed-fill HUD is therefore left for the coverage guard to
-    flag LOUDLY rather than silently mangled.
-
-    Returns the EARLIEST matching start so a file with several free-function
-    setters is walked left-to-right (each span rewritten independently — a
-    second still-guessed setter is never silently skipped just because an
-    earlier one was rewritten).
-    """
-    best = -1
-    for anchor in (
-        "local function setSliderValue",
-        "function setSliderValue",
-    ):
-        i = src.find(anchor, from_index)
-        if i != -1 and (best == -1 or i < best):
-            best = i
-    return best
-
-
-def _has_slider_setter(src: str) -> bool:
-    """True if ``src`` defines a ``setSliderValue`` in ANY form — free-function
-    (``[local ]function setSliderValue``) OR method (``:setSliderValue``).
-
-    The broadened helper-name anchor shared by the detector and the coverage
-    guard so a method-form HUD is never silently skipped by both.
-    """
-    return (
-        _free_function_setter_start(src) != -1
-        or ":setSliderValue" in src
-    )
+# The guessed-fill slider rewrite primitives moved to ``slider_fill_common`` and
+# imported at the top of this module (aliased to their original private names):
+# ``_SLIDER_FILL_HELPER``/``_SLIDER_FILL_HELPER_TOKEN``/``_SLIDER_FILL_HELPER_DEF``,
+# ``_INLINE_GUESS_FILL_RE``/``_FILL_RECEIVER_RE``/``_ANY_GUESS_FILL_RE``,
+# ``_SLIDER_GUESS_FILL_SIGS``, and the detectors/rewriters
+# ``_has_guessed_fill``/``_free_function_setter_start``/``_has_slider_setter``/
+# ``_has_inline_guessed_fill``/``_inject_slider_fill_helper``/
+# ``_rewrite_inline_guessed_fill``. The GENERIC contract-pipeline lowering
+# (``slider_fill_lowering``) reuses the SAME string-level implementation.
 
 
 def _detect_slider_fill_resize(scripts: list["RbxScript"]) -> bool:
     """Fire when any script still contains a guessed-fill ``setSliderValue``
-    (free-function OR method form) that has not yet been rewritten.
+    (free-function OR method form) OR an inlined guessed-fill resolution
+    assignment that has not yet been rewritten.
 
     The presence of a guessed-fill token IS the per-setter signal: the canonical
-    rewritten body contains none of them, so a remaining guessed-fill token means
-    an un-rewritten guessed setter is still in the file — even if a SECOND setter
-    in the same file was already rewritten."""
+    rewritten body / injected helper contains none of them, so a remaining
+    guessed-fill token means an un-rewritten guessed shape is still in the file —
+    even if a SECOND setter in the same file was already rewritten."""
     for s in scripts:
         src = s.source or ""
         if _has_slider_setter(src) and _has_guessed_fill(src):
+            return True
+        if _has_inline_guessed_fill(src):
             return True
     return False
 
 
 def _guard_slider_fill_coverage(scripts: list["RbxScript"]) -> None:
-    """LOUD non-fire detector. The deterministic upstream signal is a script
-    defining a guessed-fill ``setSliderValue``. If after the pack any such body
-    remains un-rewritten (the AI reshaped the helper enough that the
-    span/identity gate abstained), ``log.warning`` so the silent-abstain is
-    observable rather than shipping a frozen bar.
+    """LOUD non-fire detector. The deterministic upstream signal is a guessed-fill
+    resolution — either a ``setSliderValue`` body OR an inlined
+    ``<x> = <frame>:FindFirstChild("Fill")`` assignment. If after the pack any
+    guessed-fill resolution remains un-rewritten (the AI reshaped the shape
+    enough that the span/identity gate abstained), ``log.warning`` so the
+    silent-abstain is observable rather than shipping a frozen bar.
 
-    Shares the broadened helper-name anchor (free-function AND method form) so
-    a method-form guessed-fill HUD the rewrite missed is LOUDLY flagged, never
-    silently skipped by both.
+    Two surfaces are flagged:
+      * a ``setSliderValue`` (free-function AND method form) that still guesses;
+      * an inlined guessed-fill resolution assignment outside any setter body
+        (the broadened generic-shape surface).
 
-    The "covered" determination is per-SETTER, not whole-file: a guessed-fill
-    token that survives the rewrite means an un-rewritten guessed setter remains,
-    so we warn even when a SECOND setter in the same file WAS rewritten (the
-    canonical body contains no guessed-fill token, so its presence is unambiguous
-    evidence of a still-guessed setter)."""
+    The "covered" determination is per-resolution, not whole-file: any guessed-
+    fill token that survives the rewrite is unambiguous evidence of a still-
+    guessed shape (the canonical body / injected helper contains none), so we
+    warn even when a SIBLING resolution in the same file WAS rewritten."""
     for s in scripts:
         src = s.source or ""
-        if not _has_slider_setter(src):
-            continue
-        if _has_guessed_fill(src):
+        if _has_slider_setter(src) and _has_guessed_fill(src):
             log.warning(
                 "[slider_fill_path_resize] '%s' has a guessed-fill "
                 "setSliderValue the pack did not rewrite (shape drifted); "
                 "slider bar will stay frozen. Inspect the emitted "
                 "setSliderValue.", s.name,
             )
+        elif _has_inline_guessed_fill(src):
+            log.warning(
+                "[slider_fill_path_resize] '%s' has an inlined guessed-fill "
+                "resolution (<x> = <frame>:FindFirstChild(\"Fill\")) the pack "
+                "did not rewrite (shape drifted); slider bar will stay frozen. "
+                "Inspect the emitted fill resolution.", s.name,
+            )
 
 
 @patch_pack(
     name="slider_fill_path_resize",
-    description="Rewrite the HUD's guessed-fill setSliderValue to resolve the "
-    "converter-emitted SliderFillElement relative path, fail loud, and resize "
-    "the fill anchor/direction-aware.",
+    description="Rewrite the HUD's guessed-fill setSliderValue (legacy) AND the "
+    "inlined guessed-fill resolution (generic) to resolve the converter-emitted "
+    "SliderFillElement relative path, fail loud, and resize the fill "
+    "anchor/direction-aware.",
     detect=_detect_slider_fill_resize,
 )
 def _fix_slider_fill_resize(scripts: list["RbxScript"]) -> int:
@@ -5420,6 +5419,18 @@ def _fix_slider_fill_resize(scripts: list["RbxScript"]) -> int:
             log.info(
                 "  Rewrote setSliderValue in '%s' to path-aware fail-loud "
                 "resize", s.name,
+            )
+        # SECOND shape: the inlined guessed-fill resolution (faithful OOP HUD
+        # with NO setSliderValue). Localized RHS rewrite + one-shot helper
+        # injection. Runs on the post-legacy-rewrite source so the canonical
+        # setter body (which holds a variable ``segment``, not a guessed
+        # literal) is never matched.
+        src, inline_count = _rewrite_inline_guessed_fill(src)
+        if inline_count:
+            fixes += inline_count
+            log.info(
+                "  Rewrote %d inlined guessed-fill resolution(s) in '%s' to "
+                "_resolveSliderFill(frame)", inline_count, s.name,
             )
         s.source = src
     # Coverage guard runs on the post-rewrite scripts.
