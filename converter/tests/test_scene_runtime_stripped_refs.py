@@ -1387,3 +1387,189 @@ class TestNonPlacementScopedNilRefNotQueued:
         rc, out, err = _run_scenario(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "NOT_QUEUED_OK" in out, out
+
+
+# ---------------------------------------------------------------------------
+# gap#4 edge case §2.1 / decision D2 -- the PASS-1a/1b seed-all-before-
+# construct-all split. A placement parented under a LATER-SORTED placement must
+# still resolve ``activeInHierarchy`` correctly at CONSTRUCTION, because PASS 1a
+# seeds EVERY placement's parent map (``_goParentId``/``_goActiveSelf``) BEFORE
+# PASS 1b constructs ANY placement (``_injectHostSurface`` walks the parent map
+# during ``_constructPrefabClone``).
+#
+# Two placements: P_child (placement_id "AChild:1", sorts FIRST) parents its
+# prefab root under P_parent's namespaced root GO; P_parent (placement_id
+# "ZParent:1", sorts LAST) is authored INACTIVE (``active = false``). Placements
+# are sorted by ``placement_id`` ascending in start(), so "AChild:1" < "ZParent:1"
+# forces P_parent to construct AFTER P_child.
+#
+# Because PASS 1a seeds P_parent's inactive ``_goActiveSelf`` entry before PASS 1b
+# constructs P_child, P_child's ancestor walk reaches that entry and resolves
+# ``activeInHierarchy = false`` -> its boot ``OnEnable`` does NOT fire.
+#
+# DISCRIMINATOR vs a fused per-placement seed-then-construct: a fused order would
+# seed P_child then immediately construct it, BEFORE P_parent's (later-sorted)
+# entry was seeded. P_parent's ``_goActiveSelf`` would still be nil at that point,
+# defaulting to ``true`` in ``_computeActiveInHierarchyViaParentMap``, so P_child
+# would wrongly resolve active and its OnEnable WOULD fire. Asserting
+# ``CHILD_ONENABLE_SKIPPED`` (OnEnable did NOT fire) thus distinguishes the
+# two-pass split from the fused order. A positive control -- the SAME P_child made
+# a planner-root with its parent active -- proves the suppression is the ancestor
+# walk reaching P_parent, not an unconditional skip.
+# ---------------------------------------------------------------------------
+
+class TestPlacementUnderLaterSortedPlacementActiveInHierarchy:
+
+    def _scenario(self, *, child_under_parent: bool) -> str:
+        # ``child_under_parent``:
+        #   True  -- production case: P_child's prefab root parents under
+        #            P_parent's namespaced root GO (P_parent inactive) -> the
+        #            ancestor walk reaches the later-sorted inactive parent and
+        #            P_child's OnEnable must be suppressed.
+        #   False -- positive control: P_child's prefab root is a planner-root
+        #            (no parent edge), so its activeInHierarchy is its own
+        #            (active) selfFlag -> OnEnable MUST fire. Proves the
+        #            suppression in the True case is the ancestor walk, not an
+        #            unconditional skip.
+        if child_under_parent:
+            # P_parent's namespaced root GO id = "<placement>:<root goid>".
+            child_parent_go = '"ZParent:1:pfParent:root"'
+        else:
+            # Planner-root: no parent edge, no inactive ancestor. (Keep the
+            # value bare -- a trailing comment here would swallow the table's
+            # field separator.)
+            child_parent_go = "nil"
+        return textwrap.dedent("""\
+            local childOnEnableFired = false
+
+            -- P_child component: logs whether its boot OnEnable fired (OnEnable
+            -- is gated on the runtime's computed activeInHierarchy).
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({mark="CHILD"}, Child) end
+            function Child:OnEnable() childOnEnableFired = true end
+
+            -- P_parent component (authored inactive); presence only matters so
+            -- the placement boots and seeds its inactive parent-map entry.
+            local Parent = {} ; Parent.__index = Parent
+            function Parent.new(_) return setmetatable({mark="PARENT"}, Parent) end
+
+            -- placement_ids chosen so the deterministic placement_id sort places
+            -- P_parent AFTER P_child: "AChild:1" < "ZParent:1".
+            local CHILD_PLACEMENT  = "AChild:1"
+            local PARENT_PLACEMENT = "ZParent:1"
+            local CHILD_PREFAB  = "gC:Assets/Prefabs/Child.prefab"
+            local PARENT_PREFAB = "gP:Assets/Prefabs/Parent.prefab"
+            local CHILD_ROOT  = "pfChild:root"   -- prefab-local goid
+            local PARENT_ROOT = "pfParent:root"
+            -- namespaced host goids the placement boot registers / workspaceFinds.
+            local CHILD_NS  = CHILD_PLACEMENT  .. ":" .. CHILD_ROOT
+            local PARENT_NS = PARENT_PLACEMENT .. ":" .. PARENT_ROOT
+
+            local plan = {
+                modules = {
+                    child = {stem = "Child", runtime_bearing = true,
+                             module_path = "x", domain = "client"},
+                    parent = {stem = "Parent", runtime_bearing = true,
+                              module_path = "y", domain = "client"},
+                },
+                scenes = {
+                    Main = {
+                        instances = {}, references = {}, lifecycle_order = {},
+                    },
+                },
+                prefabs = {
+                    [CHILD_PREFAB] = {
+                        name = "Child",
+                        -- prefab root (parent_game_object_id nil) -> the placement
+                        -- boot binds it to the placement's parent_game_object_id.
+                        instances = {{instance_id = CHILD_PREFAB .. ":1",
+                                      script_id = "child",
+                                      game_object_id = CHILD_ROOT,
+                                      parent_game_object_id = nil,
+                                      active = true, enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {CHILD_PREFAB .. ":1"},
+                    },
+                    [PARENT_PREFAB] = {
+                        name = "Parent",
+                        instances = {{instance_id = PARENT_PREFAB .. ":1",
+                                      script_id = "parent",
+                                      game_object_id = PARENT_ROOT,
+                                      parent_game_object_id = nil,
+                                      active = true, enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {PARENT_PREFAB .. ":1"},
+                    },
+                },
+                scene_prefab_placements = {
+                    -- P_child parents under P_parent's namespaced root GO (the
+                    -- production case) or is a planner-root (the control). Listed
+                    -- child-first, but the placement_id sort is what fixes order.
+                    {placement_id = CHILD_PLACEMENT, prefab_id = CHILD_PREFAB,
+                     active = true, enabled = true,
+                     parent_game_object_id = __CHILD_PARENT_GO__},
+                    -- P_parent authored INACTIVE -> its namespaced root GO seeds
+                    -- _goActiveSelf = false in PASS 1a.
+                    {placement_id = PARENT_PLACEMENT, prefab_id = PARENT_PREFAB,
+                     active = false, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            -- No workspace clone (no GetDescendants) -> each placement resolves its
+            -- host via workspaceFind on the NAMESPACED goid.
+            local instances = {
+                [CHILD_NS]  = {Name = "Child",  _sceneRuntimeId = CHILD_NS,  _children = {}},
+                [PARENT_NS] = {Name = "Parent", _sceneRuntimeId = PARENT_NS, _children = {}},
+            }
+            local services = servicesFor(plan, {child = Child, parent = Parent}, instances)
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("client")
+            runDeferred()  -- flush deferred Starts
+
+            -- The P_child component must be registered (its placement booted).
+            local childKey = CHILD_PLACEMENT .. ":" .. CHILD_PREFAB .. ":1"
+            local childComp = engine._componentByInstanceId[childKey]
+            assert(childComp ~= nil, "P_child component must be constructed+registered")
+
+            if childOnEnableFired then
+                print("CHILD_ONENABLE_FIRED")
+            else
+                print("CHILD_ONENABLE_SKIPPED")
+            end
+            -- The computed activeInHierarchy for P_child's namespaced root GO --
+            -- seeded in PASS 1a, walked through P_parent at construction. This is
+            -- the gate the OnEnable decision above reads.
+            print("CHILD_AIH:" .. tostring(engine._goActiveInHierarchy[CHILD_NS]))
+            print("DONE")
+        """).replace("__CHILD_PARENT_GO__", child_parent_go)
+
+    def test_child_under_later_sorted_inactive_parent_suppresses_onenable(self):
+        # Production / two-pass guard: P_child (sorts first) parents under
+        # P_parent (sorts last, inactive). Because PASS 1a seeds ALL parent maps
+        # before PASS 1b constructs ANY placement, P_child's construct-time
+        # ancestor walk reaches P_parent's seeded inactive entry ->
+        # activeInHierarchy = false -> OnEnable suppressed. A fused per-placement
+        # seed-then-construct would construct P_child before P_parent's entry was
+        # seeded and WRONGLY fire OnEnable.
+        rc, out, err = _run_scenario(self._scenario(child_under_parent=True))
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CHILD_ONENABLE_SKIPPED" in out, (
+            f"P_child parents under a LATER-sorted INACTIVE placement; the "
+            f"seed-all-before-construct-all split must let its construct-time "
+            f"activeInHierarchy walk reach the seeded inactive parent so OnEnable "
+            f"does NOT fire. A fused per-placement order would fire it. got:\n{out}")
+        assert "CHILD_AIH:false" in out, (
+            f"P_child's computed activeInHierarchy must resolve false at boot "
+            f"(ancestor P_parent inactive); got:\n{out}")
+
+    def test_positive_control_child_as_root_fires_onenable(self):
+        # Positive control: same P_child made a planner-root (no inactive
+        # ancestor) -> activeInHierarchy is its own active selfFlag -> OnEnable
+        # MUST fire. Proves the suppression above is the ancestor walk reaching
+        # P_parent, not an unconditional skip of later-listed placements.
+        rc, out, err = _run_scenario(self._scenario(child_under_parent=False))
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CHILD_ONENABLE_FIRED" in out, (
+            f"with no inactive ancestor P_child's OnEnable MUST fire (control); "
+            f"got:\n{out}")
+        assert "CHILD_AIH:true" in out, (
+            f"a planner-root active P_child must resolve activeInHierarchy true; "
+            f"got:\n{out}")
