@@ -1573,3 +1573,181 @@ class TestPlacementUnderLaterSortedPlacementActiveInHierarchy:
         assert "CHILD_AIH:true" in out, (
             f"a planner-root active P_child must resolve activeInHierarchy true; "
             f"got:\n{out}")
+
+
+# ---------------------------------------------------------------------------
+# gap#4 finalize (codex): the SAME-DOMAIN UI-DEFERRED PLACED TARGET quadrant.
+#
+# The early boot drain (PASS 1, moved before the lifecycle) binds a scene->
+# placement ref ONLY when the target placement is already registered in the
+# engine union at drain time. But when the target's host clone hasn't landed at
+# boot, its placement is UI-DEFERRED (``_deferUiInstance``) and is therefore NOT
+# constructed/registered in PASS 1 -- so the early drain CANNOT bind the ref and
+# leaves the record QUEUED in ``_pendingPlacementRefs``. The target registers
+# later, inside ``_completeDeferredBatch`` (run by ``_resolveDeferredUiInstances``
+# at the tail of ``start()``), whose own ``_drainPendingPlacementRefs`` call
+# (scene_runtime.luau:3939) binds the queued ref EXACTLY ONCE. Same domain
+# (client->client) so it SHOULD eventually bind -- distinct from the cross-domain
+# stay-nil quadrant above.
+#
+# Discriminating-ness: ``_resolveDeferredUiInstances`` runs INSIDE ``start()``, so
+# observing "still queued after the early drain" requires capturing state BEFORE
+# that late batch runs. We shadow ``_resolveDeferredUiInstances`` to a no-op for
+# the duration of ``start()`` (the established ``stays_late`` technique), capture
+# the post-PASS-1 state (ref still queued, target not yet registered -> proves the
+# early drain could NOT bind it), then restore + invoke the real late batch and
+# assert the ref binds once. If the reorder dropped the queued record at the early
+# drain (e.g. cleared ``_pendingPlacementRefs`` unconditionally), STILL_QUEUED
+# would fail; if the late batch double-bound, NO_DOUBLE_RESOLVE would fail.
+# ---------------------------------------------------------------------------
+
+class TestSameDomainUiDeferredPlacedTargetBindsOnceLater:
+
+    def _scenario(self) -> str:
+        return textwrap.dedent("""\
+            local Loadout = {} ; Loadout.__index = Loadout
+            function Loadout.new(_) return setmetatable({}, Loadout) end
+
+            local MissionUI = {} ; MissionUI.__index = MissionUI
+            function MissionUI.new(_) return setmetatable({mark="MUI"}, MissionUI) end
+
+            -- Placement of a CLIENT prefab whose single instance is UI-owned, so
+            -- with no workspace clone at boot it UI-DEFERS (not registered in
+            -- PASS 1). Its engine registry key when the deferred batch builds it
+            -- is _idWithPlacement(PLACEMENT, PREFAB_LOCAL) = ENGINE_KEY -- exactly
+            -- the scene ref's target_ref. The deferred resolver keys on the
+            -- namespaced HOST goid (_idWithPlacement(PLACEMENT, HOST_GOID)).
+            local PLACEMENT = "Main:7"
+            local PREFAB = "g:Assets/Prefabs/UI/MissionPopup.prefab"
+            local PREFAB_LOCAL = PREFAB .. ":11"
+            local HOST_GOID = PREFAB .. ":host"
+            local ENGINE_KEY = PLACEMENT .. ":" .. PREFAB_LOCAL
+            local HOST_KEY = PLACEMENT .. ":" .. HOST_GOID
+
+            local plan = {
+                modules = {
+                    loadout = {stem = "Loadout", runtime_bearing = true,
+                               module_path = "x", domain = "client"},
+                    missionui = {stem = "MissionUI", runtime_bearing = true,
+                                 module_path = "y", domain = "client"},
+                },
+                scenes = {
+                    Main = {
+                        instances = {
+                            {instance_id = "Main:1", script_id = "loadout",
+                             game_object_id = "sgo", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {
+                            -- same-domain (client -> client placed UI-deferred)
+                            {["from"] = "Main:1", field = "missionPopup",
+                             index = nil, target_kind = "component",
+                             target_ref = ENGINE_KEY,
+                             target_script_id = "missionui",
+                             target_is_ui = false},
+                        },
+                        lifecycle_order = {"Main:1"},
+                    },
+                },
+                prefabs = {
+                    [PREFAB] = {
+                        name = "MissionPopup",
+                        instances = {{instance_id = PREFAB_LOCAL,
+                                      script_id = "missionui",
+                                      game_object_id = HOST_GOID, active = true,
+                                      enabled = true, config = {},
+                                      instance_owner_is_ui = true}},
+                        references = {}, lifecycle_order = {PREFAB_LOCAL},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = PLACEMENT, prefab_id = PREFAB,
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            -- Only the scene source host exists at boot. NO clone for the
+            -- placement (so _findUnboundClonePerPrefab returns nil AND the placed
+            -- UI-owned host workspaceFind misses) -> the placement UI-DEFERS.
+            local instances = {
+                sgo = {Name = "Loadout", _sceneRuntimeId = "sgo", _children = {}},
+            }
+            local services = servicesFor(plan,
+                {loadout = Loadout, missionui = MissionUI}, instances)
+            -- The deferred batch resolves the placed host LATE (clone has landed
+            -- by then). Keyed on the namespaced host goid.
+            local hostClone = {Name = "MissionPopupHost", _sceneRuntimeId = HOST_KEY,
+                               _children = {}}
+            services.awaitUiHost = function(id)
+                if id == HOST_KEY then return hostClone end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            -- Suppress the late UI batch DURING start() so we can observe the
+            -- post-early-drain state: the target is UI-deferred (not registered),
+            -- so the early drain left the ref QUEUED.
+            local _realResolve = engine._resolveDeferredUiInstances
+            engine._resolveDeferredUiInstances = function() end
+            engine:start("client")
+
+            local src = engine._componentByInstanceId["Main:1"]
+            assert(src ~= nil, "scene source must exist")
+
+            -- (a) the early drain could NOT bind it: the UI-deferred target is
+            -- not yet registered, the field is nil, and the record is STILL in
+            -- _pendingPlacementRefs.
+            assert(engine._componentByInstanceId[ENGINE_KEY] == nil,
+                "UI-deferred target must NOT be registered at the early drain")
+            if src.missionPopup == nil then print("NIL_AFTER_EARLY_DRAIN") end
+            local stillQueued = false
+            for _, rec in ipairs(engine._pendingPlacementRefs or {}) do
+                if rec.field == "missionPopup" then stillQueued = true end
+            end
+            if stillQueued then print("STILL_QUEUED") end
+
+            -- (b) now run the real late UI batch (_completeDeferredBatch ->
+            -- _drainPendingPlacementRefs at scene_runtime.luau:3939) -> the target
+            -- registers and the queued ref binds.
+            engine._resolveDeferredUiInstances = _realResolve
+            engine:_resolveDeferredUiInstances()
+            runDeferred()  -- flush the late batch's deferred Starts
+
+            assert(engine._componentByInstanceId[ENGINE_KEY] ~= nil,
+                "UI-deferred target must be registered after the late batch")
+            if type(src.missionPopup) == "table" and src.missionPopup.mark == "MUI" then
+                print("BOUND_AFTER_LATE_DRAIN")
+            else
+                print("BOUND_OTHER:" .. tostring(src.missionPopup))
+            end
+            -- bound exactly once: the late drain removed the record, so the queue
+            -- is clear of it and a further drain finds nothing to rebind.
+            local stillQueuedAfter = false
+            for _, rec in ipairs(engine._pendingPlacementRefs or {}) do
+                if rec.field == "missionPopup" then stillQueuedAfter = true end
+            end
+            if not stillQueuedAfter then print("QUEUE_CLEAR") end
+            local before = src.missionPopup
+            engine:_drainPendingPlacementRefs()
+            if src.missionPopup == before then print("NO_DOUBLE_RESOLVE") end
+            print("DONE")
+        """)
+
+    def test_same_domain_ui_deferred_target_binds_once_via_completed_batch(self):
+        rc, out, err = _run_scenario(self._scenario())
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "NIL_AFTER_EARLY_DRAIN" in out, (
+            f"a UI-deferred placed target is not registered at the early boot "
+            f"drain, so the scene->placement ref must be nil there; got:\n{out}")
+        assert "STILL_QUEUED" in out, (
+            f"the early drain could not bind the UI-deferred target, so the record "
+            f"must REMAIN in _pendingPlacementRefs (not dropped); got:\n{out}")
+        assert "BOUND_AFTER_LATE_DRAIN" in out, (
+            f"after _completeDeferredBatch registers the UI-deferred target, the "
+            f"queued ref must bind to the placed clone (same domain); got:\n{out}")
+        assert "QUEUE_CLEAR" in out, (
+            f"the late drain must remove the bound record from "
+            f"_pendingPlacementRefs; got:\n{out}")
+        assert "NO_DOUBLE_RESOLVE" in out, (
+            f"a further drain must not rebind the already-bound ref (exactly "
+            f"once); got:\n{out}")
