@@ -4194,3 +4194,25 @@ P2-HARDEN: setActive dispatch now accepts a userdata Instance arg (`elseif type(
 
 - **I4 — `converter/.cache` (LLM cache, created by running luau-gated tests) left UNTRACKED and NOT
   committed.** Classification: Mechanical. Generated artifact; not part of the slice diff.
+
+## /drive run ui-bare-container-transparency (2026-06-21)
+
+# Decisions — ui-bare-container-transparency
+
+- **D1 — Key off presence of an Image/RawImage graphic** (reuse existing ImageLabel-promotion
+  signal: `_UI_CLASS_MAP`→ImageLabel, or MonoBehaviour with `m_Sprite`/`_is_ui_image_mb`).
+  Classification: Mechanical/structural. The deterministic upstream source the task names;
+  avoids regex/fingerprint on generated output.
+- **D2 — Post-pass guard at the build site** (`if not has_image_graphic: background_transparency
+  = 1.0`), not a `core/roblox_types.py` default change. Classification: Mechanical. The default
+  can't know per-element graphic presence; the build site can; keeps non-UI consumers undisturbed.
+- **D3 — Leave Button/ScrollingFrame/TextBox/widget edge classes to existing handlers; no
+  Button-background-image special case.** Classification: Taste (scope). Symptom is bare
+  containers; Button image fill is a separate non-blocking concern → followup if e2e surfaces it.
+
+- **HARDEN scope-widening (Mechanical, root-cause of a flagged P1).** The alpha-crash P1
+  (`float(col.get("a",1.0))` on non-numeric `m_Color.a`) also lived in the pre-existing
+  `_apply_image_properties` (ui_translator.py, runs before the post-pass for Image elements), so
+  the regression test stayed RED until BOTH sites were fixed. A `_coerce_alpha` helper (mirrors
+  the file's `_coerce_int`) is now applied at both sites — same file, in the phase's surface,
+  completing design edge-10's malformed-m_Color defensive commitment. Surface at Gate B.
