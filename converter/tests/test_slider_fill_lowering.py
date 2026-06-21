@@ -286,3 +286,23 @@ def test_generic_pipeline_lowers_slider_fill() -> None:
     assert 'FindFirstChild("Fill")' not in lowered_src
     assert "local healthFill = _resolveSliderFill(healthFrame)" in lowered_src
     assert lowered_src.count("local function _resolveSliderFill(frame)") == 1
+
+
+class TestSetterDefRegexEdgeCases:
+    """has_slider_setter must detect a setSliderValue DEFINITION only, not a
+    call, and not a longer name like resetSliderValue (round-2 codex P1)."""
+
+    def test_setter_def_regex_edge_cases(self) -> None:
+        from converter.slider_fill_common import has_slider_setter
+
+        assert has_slider_setter("function setSliderValue(s, p)")
+        assert has_slider_setter("local function setSliderValue(s, p)")
+        assert has_slider_setter("function T:setSliderValue(p)")
+        assert has_slider_setter("function T :setSliderValue(p)")   # spaced colon
+        assert has_slider_setter("function T: setSliderValue(p)")   # spaced after colon
+        assert has_slider_setter("function M.setSliderValue(p)")
+        # NOT a definition of setSliderValue:
+        assert not has_slider_setter("function resetSliderValue(p)")     # name ends with ...setSliderValue
+        assert not has_slider_setter("function M.resetSliderValue(p)")
+        assert not has_slider_setter("obj:setSliderValue(0.5)")          # bare call
+        assert not has_slider_setter("self.host:setSliderValue(f, v)")   # bare call

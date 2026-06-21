@@ -117,8 +117,15 @@ _ANY_GUESS_FILL_RE = re.compile(r':FindFirstChild\(\s*"(?:Fill|Bar|Foreground)"\
 # (which is NOT preceded by ``function``) is never matched. ``[%w_.]*`` here is
 # expressed in Python ``re`` as ``[\w.]*``; the receiver separator is ``:`` or
 # ``.`` (method or table-field definition), optional for the free-function form.
+# A definition is either the free form ``function setSliderValue(`` /
+# ``local function setSliderValue(`` (the name follows ``function`` whitespace
+# directly), or a method/table form ``function <ident> [:.] setSliderValue(``
+# where a ``:``/``.`` separator (with optional surrounding spaces) precedes the
+# name. The separator is REQUIRED for the qualified form so a longer identifier
+# like ``resetSliderValue`` (which contains the substring ``setSliderValue``)
+# cannot false-match, and ``\s*`` around the separator admits spaced method defs.
 _SLIDER_SETTER_DEF_RE = re.compile(
-    r"(?:local\s+)?function\s+[\w.]*[:.]?setSliderValue\s*\("
+    r"(?:local\s+)?function\s+(?:[\w]+\s*[:.]\s*)?setSliderValue\s*\("
 )
 
 
