@@ -1452,3 +1452,31 @@ HANDOFF: converter/TODO.md Infrastructure P1 "Converter doesn't wire ScreenGui e
 ## slop (deferred to finalize)
 converter/runtime/scene_runtime.luau:4328-4335,4506-4513,4575-4607 — gap#4 block comments verbose (5-9 lines), partly restate design doc; tighten to ~2 lines/block keeping the non-obvious why.
 converter/runtime/scene_runtime.luau:4522-4527 — reused-clone comment duplicates the PASS-1a header comment at 4511-4513.
+
+## /drive run ui-bare-container-transparency (2026-06-21)
+
+- RawImage full support: element-class promotion does not key on `m_Texture`, so a Unity
+  RawImage serialized as a bare MonoBehaviour stays a `Frame` (no texture rendered) and is
+  treated as no-fill → transparent. To faithfully render RawImage backgrounds, promote
+  element_class to ImageLabel on a verified RawImage signal (RawImage script GUID, ideally) and
+  route m_Texture → element.image + alpha. Out of scope for the transparency fix (corpus has no
+  RawImage; transparent is the safe direction). Surfaced in /drive run ui-bare-container-transparency.
+- background_color RGB tint sourced from merged ui_properties (_apply_color_properties), not the
+  graphic component's own m_Color. For a Button+Image node where the Button MB also serializes
+  m_Color, the tint could derive from the wrong component (last-writer-wins). Pre-existing;
+  transparency fix does not worsen it. Consider sourcing the tint from the same graphic component
+  the transparency post-pass uses. Surfaced in /drive run ui-bare-container-transparency.
+
+## slop (deferred to finalize)
+- converter/converter/ui_translator.py:214-235 — _find_image_graphic docstring's long "NOT a bare m_Texture" rejected-rationale reads as design counter-commentary; trim to usage contract.
+- converter/converter/ui_translator.py:711-718 — the multi-line "(authoritative)" post-pass comment restates PD3 / "single source of truth" / "(the bug)" narration; trim to one line.
+- converter/tests/test_ui_translator.py:1570-1579,1647-1653 — verbose design-doc-like test comments; trim.
+- (finalize r2, codex, non-blocking) _coerce_alpha/_find_image_graphic docstrings + some new test
+  docstrings are still somewhat verbose per codex; Claude judged them concise/load-bearing. Taste
+  tie; left as-is. Trim opportunistically if revisited.
+- (finalize r2, codex, non-blocking) _apply_image_properties.background_transparency write is always
+  overridden by the authoritative post-pass (the node is ImageLabel → post-pass finds the graphic),
+  so its _coerce_alpha is load-bearing only to NOT crash (non-numeric), not for its transparency
+  value. A direct _apply_image_properties non-finite test would guard a non-production-effective
+  path. Consider simplifying _apply_image_properties to drop its (now-dead) transparency write in a
+  future cleanup (keep the no-crash coercion). Surfaced in /drive run ui-bare-container-transparency.

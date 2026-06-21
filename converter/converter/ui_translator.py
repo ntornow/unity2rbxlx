@@ -8,9 +8,10 @@ Text/TextMeshPro -> TextLabel, Image -> ImageLabel, Button -> TextButton.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, TypedDict
 
-from core.unity_types import SceneNode
+from core.unity_types import ComponentData, SceneNode
 from core.roblox_types import RbxScreenGui, RbxUIElement
 from unity.yaml_parser import ref_guid
 
@@ -177,6 +178,21 @@ def _coerce_int(raw: object) -> int | None:
         return None
 
 
+def _coerce_alpha(raw: object) -> float:
+    """Best-effort float coercion for a serialized ``m_Color.a``; 1.0 (opaque) on failure.
+
+    Mirrors ``_coerce_int``: the value crosses the parser boundary untyped and may be
+    present-but-non-numeric (``None``, ``"bad"``), so a present-but-bad alpha defaults
+    to opaque just like an absent one. Non-finite (``inf``/``-inf``/``nan``) → opaque
+    too, so ``1.0 - alpha`` never leaks a non-finite transparency.
+    """
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 1.0
+    return value if math.isfinite(value) else 1.0
+
+
 def _map_tmp_bitfield(raw: object, table: dict[int, str]) -> str | None:
     """Resolve a TMP alignment bitfield int to a Roblox token.
 
@@ -209,6 +225,27 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
         return False
     guid = (ref_guid(script) or "")
     return isinstance(guid, str) and guid.startswith(_UI_IMAGE_SCRIPT_GUID_PREFIX)
+
+
+def _find_image_graphic(node: SceneNode) -> ComponentData | None:
+    """Return the node's fill-painting Image Graphic component, or None.
+
+    Keyed on the same signal that promotes a bare Frame -> ImageLabel:
+      - a component whose ``_UI_CLASS_MAP[ct] == "ImageLabel"`` (a literal
+        "Image"/"RawImage" component_type), or
+      - a MonoBehaviour that is a UI Image (``m_Sprite`` present, or
+        ``_is_ui_image_mb`` matches the Image script GUID — covers subclasses).
+    Returns the FIRST match in component order (Unity renders one Graphic per
+    GameObject). A node with no graphic paints no fill (-> transparent).
+    """
+    for comp in node.components:
+        ct = comp.component_type
+        p = comp.properties
+        if _UI_CLASS_MAP.get(ct) == "ImageLabel":
+            return comp
+        if ct == "MonoBehaviour" and ("m_Sprite" in p or _is_ui_image_mb(p)):
+            return comp
+    return None
 
 
 def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
@@ -675,6 +712,17 @@ def _convert_ui_element(
     # Detect layout group components.
     _apply_layout_properties(element, node.components)
 
+    # Background transparency, authoritative over the per-class handlers: a node
+    # paints a fill only if it owns an Image/RawImage graphic, with opacity from
+    # that graphic's m_Color.a; a graphic-less container is transparent.
+    graphic = _find_image_graphic(node)
+    if graphic is not None:
+        col = graphic.properties.get("m_Color", {})
+        alpha = _coerce_alpha(col.get("a", 1.0)) if isinstance(col, dict) else 1.0
+        element.background_transparency = 1.0 - alpha
+    else:
+        element.background_transparency = 1.0
+
     # PR3c carve-out (generic-only): if this UI GameObject's runtime-
     # bearing controller has a serialized field referencing an asset or
     # prefab, the host runtime is responsible for instantiating the
@@ -993,7 +1041,7 @@ def _apply_image_properties(element: RbxUIElement, props: dict[str, Any]) -> Non
             float(color.get("g", 1)),
             float(color.get("b", 1)),
         )
-        alpha = float(color.get("a", 1.0))
+        alpha = _coerce_alpha(color.get("a", 1.0))
         element.background_transparency = 1.0 - alpha
 
 
