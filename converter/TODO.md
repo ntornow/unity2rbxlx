@@ -425,6 +425,28 @@ cache. The items below are where code or docs are stale or wrong.
   cover modules; harden the call graph against synthesized require-fallback
   strings; add a module-heavy test project / fixtures. (Claude + Codex cross-model
   analysis, 2026-05-19.)
+  - **REFRAME (2026-06-21, live reproduction):** the escalated "client `require()`s a
+    base class in ServerStorage → `require(nil)` → load failure" framing does **NOT
+    reproduce** on trash-dash, in any networking mode. Verified end-to-end (fresh
+    `transpile_ran=True` topology path, instrumented at `pipeline.py` reachability call):
+    under `networking=none` everything routes to ReplicatedStorage (0 ServerStorage
+    modules); under `netcode` a few signal-less modules (e.g. `Coin`) DO land in
+    ServerStorage, but the conversion emits **zero client entry-point seeds**
+    (`_client_entry_seed_names == []`) at classify time — the only client-executed
+    scripts are the generic bootstrap (`SceneRuntimeClient`→{`SceneCameraInput`,
+    `SceneRuntime`,`SceneRuntimePlan`}, `UIEventWiring`), whose full transitive require
+    closure never reaches any ServerStorage module. So no client-side `require` ever
+    resolves nil. What IS real: the routing is **not closed under `require`** — a
+    client-domain module (`TrackManager`) can be placed in ReplicatedStorage while a
+    module it requires (`Coin`) sits in ServerStorage (a latent, dormant invariant
+    violation, not an active crash here). Also: `_decide_script_container` already
+    consults the `derive_reachability_requirements` / `_client_entry_seed_names`
+    reachability closure (which DOES capture coherence-injected requires) BEFORE the
+    caller-graph branch — so hyp (b) "poisoned caller-graph" is not the live driver on
+    the topology path; the caller-graph heuristic is the legacy/fallback surface.
+    Net: this item is a **robustness + test-coverage** chore (add the missing
+    require-closure invariant + a module-heavy fixture), NOT a reproduced gameplay bug.
+    Full evidence: `~/.claude/harness-runs/modulescript-routing-20260621T085815/repro-findings.md`.
 
 - [ ] **P2 — Retire genre-specific scaffolding; make the converter fully
   genre-agnostic.** `--scaffolding=fps` (`u2r.py convert`) injects FPS-genre
