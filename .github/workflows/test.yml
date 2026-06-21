@@ -467,6 +467,33 @@ jobs:
           "$VENV/bin/python" -m pip install --upgrade pip
           "$VENV/bin/python" -m pip install -e ".[dev]"
 
+      # The runner service is launched via a launchd plist whose PATH omits
+      # ~/.local/bin (where the `claude` CLI lives) — see
+      # scripts/setup-nightly-runner.sh. With no ANTHROPIC_API_KEY in CI, the
+      # converter's only AI backend is the `claude` CLI; if it's off PATH the
+      # "AI-on" convert silently runs with ZERO AI transpiles and emits an
+      # all-stub conversion (the 2026-06-20 nightly failure mode). $GITHUB_PATH
+      # affects SUBSEQUENT steps, so this runs before the precondition assert
+      # and the convert below; the convert's python subprocess inherits it via
+      # os.environ["PATH"], which is what shutil.which("claude") reads.
+      - name: Put local CLI tools (claude) on PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Fail-loud PRECONDITION (fast early signal, NOT the load-bearing gate):
+      # this gate's whole premise is a real AI transpile, so assert an AI
+      # backend exists before spending 35 min on a convert that would silently
+      # stub. `command -v claude` only proves the binary resolves, not that
+      # calls succeed — the load-bearing check is the post-convert
+      # ai_transpiled>0 guard below.
+      - name: Assert AI backend available (cold-AI gate precondition)
+        run: |
+          if command -v claude >/dev/null 2>&1 || [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "AI backend present (claude CLI on PATH or ANTHROPIC_API_KEY set)."
+          else
+            echo "::error::cold-AI gate: no AI backend — 'claude' CLI not on PATH and ANTHROPIC_API_KEY unset. A cold AI transpile cannot run; aborting before the all-stub conversion."
+            exit 1
+          fi
+
       - name: Cold (uncached, AI-on) generic convert
         timeout-minutes: 35
         run: |
@@ -499,6 +526,20 @@ jobs:
             --no-upload \
             --no-resolve \
             --skip-architecture-step
+
+      # LOAD-BEARING fail-loud guard: `u2r.py convert` exits 0 even when AI was
+      # unavailable and every script fell back to the stub generator. That
+      # all-stub conversion boots (Roblox default Humanoid controls move the
+      # player) but the paradigm-C player/camera controller never binds, so the
+      # failure surfaces misleadingly downstream as mouse_moves_view=false at
+      # the bind step. tools/assert_ai_transpiled.py asserts the POSITIVE signal
+      # (scripts.ai_transpiled > 0) and fails CLOSED on any report anomaly, so a
+      # backend/PATH regression reds HERE with the true reason instead of at the
+      # bind step. (Unit-tested in tests/test_assert_ai_transpiled.py.)
+      - name: Assert AI transpile actually ran (no all-stub fallback)
+        run: |
+          "$HOME/.unity2rbxlx-venv/bin/python" tools/assert_ai_transpiled.py \
+            "$PWD/output/SimpleFPS_cold_e2e/conversion_report.json"
 
       - name: Boot/health gate (required) + bounded launch retry
         # Step-level cap so a hung Roblox Studio fails this step with a clear
