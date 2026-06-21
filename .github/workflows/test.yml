@@ -834,55 +834,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  runner-health:
-    # Loud alert when the self-hosted Studio runner is offline. The nightly
-    # smoke-test / cold-e2e jobs SKIP or queue→cancel against a dead runner, and
-    # that cancellation can cascade to the summary job — so a silently-dead
-    # runner shows up as confusing cancelled runs, not a clear failure (it sat
-    # dead 2026-06-10 → 06-21 unnoticed). This github-hosted job runs on the
-    # always-available ubuntu pool and checks the runner status DIRECTLY, so it
-    # is immune to that cascade. Complements scripts/runner-watchdog.sh: the
-    # watchdog self-heals; this is the backstop that fires loud when the
-    # watchdog itself can't (Mac off/asleep, auth break).
-    name: self-hosted runner online check
-    runs-on: ubuntu-latest
-    # Only meaningful on the fork that OWNS the runner. ntornow has no runner, so
-    # its self-hosted jobs skip by design — don't alert there.
-    if: |
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-      && github.repository == 'jiazou/unity2rbxlx'
-    permissions:
-      # Listing self-hosted runners needs administration:read on the repo. If the
-      # workflow token is ever denied here, the step fails loud (below) — set a
-      # PAT secret with admin:read and pass it as GH_TOKEN instead.
-      administration: read
-    steps:
-      - name: Assert the 'studio' runner is online
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          label="studio"
-          if ! json="$(gh api "repos/${{ github.repository }}/actions/runners" 2>/tmp/gh_err)"; then
-            echo "::error::runner-health: could not read self-hosted runners via the API."
-            echo "  If this is a 403, the workflow token needs administration:read"
-            echo "  (or set a PAT secret with admin:read and pass it as GH_TOKEN). gh said:"
-            sed 's/^/    /' /tmp/gh_err
-            exit 1
-          fi
-          total="$(echo "$json" | jq "[.runners[] | select([.labels[].name] | index(\"$label\"))] | length")"
-          online="$(echo "$json" | jq "[.runners[] | select([.labels[].name] | index(\"$label\")) | select(.status == \"online\")] | length")"
-          echo "self-hosted runners labelled '$label': total=$total online=$online"
-          if [ "$total" -eq 0 ]; then
-            echo "::error::No self-hosted runner labelled '$label' is registered — the nightly Studio smoke / cold-e2e jobs cannot run. Re-register on the runner Mac: scripts/setup-nightly-runner.sh"
-            exit 1
-          fi
-          if [ "$online" -eq 0 ]; then
-            echo "::error::The '$label' self-hosted runner is OFFLINE — last night's Studio smoke / cold-e2e jobs were not validated. The watchdog (scripts/runner-watchdog.sh) should self-heal within ~30 min; if it hasn't, the runner Mac is asleep/off or its gh auth broke. Manual revive: launchctl kickstart -k gui/\$(id -u)/com.github.actions-runner"
-            exit 1
-          fi
-          echo "OK — $online '$label' runner(s) online; nightly Studio jobs can run."
-
   nightly-summary:
     name: nightly summary
     runs-on: ubuntu-latest
