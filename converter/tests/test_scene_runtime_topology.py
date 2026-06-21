@@ -766,6 +766,7 @@ class TestTopologyEmissionShape:
             guid_index=None,
             dependency_map={},
             transpilation_result=TranspilationResult(),
+            dependency_analysis_available=False,
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -2970,6 +2971,7 @@ class TestApplyTopologyToRbxScripts:
             # ``transpilation_result is not None``. Populate it so
             # these tests' fresh-build path runs as expected.
             transpilation_result=TranspilationResult(),
+            dependency_analysis_available=False,
         )
         return pipeline
 
@@ -3326,6 +3328,7 @@ class TestApplyTopologyToRbxScripts:
             guid_index=None,
             dependency_map={},
             transpilation_result=None,  # transpile didn't run on resume
+            dependency_analysis_available=False,
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -3394,6 +3397,7 @@ class TestApplyTopologyToRbxScripts:
             guid_index=None,
             dependency_map={},
             transpilation_result=TranspilationResult(),
+            dependency_analysis_available=False,
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -3502,6 +3506,7 @@ class TestApplyTopologyToRbxScripts:
             guid_index=None,
             dependency_map={},
             transpilation_result=None,
+            dependency_analysis_available=False,
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -3547,6 +3552,7 @@ class TestApplyTopologyToRbxScripts:
             guid_index=None,
             dependency_map={"Caller": ["Target"]},
             transpilation_result=TranspilationResult(),
+            dependency_analysis_available=False,
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -3778,6 +3784,7 @@ class TestIntrinsicScriptTypeRoundTwoContract:
             # transpilation_result=None signals "no retranspile this run";
             # preserve caller_graph too.
             transpilation_result=None,
+            dependency_analysis_available=False,
         )
 
         # This must NOT raise. Round-1's pre-classifier first build
@@ -3849,6 +3856,7 @@ class TestSlice9aTopologyInputsPlumbing:
             guid_index=None,
             dependency_map={},
             transpilation_result=TranspilationResult(),
+            dependency_analysis_available=False,
         )
         return pipeline
 
@@ -3986,6 +3994,7 @@ class TestSlice9aTopologyInputsPlumbing:
             guid_index=None,
             dependency_map={},
             transpilation_result=None,  # resume signal
+            dependency_analysis_available=False,
         )
         resume_pipeline._build_and_apply_topology(
             scene_runtime_resume, StoragePlan(),
@@ -4212,6 +4221,7 @@ class TestSlice9bR1DegenerateFixture:
             guid_index=None,
             dependency_map={},
             transpilation_result=TranspilationResult(),
+            dependency_analysis_available=False,
         )
         pipeline.ctx = SimpleNamespace(
             scene_runtime_mode="generic",
