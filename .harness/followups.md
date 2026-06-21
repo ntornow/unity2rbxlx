@@ -1445,3 +1445,221 @@ HANDOFF: converter/TODO.md Infrastructure P1 "Converter doesn't wire ScreenGui e
   deterministic end-to-end verify (detector keeps SettingPopup/LoadoutState/GameState on the real scene).
   A live `/e2e-test` Studio playtest (SettingPopup About popups visibly land; LoadoutState.missionPopup
   resolves; no double-stamp) is available as a confirmatory check post-merge.
+
+## /drive run slider-fillrect-value-20260621T121417 (2026-06-21T15:45:03Z)
+# Followups — slider-fillrect-value
+
+- **Toggle/checkmark guessed-name resolver.** The same HUD's `setToggle` has the identical
+  guessed-name defect class: `FindFirstChild("Check") or "Checkmark" or "On"`
+  (output/simplefps-verify/scripts/HudControl.luau:81). A faithful fix would anchor on the
+  Toggle's serialized `m_Graphic`/`graphic` ref (the Toggle checkmark-binding work already
+  resolves `graphic` for `.Visible`). Out of scope for the slider fix.
+
+- **Draggable/interactive sliders.** This effort covers the value-write/display path
+  (health/value bars). Unity sliders driven by user handle drag (input -> value) are not
+  addressed.
+
+- **Instance-anchored coverage guard (Phase 1 detailed-design residual).** The slider coverage
+  guard is shape-anchored (it flags a guessed-fill `setSliderValue` the pack failed to rewrite)
+  because `run_packs(scripts)` / `fix_require_classifications(scripts)`
+  (`script_coherence.py:203,351`) receive only `scripts` — no `ctx`/`scene_runtime`/`rbx_place`,
+  so the producer's set of sliders that DID get a `SliderFillElement` attribute is not visible at
+  the guard site. A stronger guard would thread that deterministic instance set down (like
+  `ui_toggle_bindings` rides `scene_runtime`) and assert every such slider's HUD resize was
+  rewritten. Deferred: it widens the coherence entry signature + its pipeline caller —
+  disproportionate for the slider phase.
+
+- **Converter RectTransform→Size collapse for stretched UI fills.** The converted fill
+  (`CurHealth`) lands Size=(0,0,0,0) and the rbxlx writer emits no `AnchorPoint`
+  (`output/simplefps-verify/converted_place.rbxlx:65026`; `roblox/rbxlx_writer.py:592-709`). The
+  slider reader works around this by authoring a full UDim2, but other stretched UI elements
+  whose Unity RectTransform uses anchor-stretch + non-trivial pivot may also collapse to zero
+  Size. General fix = honor stretched anchors + pivot in `_extract_rect_transform`
+  (`ui_translator.py:803`) and emit AnchorPoint. Out of scope for the value-display fix.
+
+- **Path encoding vs `/` in a Unity GameObject name.** `SliderFillElement` uses `/` as the path
+  separator; a literal `/` inside a Unity hierarchy name would corrupt it. Unity disallows `/` in
+  hierarchy names in practice, so unhandled — recorded as a theoretical residual.
+
+## phasedesign1 review — worktree artifact availability
+- The `output/simplefps-verify/{scripts/HudControl.luau, converted_place.rbxlx}` artifacts that
+  acceptance criteria 5 (pack rewrites real shape) and 9 (output patch) depend on exist only in
+  the MAIN repo, not the design1 worktree (`output/` is untracked). Implementer must copy
+  `output/simplefps-verify` into the worktree (or re-run a conversion) before exercising 5/9.
+- Instance-anchored coverage guard (threading the producer's `SliderFillElement` set down to
+  `run_packs`) deferred — it would widen `fix_require_classifications`/`run_packs` signatures.
+  Recorded as the shape-anchored-guard residual; only this form catches a whole-shape HUD drift
+  (e.g. the method-form `HudControl:UpdatePlayerHealth` in
+  tests/fixtures/roblox_calls/drive-door-generic/HudControl.luau).
+
+- [size] Phase-1 production size landed at the upper edge (~180-244 lines incl a ~46-line Luau
+  payload constant) of the ~120-180 estimate. Not split: it is one writer->reader->router
+  shared-contract chain (shared-contract right-sizing rule keeps it in one unit). Recorded, no action.
+
+## slop (deferred to finalize)
+converter/converter/script_coherence_packs.py:5217 — codex-flagged slop (phase1 harden)
+converter/converter/script_coherence_packs.py:5288 — codex-flagged slop (phase1 harden)
+converter/converter/script_coherence_packs.py:5344 — codex-flagged slop (phase1 harden)
+converter/converter/ui_translator.py:1074 — codex-flagged slop (phase1 harden)
+
+## concurrent-session git incident (2026-06-21)
+- This run shares a clone with other concurrent /drive sessions. During finalize, branch refs
+  raced: the finalize fixer found wt/finalize transiently on `drive/dependency-map-persist-...`
+  and `drive/slider-fillrect-value-...` momentarily at the base 51aaded; it recovered via
+  `git checkout -B drive/slider-... da84fb2` then committed 93e3fa1 (verified correct lineage +
+  content). Separately, `drive/dependency-map-persist-20260621T123313` reflog shows IT reset
+  ITSELF to `phaseInt/slider-fillrect-value-.../1` (da84fb2) — another session's operation, NOT
+  this run's (no command here referenced that branch). Left untouched (don't disturb concurrent
+  work). LESSON: in a shared clone, pin to the verified SHA (93e3fa1) for ship/push with an
+  explicit refspec; do not trust branch-name resolution under concurrent races.
+
+## ROOT CAUSE of the concurrent-session git incident (2026-06-21)
+- I read runId from shared /tmp/drive_runid.txt on every command. A concurrent session
+  (dependency-map-persist-20260621T123313) clobbered it to ITS runId. So commands using
+  `FB="drive/$RUNID"` (the phase-advance `git branch -f` and a stability re-pin) targeted the
+  WRONG branch — that is how `drive/dependency-map-persist-...` got reset to my phaseInt then to
+  93e3fa1 (its reflog confirms: two "Reset to ..." entries, no commits of its own → NO work lost;
+  that session is stage=done and shipped on a separate `fix/...` branch I never touched).
+- MY work is intact: drive/slider-fillrect-value-... = 93e3fa1, state.json correct, 4745 green.
+- FIX: stopped trusting /tmp/drive_runid.txt; hardcoded my runId; use LITERAL branch names for all
+  git ops. The stale `drive/dependency-map-persist-...` pointer (now at my 93e3fa1) left UNTOUCHED
+  (don't disturb concurrent work; recoverable by that session — no commits lost).
+- LESSON (promote): in a shared clone, NEVER read runId from shared /tmp; hardcode it, use literal
+  refs, re-verify tip by literal name before every commit/push. [[drive ship gate + concurrent /tmp clobber]]
+
+## LIVE E2E FINDING — slider fix is NECESSARY BUT NOT SUFFICIENT (2026-06-21)
+Faithful Studio Play e2e on the fixed SimpleFPS conversion:
+- ✅ MY FIX IS CORRECT: manually calling the rewritten path-walk + resize on the live visible
+  fill (PlayerGui.HUD.Module.Health.Back.CurHealth) drains it to exactly 30% width
+  (AbsoluteSize 24.3 = 30% of Back's 80.98). The running HUD has the rewritten setSliderValue,
+  the Health frame carries SliderFillElement="Back/CurHealth", the path resolves.
+- ❌ BUT firing the REAL Player_HealthUpdate event does NOT drain the visible bar. Root cause:
+  a SEPARATE pre-existing HUD defect. The converted HUD resolves its UI host via
+  `container = playerGui:WaitForChild("ScreenGui",10) or playerGui:FindFirstChildOfClass("ScreenGui")`.
+  There is no child literally named "ScreenGui" (the HUD ScreenGui is named "HUD"), so WaitForChild
+  times out and FindFirstChildOfClass("ScreenGui") returns the FIRST ScreenGui = **"Chat"** (a CoreGui
+  default), NOT "HUD". PlayerGui ScreenGui order: Chat, BubbleChat, Freecam, HUD.
+  → getModule()=findDescendant(Chat,"Module")=nil → getHealth()=nil → setSliderValue(nil) early-returns.
+  The bar can NEVER update (health/ammo/items all broken the same way) regardless of the fill fix.
+- CONCLUSION: to fix the user symptom "bullets hit but no visible damage", BOTH are required:
+  (1) [DONE, this run] faithful fill-element resolution (the slider fix);
+  (2) [SEPARATE DEFECT] the HUD UI-host/container resolution must find the right ScreenGui by NAME
+      (or search PlayerGui broadly), not FindFirstChildOfClass("ScreenGui") which grabs Chat.
+  Defect (2) is a generic UI-host-resolution bug affecting the whole HUD, not slider-specific —
+  warrants its own focused /drive effort. Promote: trace EVERY link of the causal chain before
+  claiming a fix resolves the symptom (necessary-but-insufficient). [[repro-live-symptom-before-building]]
+
+## COURSE-CORRECTION — e2e findings were a LEGACY-SHORTCUT ARTIFACT (2026-06-21)
+I ran the live e2e on a fast LEGACY-mode `assemble` re-build (scene_runtime_mode=legacy), NOT the
+faithful generic /convert-unity conversion. In that legacy build the HUD (PlayerScripts.HudControl)
+carries a BasePart guard (pipeline.py:7077, added to requires_part_parent scripts that land outside
+recognized client containers) so it returns immediately → never connects → bar never drains. BUT
+pipeline.py:7059-7073 explicitly REFUSES to guard scripts in StarterPlayerScripts/StarterGui (warns
+instead) — so a correct/faithful conversion would NOT disable the HUD. The root-cause memory states
+the prior FAITHFUL conversion is one "where HudControl actually loads."
+=> The "dead HUD" + "container=Chat" findings are almost certainly artifacts of the legacy shortcut,
+   NOT real defects. My slider fill fix (proven correct at the fill level) is very likely SUFFICIENT
+   on the faithful path. MUST re-verify on the faithful GENERIC conversion before any scope expansion.
+LESSON (reinforces [[shortcut-artifact-is-not-a-regression]] + [[e2e-never-u2r-only-convert-unity]]):
+   NEVER conclude a converter defect from a dev-shortcut build; reproduce on the faithful
+   /convert-unity (generic) path FIRST. I over-eagerly concluded necessary-but-insufficient + a scope
+   explosion from an unfaithful artifact.
+
+## FAITHFUL-PATH FINDING — pack misses the GENERIC HUD shape (2026-06-21)
+Faithful generic conversion (output/simplefps-generic, scene_runtime_mode=generic):
+- Writer WORKS: generic rbxlx Health frame carries SliderFillElement="Back/CurHealth" + D-1 attrs
+  (ui_translator is mode-independent). NO BasePart guard (legacy artifact confirmed; HUD runs).
+- Reader FAILS: the generic HUD is an OOP require-module with NO setSliderValue function. It inlines
+  `local healthFill = healthFrame:FindFirstChild("Fill")` in :Awake() and resizes via
+  `healthFill.Size = UDim2.new(pct,0,1,0)` inside a `self.host:connect(healthEvt.Event, ...)` handler.
+  My coherence pack + coverage guard BOTH key on `function setSliderValue` → silent abstain → the
+  generic HUD still guesses "Fill" → bar frozen on the faithful path.
+=> NEED: broaden the pack to ALSO detect+rewrite the inlined generic shape (resolve the guessed-fill
+   `X:FindFirstChild("Fill"/"Bar"/"Foreground")` on a frame carrying SliderFillElement -> path-walk;
+   and make the resize anchor/direction-aware + full-UDim2). Broaden the coverage guard to flag ANY
+   un-rewritten guessed-fill resolution, not just the setSliderValue-function shape.
+   (Validates Codex's design-review silent-abstain BLOCKING + [[enumerate-real-input-space-before-abstraction-lock]].)
+
+## FUNDAMENTAL FINDING — coherence packs are LEGACY-ONLY; reader half doesn't fire on faithful path (2026-06-21)
+The faithful generic assemble logs: "[write_output] Skipping legacy require-injection and coherence
+packs in generic scene-runtime mode (contract allowlist; requires resolved by contract pipeline)".
+=> GENERIC mode (the faithful /convert-unity path) does NOT run run_packs / coherence packs AT ALL.
+   My fix's READER half is entirely a coherence pack → it NEVER fires on the faithful path → the
+   generic HUD keeps `FindFirstChild("Fill")` → bar frozen. The pack rewrites the real generic source
+   correctly when run directly (proven), but the pipeline never invokes it in generic mode.
+- The WRITER half (ui_translator SliderFillElement attribute + D-1 dispatch) IS mode-independent and
+  works in generic (verified in the generic rbxlx).
+- ARCHITECTURE IMPLICATION: the reader rewrite needs a GENERIC-mode-compatible lever, NOT a coherence
+  pack. Note the generic HUD uses `self.host:connect(...)` — it HAS a host handle — so the design's
+  ORIGINAL component-2 `host:setSliderValue` helper (DROPPED because the LEGACY HUD had no host) is
+  actually viable/correct for generic mode. The design resolved Open-Q#1 to inline-reader based on a
+  LEGACY-only observation; generic needs the host-helper or a contract-pipeline transform.
+- ALL 6 dual-voice review passes missed this (validated the pack vs the legacy shape; never checked
+  that generic mode runs packs). Only the faithful e2e surfaced it. Reinforces:
+  [[e2e-never-u2r-only-convert-unity]], [[enumerate-real-input-space-before-abstraction-lock]],
+  and "verify on the faithful integrated path, not a dev shortcut".
+
+## FAITHFUL-PATH FIX APPLIED (2026-06-21)
+After adding the generic `lower_slider_fill` contract-pipeline pass: the faithful GENERIC conversion's
+HudControl.luau now has the fix — guessed `FindFirstChild("Fill")` = 0, `_resolveSliderFill` helper
+injected, resolution rewritten to `_resolveSliderFill(healthFrame)`; writer SliderFillElement attr
+present in the generic rbxlx. Generic HUD chain (sound, traced): self.gameObject -> Module -> Health
+-> _resolveSliderFill -> CurHealth -> resize on host:connect(HealthUpdate). The legacy container=Chat
+bug is legacy-only (generic uses self.gameObject, not FindFirstChildOfClass). Full fast suite 4757
+passed, no-Any 0. Pending: live Studio confirmation on the GENERIC rbxlx that the bar drains on hit;
+then commit the new code (lower_slider_fill + slider_fill_common extraction) to featureBranch, review, ship.
+
+## Finalize P2 residuals (non-blocking, 2026-06-21)
+- Add a cross-layer contract test: writer emits SliderFillElement on a slider Frame -> BOTH readers
+  (legacy _resolveSliderFill + generic _resolveSliderFill) resolve the real fill end-to-end (currently
+  readers are tested in isolation against hardcoded script text). The faithful /e2e-test is the live
+  cross-layer proof.
+- Partial path-walk duplication: _CANONICAL_SLIDER_SETTER (legacy, direction-aware) vs _SLIDER_FILL_HELPER
+  (generic inline). Different shapes by design; a future full de-dup could share the inner segment-walk.
+- [de-slop, confirmed-dead] Remove the dead `ct == "Slider"` OR-branch at ui_translator.py:~703.
+  Real Unity sliders serialize as MonoBehaviour (D-1); grep confirms NO test uses
+  component_type="Slider", so the phase-1 design's "synthetic fixtures exist" rationale was wrong.
+  Safe 1-line removal; deferred from finalize only to avoid re-binding the ship reviewed-sha at
+  end-of-run. Remove in the next touch of this file.
+
+### damage-routing live-e2e addendum
+After adding the generic `lower_slider_fill` contract-pipeline pass: the faithful GENERIC conversion's
+HudControl.luau now has the fix — guessed `FindFirstChild("Fill")` = 0, `_resolveSliderFill` helper
+injected, resolution rewritten to `_resolveSliderFill(healthFrame)`; writer SliderFillElement attr
+present in the generic rbxlx. Generic HUD chain (sound, traced): self.gameObject -> Module -> Health
+-> _resolveSliderFill -> CurHealth -> resize on host:connect(HealthUpdate). The legacy container=Chat
+bug is legacy-only (generic uses self.gameObject, not FindFirstChildOfClass). Full fast suite 4757
+passed, no-Any 0. Pending: live Studio confirmation on the GENERIC rbxlx that the bar drains on hit;
+then commit the new code (lower_slider_fill + slider_fill_common extraction) to featureBranch, review, ship.
+
+## Finalize P2 residuals (non-blocking, 2026-06-21)
+- Add a cross-layer contract test: writer emits SliderFillElement on a slider Frame -> BOTH readers
+  (legacy _resolveSliderFill + generic _resolveSliderFill) resolve the real fill end-to-end (currently
+  readers are tested in isolation against hardcoded script text). The faithful /e2e-test is the live
+  cross-layer proof.
+- Partial path-walk duplication: _CANONICAL_SLIDER_SETTER (legacy, direction-aware) vs _SLIDER_FILL_HELPER
+  (generic inline). Different shapes by design; a future full de-dup could share the inner segment-walk.
+- [de-slop, confirmed-dead] Remove the dead `ct == "Slider"` OR-branch at ui_translator.py:~703.
+  Real Unity sliders serialize as MonoBehaviour (D-1); grep confirms NO test uses
+  component_type="Slider", so the phase-1 design's "synthetic fixtures exist" rationale was wrong.
+  Safe 1-line removal; deferred from finalize only to avoid re-binding the ship reviewed-sha at
+  end-of-run. Remove in the next touch of this file.
+
+## LIVE E2E (generic, faithful) — slider fill PROVEN; symptom blocked by a SEPARATE upstream defect (2026-06-22)
+On the faithful GENERIC SimpleFPS conversion, in a live Play session:
+- ✅ MY SLIDER FILL FIX IS PROVEN CORRECT LIVE: _resolveSliderFill resolves Back/CurHealth on the live
+  PlayerGui.HUD.Module.Health slider and the fill renders at exactly 30% width (AbsSize 24.3 of Back's
+  80.98) when resized. The faithful-path reader (lower_slider_fill) is wired and works.
+- ❌ THE SYMPTOM IS NOT FULLY RESOLVED — a SEPARATE upstream defect: the damage->HealthUpdate->HUD event
+  chain is dead at runtime. The converted Player module HAS TakeDamage/curHealth and FIRES HealthUpdate;
+  HudControl connects to it. But at runtime NO HealthUpdate event exists in ReplicatedStorage (only the
+  default chat event), the HUD component's :Awake apparently didn't run (hudGO none in workspace), and a
+  BindableEvent-based HealthUpdate cannot cross the client/server boundary (Player fires server-side,
+  HudControl listens client-side -> different objects). Server Humanoid=100/100 (converted damage not
+  authoritatively applied); client showed 90/100 (desync). So damage never reaches the bar.
+=> The slider fill fix (this run's deliverable) is necessary + correct + proven. Full "visible damage on
+   the health bar" additionally needs the converted health-event wiring (HUD component lifecycle +
+   cross-context HealthUpdate as a RemoteEvent, not a per-context BindableEvent) — a SEPARATE, larger
+   /drive effort (the converted game's health/damage runtime, not slider-specific).
+LESSON: the symptom chain had FOUR layers (dispatch, fill-name, faithful-path lever, health-event
+wiring); the slider fill fix is one. Trace EVERY link live before claiming the symptom is fixed.

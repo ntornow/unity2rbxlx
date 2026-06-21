@@ -54,3 +54,26 @@
   canvases have `Canvas.m_Enabled=1` (per-state visibility is GameObject-active driven); and it is a
   strict improvement over the pre-fix baseline (all canvases shipped Enabled=true). Surfaced by codex
   finalize review.
+
+## /drive run slider-fillrect-value-20260621T121417 — architectural follow-ups (2026-06-21T06:37:44Z)
+
+- ui_translator.py:241 / script_coherence_packs.py:5252 — The Slider fill contract (SliderFillElement)
+  is a descendant-NAME path. It disambiguates fills across different parents, but two SIBLING
+  GameObjects with the IDENTICAL name resolve via FindFirstChild-first-match → could bind the wrong
+  fill. Out of scope for this run (rare; Unity sibling-name collisions are unusual; _SceneRuntimeId is
+  not stamped on UI fill elements so a stronger id isn't freely available). A robust fix would encode a
+  child-index or a structural id alongside the name path if duplicate-sibling-name scenes matter.
+
+## NEXT EFFORT (high priority) — converted health-system damage routing (2026-06-22)
+Live e2e on faithful generic SimpleFPS proved the slider FILL display fix is correct, but the HUD
+bar still won't drain on bullets because of a SEPARATE health-system mismatch:
+- PlaneBullet (and other damage sources) deal damage via `humanoid:TakeDamage(self.damage)` to the
+  Roblox Humanoid, NOT the converted `Player.TakeDamage`/`curHealth`/`HealthUpdate` that drives the
+  Unity HUD slider. The two health systems are disconnected; the Roblox Humanoid bar is also disabled.
+- Compounding: the HUD component's `:Awake()` didn't run at runtime, and `HealthUpdate` is a per-context
+  `BindableEvent` (can't cross client/server).
+GENERIC FIX DIRECTION (affects all converted games): bridge the Roblox Humanoid and the converted Unity
+health system — route converted damage through `Player.TakeDamage` (so HealthUpdate fires → HUD), OR
+mirror `Humanoid.HealthChanged` → `HealthUpdate`; and ensure the generic scene runtime constructs +
+`:Awake()`s the HUD component, and uses a RemoteEvent (not BindableEvent) for cross-context health events.
+Own dedicated /drive effort.

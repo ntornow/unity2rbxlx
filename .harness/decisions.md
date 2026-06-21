@@ -4142,3 +4142,162 @@ P2-HARDEN: setActive dispatch now accepts a userdata Instance arg (`elseif type(
   children suppressed. Bias to abstain: no same-method clear -> KEEP (safe). Feasible on existing infra
   (script_analyzer _strip_comments + Instantiate|Destroy regex + _matching_brace_span; lazy_singleton
   _method_body precedent). Classification: User-Challenge (explicit user direction).
+
+## /drive run slider-fillrect-value-20260621T121417 (2026-06-21T15:45:03Z)
+# Decisions — slider-fillrect-value
+
+## PLAN stage (high-level design)
+
+- **Anchor the fill element on `m_FillRect` (deterministic fileID), never a guessed name.**
+  Root cause: the AI guessed (`"Fill"/"Bar"/"Foreground"`); we resolve the serialized ref.
+  Classification: Mechanical.
+
+- **Resolve fileID→GameObject-NAME via a scene-wide map built like
+  `build_component_owner_index`, threaded through the existing recursion arg that already
+  carries `component_owner_index` to the slider dispatch.** Reuses proven Toggle plumbing.
+  Classification: Mechanical.
+
+- **Transport the fill name as a Frame attribute `SliderFillElement`, consumed by the
+  runtime — same scheme as the existing `SliderDirection`/`MinValue` attributes.** One
+  canonical attribute is the producer/consumer contract. Classification: Taste.
+
+- **Component 3 is a coherence pack doing identity-gated detection + span-located body swap
+  (like `door_player_flag_location`), not a prompt edit or a regex on AI output.** The
+  `_AI_SYSTEM_PROMPT` is byte-frozen; the pack is the deterministic, testable lever.
+  Classification: Mechanical.
+
+- **One phase.** The 3 components are a writer→reader→contract chain (component 1 writes the
+  attribute, 2 reads it, 3 routes AI output to 2); the project right-sizing preference keeps
+  such a chain in ONE review unit. No fan-out (sequentially dependent), no staged-risk
+  foundation. Classification: Taste.
+
+- **Output patch included (HudControl.luau)** per the project bug-fix protocol (fix pipeline
+  AND affected output). Classification: Mechanical.
+
+## Open (deferred to detailed design, recorded as design.md Open Questions)
+- HUD→host reachability (host handle vs inline self-contained reader) — the transpiled HUD
+  is a standalone client LocalScript with no `host` in scope (`HudControl.luau:57,61`).
+- RTL/vertical fill: resize Size only vs also move AnchorPoint/position.
+
+## PLAN stage decisions
+- **Right-size the plan review.** This is a tightly-scoped, already-root-caused converter
+  bug fix (one phase, ~120-180 SLOC). The full autoplan CEO→Design→Eng→DX product gauntlet
+  (market risk, DX onboarding, etc.) is disproportionate. The load-bearing reviews —
+  engineering soundness of the 3-component contract chain + the adversarial Codex second
+  opinion the user explicitly requested — are delivered by the dual-voice `/drive-review
+  design` primitive (Claude reviewer subagent + codex exec). Consolidated step 2a (autoplan)
+  and step 2b (dual-voice design review) into one eng-altitude dual-voice review to avoid
+  running two overlapping Claude+Codex passes on the same design.md.
+  Classification: Mechanical (right-sizing per OPERATING.md; both steps reduce to the same
+  Claude+Codex-on-design work for a change this size).
+
+## PLAN stage — round-2 codex review (codex recovered after outage)
+- **Strengthen the stored fill identity from a bare NAME to a relative descendant PATH**
+  (`SliderFillElement="Back/CurHealth"`). Codex BLOCKING: names aren't unique post-conversion.
+  Verified `_SceneRuntimeId` is NOT stamped on UI fill elements (0 in real rbxlx) → a
+  converter-computed relative path is the feasible strong identity. Classification: Mechanical
+  (correctness; the converter knows the tree deterministically).
+- **Reader resolves by descendant path (grandchild-safe) + FAILS LOUD** — never silently fall
+  back to the guessed "Fill"/"Bar"/"Foreground" names (that fallback is the bug). Classification:
+  Mechanical (the real fill is a grandchild; direct-child lookup is wrong).
+- **Resize is anchor/direction-aware**, not width-only; e2e must visually confirm drain
+  direction. Codex BLOCKING. Classification: Mechanical (general correctness across directions).
+- **Open Q#1 RESOLVED → option (b) inline-reader** (both voices agree); component-2 host helper
+  not built for the live HUD path (HUD has no host handle). Classification: Taste→settled by
+  dual-voice consensus.
+- **Coherence pack hardened: broaden match surface + deterministic coverage guard** so a
+  silent-abstain (AI renames/inlines/reshapes the helper) is flagged loudly rather than shipping
+  a frozen bar. Anchors load-bearing correctness on the deterministic upstream attribute, not the
+  AI-output fingerprint (per [[generic-binding-on-ai-output-fingerprints-is-fragile]]).
+  Classification: Mechanical (project anti-fragility rule). Full canonical-injection deferred
+  unless detailed design shows the guarded matcher is still too fragile.
+
+## DESIGN stage — Phase 1 detailed design (against the real code)
+
+- **D-1 (BLOCKING, User-Challenge): the slider dispatch is DEAD on real scenes.** A Unity
+  Slider serializes as a MonoBehaviour (CID 114 → `component_type=="MonoBehaviour"`,
+  `unity/yaml_parser.py:114`, `scene_parser.py:174`), so `ct=="Slider"`
+  (`ui_translator.py:652`) NEVER fires — verified against `SimpleFPS/main.unity:840` (the
+  Slider is `!u!114 &74771062` on the `Health` GO) and the real rbxlx (the `Health` Frame has
+  NO slider attributes at all). The producer fix MUST first detect the slider by its defining
+  field `m_FillRect` (mirrors the Toggle `m_IsOn` fix `:658-660`,
+  `[[unity-ui-widgets-serialize-as-monobehaviour-not-typed]]`). The high-level design assumed
+  the dispatch already ran; reality wins.
+
+- **D-2 (Mechanical): the converted fill is Size=(0,0,0,0) with NO AnchorPoint**
+  (`converted_place.rbxlx:65026`; the writer emits no AnchorPoint, `rbxlx_writer.py:592-709`).
+  The reader must AUTHOR a complete UDim2 for both axes (+ AnchorPoint/Position per direction),
+  not mutate one axis of a zero Size — otherwise a correctly-routed write stays invisible.
+
+- **D-3 (Mechanical): confirmed Open-Q#1 → inline reader.** `HudControl.luau` is a standalone
+  client LocalScript using `_G.Player`/`LocalPlayer` (lines 8,57,61); no `host` handle. The
+  reader is inlined into the rewritten `setSliderValue` body by the pack; NO `scene_runtime.luau`
+  change this phase (the design.md "Size estimate" host-helper line is stale).
+
+- **`SliderFillElement` value = `/`-separated relative path of converted node NAMES**
+  (`"Back/CurHealth"`), walked `FindFirstChild`-per-segment, fail-loud, no guessed-name
+  fallback. Names pass through unchanged (`ui_translator.py:614` → `rbxlx_writer.py:228`), so a
+  path of `SceneNode.name` segments matches the live tree. Classification: Mechanical.
+
+- **Reuse `parsed_scene.all_nodes` (threaded as `node_index`) as the fileID→node map**, not a
+  new traversal. Classification: Mechanical.
+
+- **Coverage guard is shape-anchored (guessed-fill `setSliderValue` presence-after-rewrite),
+  NOT instance-anchored**, because `run_packs(scripts)`/`fix_require_classifications(scripts)`
+  (`script_coherence.py:203,351`) receive only `scripts` — the producer's `SliderFillElement`
+  instance set is not reachable there. Instance-anchored guard deferred (followups).
+  Classification: Taste (right-sizing; residual recorded).
+
+- **ONE slice** — writer+reader+coverage-guard share a NEW co-authored contract (attr name,
+  path format, idempotency token `GetAttribute("SliderFillElement")`). Per the shared-contract
+  right-sizing rule they stay in one review unit. No fan-out, no staged-risk seam.
+  Classification: Taste.
+
+## Phase-1 DETAILED design — dual-voice review (round 1 → converged)
+- Claude reviewer: CONVERGED (0 P1; P2 method-form match surface, P3 doc line-ref) — verified
+  D-1/D-2/D-3 + all interfaces against real code.
+- Codex: no BLOCKING build-break (confirmed producer threading, dispatch, span-swap, reader all
+  buildable); ONE MAJOR P1 — reader Min/Max normalization mis-renders domains overlapping [0,1].
+- **Fix applied:** reader treats incoming value as a [0,1] fraction + clamp; dropped the
+  conditional Min/Max re-normalization (faithful to original semantics). Classification: Mechanical.
+- **Match surface broadened:** detector/apply/guard key on the `setSliderValue` helper-name token
+  (free-function AND `:method` form) + guessed-fill body tokens, not the `local function` prefix,
+  so a method-form HUD (tracked fixture drive-door-generic) is rewritten or loudly flagged, never
+  silently skipped. Classification: Mechanical (the design already committed to broadening).
+
+## IMPLEMENT stage — slice 1.1 (slider_fill_faithful_resize)
+- **Criterion 9 re-framed (output/ is GITIGNORED):** the output HudControl.luau patch is
+  applied locally for sanity but is NOT a committed artifact. Tracked coverage instead:
+  (a) the REAL AI-emitted guessed-fill setSliderValue body is embedded as a Python literal in
+  test_script_coherence_packs.py (tautology-free), and (b) test_rewrite_emits_canonical_constant
+  asserts the pack splices exactly `_CANONICAL_SLIDER_SETTER`, keeping constant↔output in sync.
+  Classification: Mechanical (per implement-prompt adjustment #1).
+- **Method-form setSliderValue is FLAGGED, not rewritten.** The canonical replacement body is a
+  free function (`local function setSliderValue`); splicing it over a method-form definition
+  (`function T:setSliderValue`) would break the call contract. So the apply rewrites ONLY the
+  free-function form, while the detector AND coverage guard key on the broadened helper-name
+  anchor (free-function OR `:setSliderValue`) — a method-form guessed-fill HUD is therefore
+  LOUDLY flagged by the guard, never silently skipped by both (satisfies design §3 edge case 5 /
+  adjustment #2: "rewritten OR loudly flagged"). Classification: Mechanical (the real emitted
+  shape is free-function; no method-form HUD fixture exists in-repo).
+
+## Slice 1.1 review-fix deviation (2026-06-21)
+- **P1-A (no-Any gate) resolved via option (3): allowlist `converter/converter/ui_translator.py`.** Options (1)/(2) are not achievable here: (1) keeping the pre-slice `props: dict[str, Any]` line byte-identical is impossible because the `def` MUST grow new kwargs, so any form of the signature line containing `Any` differs from origin and the boy-scout line-diff gate flags it; (2) there is no concrete non-`Any` type — `props` receives `ComponentData.properties`, declared `dict[str, Any]` at `core/unity_types.py:29` (the Unity-YAML deserialization boundary). So the `Any` here IS the YAML seam, identical in kind to the already-allowlisted `yaml_parser.py`/`animation_converter.py` boundaries. Added one allowlist line with that justification. Classification: Mechanical (typed/untyped boundary recognition).
+
+## HARDEN phase 1 — fix set applied (2026-06-21)
+- **FIX 1 (P1, fail-loud path encoding) applied at BOTH ends (belt-and-suspenders).** Writer `_relative_fill_path` now returns `None` when any collected segment name is empty (`""`) OR contains `/` (un-encodable → writer abstains → no `SliderFillElement` attr). Reader `_CANONICAL_SLIDER_SETTER` replaced the silent `gmatch("[^/]+")` walk with a `string.find(path,"/",cursor,true)` split that KEEPS empty segments and `warn(...)+return`s on an empty or non-resolving segment, so a malformed/empty-segment path fails loud instead of mis-resolving. Classification: Mechanical (root-cause fail-loud).
+- **Deviation (mechanical, in-scope): two existing reader-shape tests updated to the new walk tokens.** `test_rewrites_real_hud_shape` and `test_injected_reader_has_segment_walk` asserted the removed `gmatch("[^/]+")` line; re-pinned to `string.find(path, "/", cursor, true)` + `if segment == "" then`. Not a behavior change — the canonical constant changed shape, so the string-match assertions had to follow. No new slop introduced.
+- **FIX 2/3/4 (tests) added.** FIX 2: `test_canonical_setter_emits_correct_per_direction_anchor` pins LTR/RTL/BTT/TTB AnchorPoint+Position+Size. FIX 3: `test_two_free_function_setters_both_rewritten` pins the per-setter span walk + idempotency on TWO guessed free-function setters in one file. FIX 4: `test_relative_fill_path_empty_intermediate_name_returns_none` + `test_relative_fill_path_slash_in_name_returns_none` pin FIX 1 (verified RED pre-fix: pre-fix emits `/CurHealth` / `Cur/Health`). Classification: Mechanical.
+
+## Phase 2 (generic reader) — DESIGN approved (investigation + Codex, 2026-06-21)
+- LEVER: a new allowlisted `lower_slider_fill` pass in contract_pipeline.transpile_with_contract
+  (the generic-mode equivalent of coherence packs; same family as lower_trigger_enter/
+  lower_camera_mount_equip), porting the existing structural inline-fill rewrite. Keyed on the
+  deterministic SliderFillElement attribute. Rejected: prompt edit (cache-key cold-retranspile +
+  AI fingerprint) and host:setSliderValue (heavier; only needed for RTL/vertical). Classification:
+  Mechanical (matches generic transform architecture).
+- Codex caution (load-bearing): the SHARED regex/helper must operate at the SOURCE-STRING level so
+  both the legacy pack (RbxScript.source) and the generic lowering (TranspiledScript.luau_source)
+  reuse one implementation cleanly — avoid a shallow porting bug. Classification: Mechanical.
+- Residuals (flagged, out of scope for the LTR health-bar symptom): RTL/BottomToTop direction-aware
+  resize (would need the host route); generic method-form coverage (fail-loud guard makes drift observable).
