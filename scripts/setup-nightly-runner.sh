@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # One-shot setup for the nightly self-hosted GitHub Actions runner on this Mac.
 # Installs + registers the runner, loads it as a LaunchAgent (GUI-capable),
-# schedules a 02:55 wake so the 19:00 UTC cron finds the Mac awake, and
-# pre-installs converter dev deps. Idempotent — re-run anytime.
+# installs a watchdog LaunchAgent that self-heals a wedged runner, schedules a
+# 02:55 wake so the 19:00 UTC cron finds the Mac awake, and pre-installs
+# converter dev deps. Idempotent — re-run anytime.
 
 set -euo pipefail
 
@@ -135,6 +136,57 @@ launchctl bootstrap "gui/$USER_UID" "$PLIST"
 launchctl enable "gui/$USER_UID/$PLIST_LABEL"
 ok "runner is now running and will auto-start at every login"
 
+# ---- 5b. install the runner WATCHDOG LaunchAgent -------------------------
+# KeepAlive (above) only restarts the runner when its process EXITS. When the
+# listener instead hangs alive — broker long-poll dead, GitHub shows `offline`
+# — KeepAlive never fires and the runner stays silently dead (2026-06-10 →
+# 06-21 outage). This watchdog polls GitHub every 15 min and kickstart -k's the
+# runner whenever it reports `offline`. See scripts/runner-watchdog.sh.
+WATCHDOG_LABEL="com.github.actions-runner-watchdog"
+WATCHDOG_PLIST="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
+# Deploy the watchdog to the STABLE runner dir, not $REPO_ROOT/scripts — this
+# dev clone hops branches constantly (every /drive run), so a plist pointing at
+# the working tree would break whenever a branch lacks the file. Re-run this
+# script to redeploy after editing scripts/runner-watchdog.sh.
+WATCHDOG_SCRIPT="$RUNNER_DIR/runner-watchdog.sh"
+install -m 0755 "$REPO_ROOT/scripts/runner-watchdog.sh" "$WATCHDOG_SCRIPT"
+log "writing watchdog LaunchAgent plist → $WATCHDOG_PLIST"
+cat >"$WATCHDOG_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$WATCHDOG_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$WATCHDOG_SCRIPT</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>$RUNNER_DIR/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>$RUNNER_DIR/watchdog.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+    </dict>
+</dict>
+</plist>
+EOF
+launchctl bootout "gui/$USER_UID/$WATCHDOG_LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$USER_UID" "$WATCHDOG_PLIST"
+launchctl enable "gui/$USER_UID/$WATCHDOG_LABEL"
+ok "watchdog installed — polls every 15 min, self-heals a wedged runner"
+
 # ---- 6. wake the Mac at 02:55 local daily --------------------------------
 log "ensuring Mac wakes daily at $WAKE_TIME (needs sudo once)"
 if pmset -g sched | grep -qE "wake.*$WAKE_TIME"; then
@@ -177,7 +229,12 @@ cat <<EOF
   ── Tail runner logs ─────────────────────────────────────────────────────
     tail -f $RUNNER_DIR/runner.out.log
 
-  ── Stop the runner (if you ever need to) ───────────────────────────────
+  ── Watchdog (self-heals a wedged runner; polls every 15 min) ───────────
+    tail -f $RUNNER_DIR/watchdog.log
+    launchctl kickstart -k gui/$USER_UID/com.github.actions-runner-watchdog  # run now
+
+  ── Stop the runner + watchdog (if you ever need to) ────────────────────
     launchctl bootout gui/$USER_UID/$PLIST_LABEL
+    launchctl bootout gui/$USER_UID/com.github.actions-runner-watchdog
 ============================================================================
 EOF
