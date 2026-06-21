@@ -37,41 +37,78 @@ from test_scene_runtime_host_behavior import _run_scenario, pytestmark  # noqa: 
 
 
 # ---------------------------------------------------------------------------
-# AC3 -- the repro fix: scene ref to a placed-prefab stripped MB binds after
-# the placement-boot drain.
+# gap#4 acceptance (i) -- a scene comp's ref to a placed-prefab stripped MB is
+# NON-nil (object + .gameObject) AT THE SCENE COMP'S OnEnable, because PASS 1
+# constructs+registers the placement and the boot drain binds the ref BEFORE the
+# scene lifecycle runs (the inverted contract: pre-reorder the drain ran AFTER
+# the scene lifecycle, so the field was nil at Awake/OnEnable).
 # ---------------------------------------------------------------------------
 
-class TestStrippedRefBindsAfterPlacementDrain:
+class TestStrippedRefExistsBeforeSceneLifecycle:
 
-    def _plan_scenario(self, *, expect_bound: bool, drive_drain: bool) -> str:
-        # ``drive_drain`` mirrors the production call: start() runs the
-        # placement-boot loop then calls _drainPendingPlacementRefs. The RED
-        # variant models the PRE-FIX runtime by shadowing the drain method with
-        # a no-op on the instance (an instance field shadows the metatable
-        # method) BEFORE start() runs -- so the drain calls inside start() /
-        # _completeDeferredBatch do nothing, exactly as if the drain step never
-        # existed. The SAME real start()/_wireReferences run either way; only
-        # the drain is disabled. The field then stays nil end-to-end.
-        red_clear = (
-            "engine._drainPendingPlacementRefs = function() end  -- pre-fix: no drain\n"
-            if not drive_drain else ""
-        )
+    # ``drain_mode``:
+    #   "early"      -- production: boot drain runs in PASS 1, before lifecycle.
+    #   "absent"     -- RED proof (a): drain shadowed to a no-op for the whole
+    #                   run -> the ref never binds, nil at OnEnable. Proves the
+    #                   DRAIN is load-bearing.
+    #   "stays_late" -- RED proof (b): the boot drain is suppressed DURING
+    #                   start() (so PASS 1's early drain is a no-op) and the real
+    #                   drain is invoked only AFTER start() returns -- i.e. the
+    #                   drain still runs, but after the scene lifecycle, exactly
+    #                   the PRE-REORDER ordering. The field is nil at OnEnable
+    #                   even though it binds post-start. Proves the EARLY
+    #                   POSITION of the drain is load-bearing (distinct from (a)).
+    def _plan_scenario(self, *, drain_mode: str) -> str:
+        if drain_mode == "absent":
+            setup = (
+                "engine._drainPendingPlacementRefs = function() end"
+                "  -- RED (a): drain disabled entirely\n"
+            )
+            post = ""
+        elif drain_mode == "stays_late":
+            # Capture the real method, no-op it during start(), restore + invoke
+            # it after start() returns -> drain runs but AFTER the scene
+            # lifecycle (the pre-reorder order). probeAtOnEnable was captured
+            # synchronously during the scene OnEnable, so it reflects the
+            # pre-drain state.
+            setup = (
+                "local _realDrain = engine._drainPendingPlacementRefs\n"
+                "engine._drainPendingPlacementRefs = function() end"
+                "  -- RED (b): suppress the early drain during start()\n"
+            )
+            post = (
+                "engine._drainPendingPlacementRefs = _realDrain\n"
+                "engine:_drainPendingPlacementRefs()  -- drain LATE, after lifecycle\n"
+            )
+        else:  # "early" -- production order
+            setup = ""
+            post = ""
         # The engine-union key the placement boot registers under is
         # ``<placement_id>:<inst.instance_id>``; inst.instance_id is
         # ``<prefab_id>:<src_fid>``. The scene ref's resolved target_ref equals
         # that full key (what slice 3.2's planner emits).
         return textwrap.dedent("""\
+            -- Probes captured SYNCHRONOUSLY inside the scene comp's lifecycle,
+            -- the faithful observation point (LoadoutState:Enter runs inside
+            -- GameManager.OnEnable per the root cause).
+            local probeAtAwake = "UNREAD"
+            local probeAtOnEnable = "UNREAD"
+            local goAtOnEnable = "UNREAD"
             local boundField = "UNREAD"
-            local fieldDuringWire = "UNREAD"
 
             -- Source: a scene MonoBehaviour (LoadoutState) holding the ref.
             local Loadout = {} ; Loadout.__index = Loadout
             function Loadout.new(_) return setmetatable({}, Loadout) end
             function Loadout:Awake()
-                -- Scene refs wire BEFORE Awake; the placement hasn't booted yet
-                -- so the field is still nil here (the inherent ordering limit
-                -- for Awake; Start sees the bound value).
-                fieldDuringWire = self.missionPopup
+                probeAtAwake = self.missionPopup
+            end
+            function Loadout:OnEnable()
+                -- The live crash site reads ``self.missionPopup.gameObject``
+                -- inside the scene OnEnable; the ref MUST exist here now.
+                probeAtOnEnable = self.missionPopup
+                if self.missionPopup ~= nil then
+                    goAtOnEnable = self.missionPopup.gameObject
+                end
             end
             function Loadout:Start()
                 boundField = self.missionPopup
@@ -138,40 +175,354 @@ class TestStrippedRefBindsAfterPlacementDrain:
             }
             local services = servicesFor(plan, {loadout = Loadout, missionui = MissionUI}, instances)
             local engine = SceneRuntime.new(services, plan)
-            __RED_CLEAR__
+            __SETUP__
             engine:start("client")
+            __POST__
             runDeferred()  -- flush Start
 
-            assert(fieldDuringWire == nil,
-                "field must be nil during scene wire (pre-placement); got " ..
-                tostring(fieldDuringWire))
-            print("WIRE_NIL_OK")
-            if boundField == nil then
-                print("FIELD_NIL")
-            elseif type(boundField) == "table" and boundField.mark == "MUI" then
-                print("FIELD_BOUND")
+            if probeAtOnEnable == nil then
+                print("ONENABLE_NIL")
+            elseif type(probeAtOnEnable) == "table" and probeAtOnEnable.mark == "MUI" then
+                print("ONENABLE_NONNIL")
+                if goAtOnEnable ~= nil and goAtOnEnable ~= "UNREAD" then
+                    print("ONENABLE_GO_NONNIL")
+                else
+                    print("ONENABLE_GO_NIL")
+                end
             else
-                print("FIELD_OTHER:" .. tostring(boundField))
+                print("ONENABLE_OTHER:" .. tostring(probeAtOnEnable))
+            end
+            if probeAtAwake == nil then
+                print("AWAKE_NIL")
+            elseif type(probeAtAwake) == "table" and probeAtAwake.mark == "MUI" then
+                print("AWAKE_NONNIL")
+            else
+                print("AWAKE_OTHER:" .. tostring(probeAtAwake))
             end
             print("DONE")
-        """).replace("__RED_CLEAR__", red_clear)
+        """).replace("__SETUP__", setup).replace("__POST__", post)
 
-    def test_field_binds_to_cloned_component_after_drain(self):
-        # GREEN: real drain binds the field to the placed clone.
-        rc, out, err = _run_scenario(
-            self._plan_scenario(expect_bound=True, drive_drain=True))
+    def test_field_nonnil_with_gameobject_at_scene_onenable(self):
+        # GREEN (acceptance (i)): the early drain binds the ref BEFORE the scene
+        # lifecycle, so the scene comp sees a non-nil missionPopup -- with a
+        # non-nil .gameObject -- at its OnEnable (and even at Awake).
+        rc, out, err = _run_scenario(self._plan_scenario(drain_mode="early"))
         assert rc == 0, f"luau failed: {err}\n{out}"
-        assert "WIRE_NIL_OK" in out, out
-        assert "FIELD_BOUND" in out, f"field must bind after drain; got:\n{out}"
+        assert "ONENABLE_NONNIL" in out, (
+            f"missionPopup must be non-nil at the scene comp's OnEnable; got:\n{out}")
+        assert "ONENABLE_GO_NONNIL" in out, (
+            f"missionPopup.gameObject must be non-nil at OnEnable (the live crash "
+            f"site reads it); got:\n{out}")
+        assert "AWAKE_NONNIL" in out, (
+            f"under the reorder the ref also exists at Awake (constructed+drained "
+            f"before the whole scene lifecycle); got:\n{out}")
 
     def test_red_pre_fix_no_drain_leaves_field_nil(self):
-        # RED: without the drain step (pre-fix runtime) the field stays nil.
-        rc, out, err = _run_scenario(
-            self._plan_scenario(expect_bound=False, drive_drain=False))
+        # RED proof (a): the DRAIN is load-bearing. With it disabled the ref
+        # never binds, so it is nil at the scene OnEnable.
+        rc, out, err = _run_scenario(self._plan_scenario(drain_mode="absent"))
         assert rc == 0, f"luau failed: {err}\n{out}"
-        assert "WIRE_NIL_OK" in out, out
-        assert "FIELD_NIL" in out, (
-            f"pre-fix (no drain) must leave field nil (RED proof); got:\n{out}")
+        assert "ONENABLE_NIL" in out, (
+            f"RED (a): without the drain the ref must be nil at OnEnable; got:\n{out}")
+
+    def test_red_drain_stays_late_leaves_field_nil_at_onenable(self):
+        # RED proof (b): the EARLY POSITION of the drain is load-bearing. The
+        # drain still runs (so the field binds post-start), but only AFTER the
+        # scene lifecycle -- the pre-reorder order -- so the ref is nil AT the
+        # scene comp's OnEnable. Distinct from (a): here the drain is present.
+        rc, out, err = _run_scenario(
+            self._plan_scenario(drain_mode="stays_late"))
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "ONENABLE_NIL" in out, (
+            f"RED (b): a late drain leaves the ref nil at the scene OnEnable; "
+            f"got:\n{out}")
+
+
+# ---------------------------------------------------------------------------
+# gap#4 acceptance (ii) -- the global Awake-before-Start invariant still holds
+# across the PASS-2 scene-then-placement batches: every comp's Awake/OnEnable
+# (sync) precedes EVERY comp's Start (task.defer'd), so no Start marker may
+# appear before all Awake/OnEnable markers in the combined log.
+# ---------------------------------------------------------------------------
+
+class TestAwakeBeforeStartInvariantAcrossBatches:
+
+    def _scenario(self) -> str:
+        # A scene comp + a scene-placed placement comp, each logging an ordered
+        # marker in Awake/OnEnable (sync) and Start (deferred). After
+        # runDeferred() flushes the deferred Starts, NO Start marker may precede
+        # any Awake/OnEnable marker.
+        return textwrap.dedent("""\
+            local order = {}
+            local function mark(s) table.insert(order, s) end
+
+            local Scene = {} ; Scene.__index = Scene
+            function Scene.new(_) return setmetatable({}, Scene) end
+            function Scene:Awake() mark("scene_awake") end
+            function Scene:OnEnable() mark("scene_onenable") end
+            function Scene:Start() mark("scene_start") end
+
+            local Placed = {} ; Placed.__index = Placed
+            function Placed.new(_) return setmetatable({}, Placed) end
+            function Placed:Awake() mark("placed_awake") end
+            function Placed:OnEnable() mark("placed_onenable") end
+            function Placed:Start() mark("placed_start") end
+
+            local PLACEMENT = "Main:42"
+            local PREFAB = "g:Assets/Prefabs/P.prefab"
+            local PREFAB_LOCAL = PREFAB .. ":99"
+            local ENGINE_KEY = PLACEMENT .. ":" .. PREFAB_LOCAL
+
+            local plan = {
+                modules = {
+                    scene = {stem = "Scene", runtime_bearing = true,
+                             module_path = "x", domain = "client"},
+                    placed = {stem = "Placed", runtime_bearing = true,
+                              module_path = "y", domain = "client"},
+                },
+                scenes = {
+                    Main = {
+                        instances = {
+                            {instance_id = "Main:1", script_id = "scene",
+                             game_object_id = "sgo", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {}, lifecycle_order = {"Main:1"},
+                    },
+                },
+                prefabs = {
+                    [PREFAB] = {
+                        name = "P",
+                        instances = {{instance_id = PREFAB_LOCAL, script_id = "placed",
+                                      game_object_id = PREFAB_LOCAL, active = true,
+                                      enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {PREFAB_LOCAL},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = PLACEMENT, prefab_id = PREFAB,
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            local instances = {
+                sgo = {Name = "Scene", _sceneRuntimeId = "sgo", _children = {}},
+                [ENGINE_KEY] = {Name = "P", _sceneRuntimeId = ENGINE_KEY,
+                                _children = {}},
+            }
+            local services = servicesFor(plan, {scene = Scene, placed = Placed}, instances)
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("client")
+            runDeferred()  -- flush deferred Starts
+
+            -- The combined order: no Start may appear before any Awake/OnEnable.
+            local firstStartIdx, lastLifecycleIdx = nil, nil
+            for i, m in ipairs(order) do
+                if string.find(m, "_start") and firstStartIdx == nil then
+                    firstStartIdx = i
+                end
+                if string.find(m, "_awake") or string.find(m, "_onenable") then
+                    lastLifecycleIdx = i
+                end
+            end
+            assert(firstStartIdx ~= nil, "a Start must have fired")
+            assert(lastLifecycleIdx ~= nil, "an Awake/OnEnable must have fired")
+            if firstStartIdx > lastLifecycleIdx then
+                print("AWAKE_BEFORE_START_OK")
+            else
+                print("ORDER_VIOLATION:" .. table.concat(order, ","))
+            end
+            -- Today's relative order is preserved: scene batch lifecycle before
+            -- placement batch lifecycle.
+            local sa, pa = nil, nil
+            for i, m in ipairs(order) do
+                if m == "scene_awake" then sa = i end
+                if m == "placed_awake" then pa = i end
+            end
+            if sa ~= nil and pa ~= nil and sa < pa then
+                print("SCENE_BEFORE_PLACEMENT_OK")
+            end
+            print("DONE")
+        """)
+
+    def test_no_start_before_all_awake_onenable(self):
+        rc, out, err = _run_scenario(self._scenario())
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "AWAKE_BEFORE_START_OK" in out, (
+            f"no Start marker may precede any Awake/OnEnable across batches; "
+            f"got:\n{out}")
+        assert "SCENE_BEFORE_PLACEMENT_OK" in out, (
+            f"PASS-2 must keep today's scene-batch-then-placement-batch order; "
+            f"got:\n{out}")
+
+
+# ---------------------------------------------------------------------------
+# gap#4 acceptance (iii) -- runtime-spawn boundary + single-bind.
+#   (a) a runtime ``instantiatePrefab`` still resolves its ``externalRefs`` and
+#       is NOT skipped by the reorder (the spawn path is byte-unchanged).
+#   (b) a scene-placed target binds ONCE at the early boot drain: after start()
+#       the boot drain leaves ``_pendingPlacementRefs`` clear (nil) of it, so a
+#       later ``_completeDeferredBatch`` drain has nothing to rebind.
+# ---------------------------------------------------------------------------
+
+class TestRuntimeSpawnBoundaryAndSingleBind:
+
+    def test_runtime_instantiate_prefab_resolves_external_refs(self):
+        # (a) The reorder edits only start(); instantiatePrefab is a separate
+        # path that must still apply its externalRefs override.
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+
+            local plan = {
+                modules = {
+                    foo = {stem = "Foo", runtime_bearing = true,
+                           module_path = "x", domain = "client"},
+                },
+                scenes = {}, domain_overrides = {},
+                prefabs = {
+                    ["pf"] = {
+                        name = "Foo",
+                        instances = {{instance_id = "pf:1", script_id = "foo",
+                                      game_object_id = "pf:host", active = true,
+                                      enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"pf:1"},
+                    },
+                },
+            }
+            -- Synthesize a clone so the spawn path proceeds (the default harness
+            -- clonePrefabTemplate returns nil). The clone's root SRI matches the
+            -- prefab-local host so resolveCloneChild finds the component.
+            local cloneRoot = {Name = "FooClone", _sceneRuntimeId = "pf:host",
+                               _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                return cloneRoot
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("client")
+
+            -- externalRefs the runtime spawn must apply onto the constructed
+            -- comp. Shape is {instId = {field = value}}, keyed by the
+            -- prefab-local instance_id.
+            local marker = {mark = "EXT"}
+            local clone = engine:instantiatePrefab("pf", nil, nil,
+                {["pf:1"] = {someRef = marker}})
+            assert(clone ~= nil, "spawn must produce a clone")
+            runDeferred()
+
+            -- Find the spawned component (registered under a minted _rt_ key).
+            local spawned = nil
+            for key, comp in pairs(engine._componentByInstanceId) do
+                if string.find(tostring(key), "_rt_") then spawned = comp end
+            end
+            assert(spawned ~= nil, "runtime-spawned comp must be registered")
+            if spawned.someRef == marker then
+                print("EXTERNAL_REF_BOUND")
+            else
+                print("EXTERNAL_REF_MISSING:" .. tostring(spawned.someRef))
+            end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "EXTERNAL_REF_BOUND" in out, (
+            f"runtime instantiatePrefab must still apply its externalRefs after "
+            f"the start() reorder; got:\n{out}")
+
+    def test_scene_placed_target_binds_once_at_early_drain(self):
+        # (b) The boot drain (now in PASS 1) binds the scene->placement ref and
+        # REMOVES the record, so _pendingPlacementRefs is clear of it after
+        # start(); a later _completeDeferredBatch drain finds nothing to rebind.
+        scenario = textwrap.dedent("""\
+            local Loadout = {} ; Loadout.__index = Loadout
+            function Loadout.new(_) return setmetatable({}, Loadout) end
+
+            local MissionUI = {} ; MissionUI.__index = MissionUI
+            function MissionUI.new(_) return setmetatable({mark="MUI"}, MissionUI) end
+
+            local PLACEMENT = "Main:7"
+            local PREFAB = "g:Assets/Prefabs/MissionPopup.prefab"
+            local PREFAB_LOCAL = PREFAB .. ":11"
+            local ENGINE_KEY = PLACEMENT .. ":" .. PREFAB_LOCAL
+
+            local plan = {
+                modules = {
+                    loadout = {stem = "Loadout", runtime_bearing = true,
+                               module_path = "x", domain = "client"},
+                    missionui = {stem = "MissionUI", runtime_bearing = true,
+                                 module_path = "y", domain = "client"},
+                },
+                scenes = {
+                    Main = {
+                        instances = {
+                            {instance_id = "Main:1", script_id = "loadout",
+                             game_object_id = "sgo", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {
+                            {["from"] = "Main:1", field = "missionPopup",
+                             index = nil, target_kind = "component",
+                             target_ref = ENGINE_KEY,
+                             target_script_id = "missionui",
+                             target_is_ui = false},
+                        },
+                        lifecycle_order = {"Main:1"},
+                    },
+                },
+                prefabs = {
+                    [PREFAB] = {
+                        name = "MissionPopup",
+                        instances = {{instance_id = PREFAB_LOCAL, script_id = "missionui",
+                                      game_object_id = PREFAB_LOCAL, active = true,
+                                      enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {PREFAB_LOCAL},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = PLACEMENT, prefab_id = PREFAB,
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            local instances = {
+                sgo = {Name = "Loadout", _sceneRuntimeId = "sgo", _children = {}},
+                [ENGINE_KEY] = {Name = "MissionPopup", _sceneRuntimeId = ENGINE_KEY,
+                                _children = {}},
+            }
+            local services = servicesFor(plan, {loadout = Loadout, missionui = MissionUI}, instances)
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("client")
+            runDeferred()
+
+            local src = engine._componentByInstanceId["Main:1"]
+            assert(src ~= nil, "scene source must exist")
+            -- bound exactly once.
+            if type(src.missionPopup) == "table" and src.missionPopup.mark == "MUI" then
+                print("BOUND_ONCE")
+            end
+            -- the early boot drain removed the record -> the queue is clear.
+            local stillQueued = false
+            for _, rec in ipairs(engine._pendingPlacementRefs or {}) do
+                if rec.field == "missionPopup" then stillQueued = true end
+            end
+            if not stillQueued then print("QUEUE_CLEAR") end
+            -- a later drain (mirroring _completeDeferredBatch) finds nothing to
+            -- rebind -- the value is unchanged.
+            local before = src.missionPopup
+            engine:_drainPendingPlacementRefs()
+            if src.missionPopup == before then print("NO_DOUBLE_RESOLVE") end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "BOUND_ONCE" in out, (
+            f"scene->placement ref must bind to the placed clone; got:\n{out}")
+        assert "QUEUE_CLEAR" in out, (
+            f"the early drain must remove the bound record from "
+            f"_pendingPlacementRefs; got:\n{out}")
+        assert "NO_DOUBLE_RESOLVE" in out, (
+            f"a later drain must not rebind the already-bound ref; got:\n{out}")
 
 
 # ---------------------------------------------------------------------------
