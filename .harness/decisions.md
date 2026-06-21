@@ -4142,3 +4142,55 @@ P2-HARDEN: setActive dispatch now accepts a userdata Instance arg (`elseif type(
   children suppressed. Bias to abstain: no same-method clear -> KEEP (safe). Feasible on existing infra
   (script_analyzer _strip_comments + Instantiate|Destroy regex + _matching_brace_span; lazy_singleton
   _method_body precedent). Classification: User-Challenge (explicit user direction).
+
+## /drive run gap4-boot-ordering-20260621T101429 (2026-06-21T06:37:24Z)
+
+# Decisions — gap4-boot-ordering
+
+## Phase 1 (detailed design — design-phase1.md)
+
+- **D1 — Pass-2 lifecycle order = scene batches THEN placement batches.**
+  Classification: Mechanical. Preserve today's relative scene-then-placement batch order; do
+  not re-sort. Minimal reorder that restores the contract; any re-sort is out-of-scope.
+
+- **D2 — Split placement seed-all (F2') from construct-all (F3') into two passes over
+  `placementOrder`.** Classification: Mechanical. Needed for correct `activeInHierarchy` when a
+  placement parents under a later-sorted placement; without it a child placement's construct
+  could read an unseeded parent `_goParentId`/`_goActiveSelf` entry.
+
+- **D3 — EXISTENCE-not-READINESS is the deliberate bounded scope.** Classification:
+  User-Challenge. Acceptance (i) probes a non-nil placement OBJECT at the scene comp's OnEnable,
+  NOT a placement-Awake-set field value. Full Awake-interleave (Option B) is OUT OF SCOPE, gated
+  on evidence a real conversion needs it (none today — the 85 refs need only object identity +
+  `.gameObject`). State the claim as "refs EXIST before lifecycle", not "Unity lifecycle restored".
+
+- **D4 — Update the existing `test_scene_runtime_stripped_refs.py` `fieldDuringWire == nil`
+  assertion IN PLACE to the new OnEnable-non-nil contract.** Classification: Taste. The old
+  assertion encodes the pre-fix contract (drain after lifecycle) and is now factually wrong;
+  leaving it would be a contradictory/green-for-wrong-reason guard. Retain the no-drain RED test
+  as acceptance-(i) RED proof (a); add a "drain stays late" RED variant for proof (b).
+
+## Phase 1 — Slice 1.1 implementer notes (impl decisions)
+
+- **I1 — Renamed the old `TestStrippedRefBindsAfterPlacementDrain` class to
+  `TestStrippedRefExistsBeforeSceneLifecycle` and re-authored its scenario to probe at the scene
+  comp's `OnEnable` (and `Awake`), asserting non-nil object + non-nil `.gameObject`.**
+  Classification: Taste. The old class name and `WIRE_NIL_OK`/`fieldDuringWire == nil` assertion
+  encoded the pre-fix "nil before drain" contract; D4 mandates inverting it. The acceptance-(i)
+  GREEN test FAILS against pre-reorder code (stash-verified: `ONENABLE_NIL`) → real regression guard.
+
+- **I2 — RED proof (a) vs (b) split per review MINOR #1.** Classification: Mechanical. Proof (a)
+  (`drain_mode="absent"`) shadows the drain to a no-op for the whole run → proves the DRAIN is
+  load-bearing. Proof (b) (`drain_mode="stays_late"`) suppresses the early drain DURING `start()`
+  and invokes the real drain only AFTER `start()` returns → the pre-reorder order (drain present
+  but late) → ref nil at the OnEnable probe → proves the EARLY POSITION is load-bearing. Distinct
+  models, not duplicative.
+
+- **I3 — Two-pass placement split realized as `placementBuildOrder` accumulator.** Classification:
+  Mechanical. PASS 1a resolves each `placement_clone` exactly once (the resolver consumes
+  `boundClones`) + seeds all parent maps, capturing `{placement_clone, prefab, prefab_id,
+  p_placement_id}`; PASS 1b iterates that captured list to `_constructPrefabClone` (never
+  re-resolving) and collects each `componentList`. Honors codex MINOR #1 (cache clone across passes).
+
+- **I4 — `converter/.cache` (LLM cache, created by running luau-gated tests) left UNTRACKED and NOT
+  committed.** Classification: Mechanical. Generated artifact; not part of the slice diff.

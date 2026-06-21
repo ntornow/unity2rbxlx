@@ -1445,3 +1445,10 @@ HANDOFF: converter/TODO.md Infrastructure P1 "Converter doesn't wire ScreenGui e
   deterministic end-to-end verify (detector keeps SettingPopup/LoadoutState/GameState on the real scene).
   A live `/e2e-test` Studio playtest (SettingPopup About popups visibly land; LoadoutState.missionPopup
   resolves; no double-stamp) is available as a confirmatory check post-merge.
+
+## /drive run gap4-boot-ordering-20260621T101429 (2026-06-21T06:37:24Z)
+
+
+## slop (deferred to finalize)
+converter/runtime/scene_runtime.luau:4328-4335,4506-4513,4575-4607 — gap#4 block comments verbose (5-9 lines), partly restate design doc; tighten to ~2 lines/block keeping the non-obvious why.
+converter/runtime/scene_runtime.luau:4522-4527 — reused-clone comment duplicates the PASS-1a header comment at 4511-4513.
