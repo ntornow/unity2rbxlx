@@ -300,7 +300,6 @@ def convert_canvas(
     suppress_static_children_ids: frozenset[str] | None = None,
     component_owner_index: dict[str, str] | None = None,
     toggle_bindings: list[ToggleBinding] | None = None,
-    component_domain_index: dict[str, str] | None = None,
     click_bindings: list[ClickBinding] | None = None,
     unsupported_click_bindings: list[UnsupportedClickBinding] | None = None,
 ) -> list[RbxScreenGui]:
@@ -344,15 +343,12 @@ def convert_canvas(
             stashes the populated result onto ``ctx.scene_runtime`` -- so the
             rows surface without riding the (unchanged) return value and without
             any transport attribute leaking onto a produced instance.
-        component_domain_index: Scene-wide
-            ``component fileID -> domain`` map (``client`` / ``server`` /
-            ``helper`` / ``excluded``), built in ``convert_scene`` from the
-            classified ``scene_runtime["modules"]``. Drives the onClick
-            domain gate. ``None`` for legacy / synthetic callers.
         click_bindings: By-ref ``ClickBinding`` accumulator (mirrors
             ``toggle_bindings``). For each dispatchable onClick call (no static
-            arg, resolvable client/helper target) ``_emit_click_bindings``
-            appends a row. ``None`` for legacy callers.
+            arg, owner-resolvable target) ``_emit_click_bindings`` appends a
+            CANDIDATE row -- the domain gate is deferred to a post-classification
+            reclassification step (the domain isn't stamped yet at this phase).
+            ``None`` for legacy callers.
         unsupported_click_bindings: By-ref accumulator for onClick calls this
             version cannot honor (server/excluded/unresolved target or static
             arg). Surfaced LOUD in the conversion report; never shipped to the
@@ -390,7 +386,6 @@ def convert_canvas(
                 ),
                 component_owner_index=component_owner_index,
                 toggle_bindings=toggle_bindings,
-                component_domain_index=component_domain_index,
                 click_bindings=click_bindings,
                 unsupported_click_bindings=unsupported_click_bindings,
             )
@@ -497,7 +492,6 @@ def _convert_ui_element(
     suppress_static_children_ids: frozenset[str] = frozenset(),
     component_owner_index: dict[str, str] | None = None,
     toggle_bindings: list[ToggleBinding] | None = None,
-    component_domain_index: dict[str, str] | None = None,
     click_bindings: list[ClickBinding] | None = None,
     unsupported_click_bindings: list[UnsupportedClickBinding] | None = None,
 ) -> RbxUIElement | None:
@@ -633,7 +627,6 @@ def _convert_ui_element(
     _emit_click_bindings(
         element, node, on_click_handlers,
         component_owner_index=component_owner_index,
-        component_domain_index=component_domain_index,
         scene_namespace=scene_namespace,
         click_bindings=click_bindings,
         unsupported_click_bindings=unsupported_click_bindings,
@@ -704,7 +697,6 @@ def _convert_ui_element(
             suppress_static_children_ids=suppress_static_children_ids,
             component_owner_index=component_owner_index,
             toggle_bindings=toggle_bindings,
-            component_domain_index=component_domain_index,
             click_bindings=click_bindings,
             unsupported_click_bindings=unsupported_click_bindings,
         )
@@ -720,12 +712,20 @@ def _emit_click_bindings(
     on_click_handlers: list[dict[str, str]],
     *,
     component_owner_index: dict[str, str] | None,
-    component_domain_index: dict[str, str] | None,
     scene_namespace: str,
     click_bindings: list[ClickBinding] | None,
     unsupported_click_bindings: list[UnsupportedClickBinding] | None,
 ) -> None:
-    """Emit one ``ClickBinding`` per dispatchable onClick call; record the rest.
+    """Emit a CANDIDATE ``ClickBinding`` per dispatchable onClick call; record the rest.
+
+    Stage 1 of the deferred two-stage domain gate (design AMENDMENT r3). The
+    component domain is NOT yet known at ``convert_scene`` time -- it is stamped
+    later in ``_classify_storage`` (``scene_runtime["modules"][*]["domain"]``).
+    So this stage emits a *candidate* binding for every owner-resolvable,
+    non-static-arg call WITHOUT consulting domain; the post-classification step
+    (``Pipeline._reclassify_click_bindings_by_domain``) re-gates the candidates
+    once domains exist, moving any server/excluded/unknown target to the
+    unsupported report.
 
     For each parsed onClick call (already gated on ``m_CallState >= 1`` --
     EditorAndRuntime(1) and RuntimeOnly(2) both fire at runtime; Off(0) is
@@ -734,11 +734,9 @@ def _emit_click_bindings(
       * An unresolvable target (``target_file_id`` of ``0`` / not in the owner
         index, or a Button element that wasn't SRI-stamped) is recorded as
         unsupported.
-      * A target whose component domain is ``server`` / ``excluded`` (or any
-        non-client/helper value) is recorded as unsupported -- it isn't
-        reachable from the client VM where ``Activated`` fires.
-      * Only a target resolving to ``client`` / ``helper`` domain emits a
-        ``ClickBinding`` row, component-precise (the engine registry key).
+      * Every other (owner-resolvable, non-static-arg) call emits a candidate
+        ``ClickBinding`` row, component-precise (the engine registry key). The
+        domain gate is deferred to stage 2.
 
     Fail LOUD, never silent: every non-emitted call lands in
     ``unsupported_click_bindings`` (surfaced in the conversion report). NO
@@ -755,7 +753,6 @@ def _emit_click_bindings(
     button_sri = element.attributes.get("_SceneRuntimeId")
     button_sri = button_sri if isinstance(button_sri, str) else ""
     owner_index = component_owner_index or {}
-    domain_index = component_domain_index or {}
 
     for handler in on_click_handlers:
         method = handler.get("method", "")
@@ -787,18 +784,9 @@ def _emit_click_bindings(
             _record_unsupported("unresolved_target")
             continue
 
-        # Domain gate: only client/helper targets are reachable in the client VM.
-        domain = domain_index.get(target_file_id, "")
-        if domain not in ("client", "helper"):
-            reason = (
-                "domain_server" if domain == "server"
-                else "domain_excluded" if domain == "excluded"
-                else "unresolved_target" if domain == ""
-                else f"domain_{domain}"
-            )
-            _record_unsupported(reason)
-            continue
-
+        # Domain gate is DEFERRED to stage 2 (the domain isn't stamped yet at
+        # convert_scene time). Emit a candidate binding; the post-classification
+        # reclassifier re-gates it once ``modules[*].domain`` exists.
         click_bindings.append(ClickBinding(
             button_sri=button_sri,
             target_sri=f"{scene_namespace}:{target_go_fid}",

@@ -1637,8 +1637,7 @@ def convert_scene(
     # the static-emit path is byte-identical to pre-PR3c.
     from converter.ui_translator import (
         find_canvas_nodes, convert_canvas, build_component_owner_index,
-        build_component_domain_index, ToggleBinding, ClickBinding,
-        UnsupportedClickBinding,
+        ToggleBinding, ClickBinding, UnsupportedClickBinding,
     )
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
@@ -1652,23 +1651,13 @@ def convert_scene(
         # reference (e.g. a Unity ``Toggle.graphic``) can be resolved to its
         # owning GameObject.
         component_owner_index = build_component_owner_index(parsed_scene.roots)
-        # Scene-wide component fileID -> module domain map (client/server/
-        # helper/excluded), built from the classified ``scene_runtime.modules``
-        # so the Button onClick gate can decide whether a target is reachable
-        # in the client VM where ``Activated`` fires. Empty when the scene_runtime
-        # is absent / unclassified (legacy / synthetic) -> no ClickBinding emit.
-        module_domains: dict[str, str] = {}
-        if scene_runtime is not None:
-            modules_obj = scene_runtime.get("modules")
-            if isinstance(modules_obj, dict):
-                for guid, mod in modules_obj.items():
-                    if isinstance(mod, dict):
-                        dom = mod.get("domain")
-                        if isinstance(dom, str) and dom:
-                            module_domains[str(guid)] = dom
-        component_domain_index = build_component_domain_index(
-            parsed_scene.roots, module_domains,
-        )
+        # The Button onClick DOMAIN gate is deferred (design AMENDMENT r3): the
+        # per-component domain (``scene_runtime["modules"][*]["domain"]``) is not
+        # stamped until ``_classify_storage``, which runs AFTER ``convert_scene``.
+        # So convert emits a domain-AGNOSTIC candidate per owner-resolvable call
+        # here; ``Pipeline._reclassify_click_bindings_by_domain`` re-gates the
+        # candidates once domains exist, moving server/excluded/unknown targets
+        # to the unsupported report.
         # By-ref accumulator for Toggle ``isOn`` -> checkmark-graphic bindings.
         # ``convert_canvas`` appends a ``ToggleBinding`` per Toggle with a
         # resolvable ``graphic``; the populated list is stashed onto
@@ -1691,7 +1680,6 @@ def convert_scene(
             suppress_static_children_ids=ui_suppress_ids,
             component_owner_index=component_owner_index,
             toggle_bindings=toggle_bindings,
-            component_domain_index=component_domain_index,
             click_bindings=click_bindings,
             unsupported_click_bindings=unsupported_click_bindings,
         )

@@ -3448,6 +3448,130 @@ return table.concat(allData, "\\n")'''
         self._subphase_analyze_dead_modules()
         self._subphase_prune_dead_module_closures()
         self._classify_storage()
+        # Stage 2 of the deferred onClick domain gate (design AMENDMENT r3).
+        # Runs AFTER ``_classify_storage`` has stamped
+        # ``ctx.scene_runtime["modules"][*]["domain"]`` and BEFORE
+        # ``write_output`` builds the conversion report -- so the FINAL
+        # post-reclassification unsupported set is what the report reflects.
+        self._reclassify_click_bindings_by_domain()
+
+    def _reclassify_click_bindings_by_domain(self) -> None:
+        """Stage 2: re-gate the candidate ``ui_click_bindings`` against the now-
+        classified per-component domain (design AMENDMENT r3).
+
+        ``convert_scene`` (the ``convert_scene`` phase) emits a domain-AGNOSTIC
+        ClickBinding candidate for every owner-resolvable, non-static-arg onClick
+        call, because the component domain isn't stamped yet at that phase. The
+        domain is finalized in ``_classify_storage``
+        (``scene_runtime["modules"][<guid>]["domain"]``). This step -- invoked at
+        the end of ``materialize_and_classify``, after that stamping and before
+        ``write_output`` builds the report -- rebuilds the
+        ``component fileID -> domain`` map from the classified modules (the SAME
+        construction ``convert_scene`` used to use) and re-gates each candidate:
+        a target whose domain is ``server`` / ``excluded`` / unknown MOVES from
+        ``scene_runtime["ui_click_bindings"]`` to
+        ``rbx_place.unsupported_onclick_bindings`` (reason ``domain_server`` /
+        ``domain_excluded`` / ``domain_unknown``); ``client`` / ``helper`` stay.
+
+        Gated identically to the domain-stamp pass in ``_classify_storage``
+        (generic mode, ``modules`` present): under legacy mode no domain is
+        stamped, so re-gating on an empty map would spuriously fail every
+        candidate. When the gate is closed the candidates are left untouched
+        (matching the host-bound emission, which only exists when a scene-runtime
+        host is present).
+        """
+        place = self.state.rbx_place
+        scene_runtime = self.ctx.scene_runtime
+        parsed_scene = self.state.parsed_scene
+        if place is None or not isinstance(scene_runtime, dict):
+            return
+        candidates = scene_runtime.get("ui_click_bindings")
+        if not isinstance(candidates, list) or not candidates:
+            return
+        modules_obj = scene_runtime.get("modules")
+        # Same gate as the ``_classify_storage`` domain-stamp pass: only re-gate
+        # when domains were actually computed (generic mode, modules present).
+        if (
+            self.ctx.scene_runtime_mode == "legacy"
+            or not isinstance(modules_obj, dict)
+            or not modules_obj
+            or parsed_scene is None
+        ):
+            return
+
+        from converter.ui_translator import (
+            build_component_domain_index, ClickBinding, UnsupportedClickBinding,
+        )
+        from converter.scene_converter import _scene_namespace
+
+        # ``component fileID -> domain`` map, rebuilt from the now-classified
+        # modules block (the construction ``convert_scene`` used pre-r3).
+        module_domains: dict[str, str] = {}
+        for guid, mod in modules_obj.items():
+            if isinstance(mod, dict):
+                dom = mod.get("domain")
+                if isinstance(dom, str) and dom:
+                    module_domains[str(guid)] = dom
+        domain_index = build_component_domain_index(
+            parsed_scene.roots, module_domains,
+        )
+        # The current scene's SRI namespace. A multi-scene run re-enters this
+        # method per scene against the SAME accumulated ``ui_click_bindings``
+        # list; a candidate emitted for a DIFFERENT scene must NOT be re-gated
+        # here (its target fileID belongs to another scene's domain index, which
+        # would spuriously mark it ``domain_unknown``). Candidates whose
+        # namespace doesn't match the current scene are passed through unchanged.
+        # Recomputed with the SAME helper ``convert_scene`` stamps with, so the
+        # prefix matches the candidates' ``target_component_id``.
+        current_ns = _scene_namespace(
+            getattr(parsed_scene, "scene_path", None), self.unity_project_path,
+        )
+
+        kept: list[ClickBinding] = []
+        moved: list[UnsupportedClickBinding] = []
+        for row in candidates:
+            if not isinstance(row, dict):
+                continue
+            click_row = cast("ClickBinding", row)
+            # Recover the raw Unity target component fileID from the engine
+            # registry key ``"<scene_namespace>:<target_file_id>"``. The fileID
+            # never contains a ``:``, so ``rsplit(":", 1)`` is exact even when
+            # the namespace itself carries slashes / ``.unity``.
+            target_component_id = str(click_row.get("target_component_id", ""))
+            target_ns, _, target_file_id = target_component_id.rpartition(":")
+            # Pass through a candidate from a different scene untouched.
+            if current_ns and target_ns and target_ns != current_ns:
+                kept.append(click_row)
+                continue
+            domain = domain_index.get(target_file_id, "")
+            if domain in ("client", "helper"):
+                kept.append(click_row)
+                continue
+            reason = (
+                "domain_server" if domain == "server"
+                else "domain_excluded" if domain == "excluded"
+                else "domain_unknown"
+            )
+            moved.append(UnsupportedClickBinding(
+                button_sri=str(click_row.get("button_sri", "")),
+                target_file_id=target_file_id,
+                method=str(click_row.get("method", "")),
+                reason=reason,
+                call_index=int(cast(int, click_row.get("call_index", 0) or 0)),
+            ))
+
+        if not moved:
+            return
+        # Re-gate: the host plan carries ONLY the kept (client/helper) bindings;
+        # the moved ones surface LOUD in the operator-facing unsupported report.
+        scene_runtime["ui_click_bindings"] = kept
+        place.unsupported_onclick_bindings.extend(dict(row) for row in moved)
+        for row in moved:
+            log.warning(
+                "[onclick] reclassified unsupported binding: button %s -> %s "
+                "(reason=%s); no Activated handler emitted",
+                row["button_sri"] or "?", row["method"], row["reason"],
+            )
 
         # Record the post-prune on-disk top-level script count. The prune above
         # deletes dead modules from disk AFTER ``transpiled_scripts`` was set in
