@@ -84,6 +84,92 @@ cache. The items below are where code or docs are stale or wrong.
   hardcoded Quad/InOut at all four TweenInfo emit sites in `animation_converter.py` — Unity
   AnimationCurve easing is parsed but dropped.
 
+## Decisions-log audit follow-ups (2026-06-22)
+
+From a two-voice audit (4 Claude readers + Codex) of `.harness/decisions.md` across ~13 `/drive`
+runs. Full evidence + line refs: `.harness/decisions-audit.md` (item IDs A*/B*/C* cited below).
+**Root cause across the whole log:** load-bearing behavior keeps being re-anchored on
+non-deterministic AI (LLM) output, against the "anchor on the deterministic upstream source"
+rule — gate accumulation, oscillation, and late shape-discovery are its downstream symptoms.
+
+Do the two keystone diagnostics FIRST — the architectural reworks below them can't be scoped
+(and shouldn't be started blind — that blind-start IS the late-shape-discovery anti-pattern) until
+the inventory and the policy decision exist.
+
+- [ ] **P0 — Lowering/verifier inventory (keystone). (audit C1/B1/B2/B3/B4)** Enumerate every active
+  post-transpile lowering (`*_lowering.py`, the `lower_*` calls in `contract_pipeline.py`) + every
+  `contract_verifier.py` check. For each, record: trigger source, rewrite/assert *target*, and
+  whether trigger AND target are deterministic-upstream vs a fingerprint of AI Luau. A non-deterministic
+  *target* is the red flag (several have a deterministic trigger but rewrite an AI-output site).
+  Deliverable: a `lowering-inventory` doc. Unblocks the policy + rework items.
+
+- [ ] **P0 — Settle the post-transpile-rewrite policy (resolve the A10 contradiction). (audit A10/C1)**
+  The gap4 `D0` decision BANS post-transpile AI-output rewrites; the trash-dash run SHIPPED
+  `spawn_call_site_lowering.py` doing exactly that. Pick ONE standing rule and write it into
+  `converter/CLAUDE.md`: e.g. "post-transpile rewrites allowed iff the rewrite *target site* is located
+  by a deterministic upstream fact AND fails loud (never silently abstains) on a target-shape miss;
+  else re-anchor on a consumer read-reroute keyed on the AI-stable member name (the rifle re-anchor
+  pattern)." Name which existing lowerings are grandfathered vs flagged for rework. Depends on the inventory.
+
+- [ ] **P1 — Re-anchor or retire the AI-output-targeted lowerings the inventory flags. (audit C1/B1/B2)**
+  Per flagged lowering: (a) re-anchor on the consumer read-reroute keyed on the AI-stable name (proven
+  pattern — the rifle `weaponSlot` fix), (b) move to a pre-AI C# substitution, or (c) retire if dead.
+  Highest-traffic first; one `/drive` run each. Acceptance: a RED test on ≥2 distinct valid AI output
+  shapes that the old shape-anchored path silently abstained on.
+
+- [ ] **P1 — Classifier-authority review: the dead-module exemption carriers. (audit C2/B4)** Inventory
+  every dead-module/dead-write exemption carrier (`rig_binding`, `roster_binding`, …) and the ~6 sites
+  each threads through. Per carrier: does the dead-module classifier seam need redesign (ask the producer)
+  rather than another after-the-fact exemption? For each, document what breaks if removed — "nothing" = dead;
+  "classifier mis-stubs a live module" = the seam to fix. The carrier count is itself eroding the
+  classifier's trustworthiness as an authority.
+
+- [ ] **P1 — Fail-loud the `_PLAN_KEYS_FOR_HOST` allowlist. (audit B7)** A plan key not in the allowlist
+  is silently ELIDED → silently-dead feature on a fresh convert (has bitten gravity, addressables,
+  db-seeds). Make the elision a loud error, or assert at build time that every emitted plan key is
+  allowlisted. Test: an un-allowlisted plan key fails the build loudly.
+
+- [ ] **P1 — De-hardcode the mesh-wrap attribute move-list. (audit B9)** The literal move-list tuple in
+  `scene_converter.py` (grep the `_UnityMass`/`_Rigidbody2D` move set) silently misclassifies a body when
+  a new stamped attribute is forgotten (the S2 wrapped-2D bug). Replace with a structural rule (move all
+  `_`-prefixed converter attributes, or a registry the stampers append to). Test: a new `_`-attribute
+  survives wrapping with no manual tuple edit.
+
+- [ ] **P1 — Shape-enumeration-first design gate. (audit C3/A7)** Add a hard checklist item to the
+  `/drive-design` skill + design-review: "capture the REAL emitted/runtime shape corpus (≥2 distinct AI
+  shapes + each scene/prefab carrier shape) BEFORE locking any lowering/classification abstraction." This
+  is the single highest-leverage prevention for the recurring late-shape churn (turret chain, Player cache,
+  gravity carriers, Toggle serialization, mesh gate).
+
+- [ ] **P1 — Persistence-seam audit: persist facts, recompute conclusions. (audit C5)** Find every place a
+  *derived conclusion* is stashed into `ConversionContext`/the plan and rehydrated on resume/transpile-skip
+  instead of recomputed from facts (known drift sites: addressables essential-recompute, `rig_binding`
+  carrier, gravity early-stash, `addressable_db_seeds`, `dependency_map`). Output which stashed values must
+  become recompute-on-load. Test: transpile-skip assemble classifies identically to a cold run.
+
+- [ ] **P1 — Close the userdata-vs-table test-mock blind spot. (audit B12)** Real Instances are `userdata`,
+  not `table`; table-mock unit tests pass while production silently no-ops (recurred ≥2×: ScreenGui
+  `Enabled` toggle, the `scene_runtime.luau` destroy fix). Add a real-Instance Luau test harness for the
+  dispatch paths, or a lint flagging `type(x)=="table"` guards on values that can be Instances.
+
+- [ ] **P2 — Decide on force-behavior CI coverage. (audit B8)** Gravity-correction fall-rate is Studio-only;
+  CI pins only emitted tokens (green-for-wrong-reason risk). Decide explicitly: accept the documented blind
+  spot, or stand up a minimal Roblox-physics execution check. Record the decision rather than letting it drift.
+
+- [ ] **P2 — Real Luau parser for the rewrite/verify analyzers. (audit B6)** Hand-rolled regex + "code
+  projection" re-discovered a lexer the hard way (long-brackets, escapes, comments, block balance,
+  `(self)[k]`, encoded keys) over many rounds. A real Luau parse closes the class once. Only worth it if
+  the re-anchor rework keeps these analyzers alive.
+
+- [ ] **P2 — Remove the `DEP_MAX_ITERS` test-double leak. (audit B11)** The `DEP_MAX_ITERS` production
+  hard-cap in `scene_runtime.luau` was chosen to satisfy a mock-clock unit harness (the mock `task.wait`
+  doesn't advance the clock). Fix the harness to advance the mock clock so runtime semantics aren't shaped
+  by the test double; then drop the iteration cap.
+
+- [ ] **P2 — decisions.md bookkeeping pass. (audit A8/A9)** Dedupe the repeated run headings, de-collide
+  reused D-numbers within a single run (e.g. the door-binding run reuses D2–D5), and adopt a
+  `<!-- run: ... -->` separator convention so future appends don't re-collide.
+
 ## Legacy retirement (strategic direction, 2026-06-11)
 
 - [ ] **P1 — Retire legacy mode + the coherence-pack layer; generic is the path forward.**
