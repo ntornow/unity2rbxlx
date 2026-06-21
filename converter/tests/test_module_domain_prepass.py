@@ -1030,11 +1030,13 @@ class TestTopologyInputsTranspileRan:
         """The full-path test: a non-trivial scene_runtime with at
         least one module + script causes the prepass to return a
         populated ``TopologyInputs`` whose ``transpile_ran`` mirrors
-        ``state.transpilation_result is not None``.
+        ``_topology_data_available()`` (transpile ran this invocation OR a
+        persisted dep_map was rehydrated).
 
-        Asserted for both branches:
+        Asserted for both branches (dep_map empty in both, so the result
+        tracks ``transpilation_result``):
           * ``transpilation_result is not None`` -> True
-          * ``transpilation_result is None`` -> False
+          * ``transpilation_result is None`` + empty dep_map -> False
         """
         from unittest.mock import MagicMock
         from converter.pipeline import Pipeline
@@ -1049,6 +1051,10 @@ class TestTopologyInputsTranspileRan:
                 MagicMock() if has_transpile_result else None
             )
             p.state.dependency_map = {}
+            # Bind the REAL gate so the pin tracks the actual derivation.
+            p._topology_data_available = (
+                lambda: Pipeline._topology_data_available(p)
+            )
             p.state.guid_index = None
             p.state.rbx_place = MagicMock()
             # Provide one runtime-bearing script + matching module so

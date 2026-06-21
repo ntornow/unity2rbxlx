@@ -167,6 +167,21 @@ class ConversionContext:
     # back into ServerStorage. Empty by default.
     dead_modules: list[str] = field(default_factory=list)
 
+    # Cross-script C# dependency graph (class_name -> referenced class_names),
+    # built only inside ``transpile_scripts`` (pipeline.py). Persisted here so a
+    # transpile-skipped ``assemble`` (cache intact since #222 — separate
+    # process, ``transpilation_result is None``) can rehydrate the
+    # topology-quality caller graph the storage classifier needs, instead of
+    # collapsing to the empty-graph legacy path that misroutes client-reachable
+    # ModuleScripts into ServerStorage (-> client ``require(nil)``). Keyed on
+    # ``class_name`` (stable across phases — the same identity transpile uses);
+    # round-trips through ``conversion_context.json`` via ``asdict``/``cls(**data)``.
+    # Old context files lacking this field load with the empty default, which
+    # fails the routing gate closed to legacy (backward-compatible). Mirrors the
+    # ``dead_modules`` "no-transpile resume loses a transpile-derived verdict"
+    # precedent above.
+    dependency_map: dict[str, list[str]] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the
