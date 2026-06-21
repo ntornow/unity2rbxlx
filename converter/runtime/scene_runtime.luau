@@ -4325,6 +4325,15 @@ function SceneRuntime:start(domainFilter)
 	end
 	table.sort(sceneOrder)   -- determinism
 
+	-- gap#4 PASS 1 (construct+register, NO lifecycle): every scene comp AND every
+	-- scene-placed placement comp is constructed + registered in the engine union
+	-- BEFORE any Awake/OnEnable/Start, so the boot drain (below) can bind every
+	-- scene->placement ref before the scene lifecycle reads it. The lifecycle
+	-- batches are collected here and run in PASS 2 (after the drain), preserving
+	-- today's relative scene-batch-then-placement-batch order.
+	local sceneLifecycleBatches = {}
+	local placementLifecycleBatches = {}
+
 	for _, sceneKey in ipairs(sceneOrder) do
 		local scene = self._plan.scenes[sceneKey]
 		local componentByInstanceId = {}
@@ -4413,8 +4422,11 @@ function SceneRuntime:start(domainFilter)
 		self:_wireReferences(scene.references or {}, componentByInstanceId,
 			crossDomainEdges, byInstanceId)
 
-		-- Steps 3-5: Awake -> OnEnable -> Start.
-		self:_runAwakeEnableStart(lifecycleList)
+		-- gap#4: lifecycle is DEFERRED to PASS 2 (after the boot drain). The
+		-- scene wire above enqueues any scene->placement ref into
+		-- ``_pendingPlacementRefs``; the placement targets are constructed below
+		-- and the drain binds them, all BEFORE this batch's Awake/OnEnable runs.
+		table.insert(sceneLifecycleBatches, lifecycleList)
 	end
 
 	-- Bug B tier 1: boot pre-placed prefab instances. The scene loop only
@@ -4491,6 +4503,15 @@ function SceneRuntime:start(domainFilter)
 		return nil
 	end
 
+	-- gap#4 PASS 1a (seed-all + clone-resolve): seed EVERY placement's parent map
+	-- (``_goParentId``/``_goActiveSelf``) and resolve its workspace clone BEFORE
+	-- any ``_constructPrefabClone`` runs. ``_injectHostSurface`` computes
+	-- ``activeInHierarchy`` at construction time by walking the parent map, and a
+	-- placement may parent under a LATER-sorted placement, so seeding must finish
+	-- for all placements first. ``_findUnboundClonePerPrefab`` CONSUMES
+	-- ``boundClones`` and is NOT idempotent, so we resolve each clone exactly ONCE
+	-- here and reuse the captured value in PASS 1b -- never re-resolving.
+	local placementBuildOrder = {}
 	for _, entry in ipairs(placementOrder) do
 		local placement = placements[entry.idx]
 		local prefab_id = placement.prefab_id
@@ -4502,7 +4523,8 @@ function SceneRuntime:start(domainFilter)
 			-- scoped ``resolveCloneChild`` walk inside ``_constructPrefabClone``
 			-- then finds the placement's specific sub-Instances. Falls back to
 			-- ``nil`` (workspaceFind path) if no clone is found, preserving
-			-- prior single-instance behaviour.
+			-- prior single-instance behaviour. Resolved ONCE (the resolver
+			-- consumes ``boundClones``); the captured clone is reused in PASS 1b.
 			local placement_clone = _findUnboundClonePerPrefab(prefab, prefab_id)
 
 			-- Seed ``_goParentId``/``_goActiveSelf`` for the placement's
@@ -4541,22 +4563,48 @@ function SceneRuntime:start(domainFilter)
 				end
 			end
 
-			local componentList = self:_constructPrefabClone(
-				placement_clone, prefab, prefab_id, includeScriptId, nil,
-				p_placement_id, true)
-			self:_runAwakeEnableStart(componentList)
+			table.insert(placementBuildOrder, {
+				placement_clone = placement_clone,
+				prefab = prefab,
+				prefab_id = prefab_id,
+				p_placement_id = p_placement_id,
+			})
 		end
 	end
 
-	-- Phase 3 (slice 3.3): the placement boot loop has now registered every
-	-- placed-prefab component in ``_componentByInstanceId``. Drain scene-boot
-	-- component refs (e.g. LoadoutState.missionPopup) whose target is one of
-	-- those placed clones -- they resolved to nil at scene-wire time because
-	-- the placement hadn't booted yet. Runs synchronously before the
-	-- heartbeat connect and before any deferred Start fires, so the field is
-	-- set before its source's Start reads it. A target that is itself
-	-- UI-deferred is drained later by ``_completeDeferredBatch``.
+	-- gap#4 PASS 1b (construct-all, NO lifecycle): construct + register every
+	-- placement's components in the engine union, reusing the clone captured in
+	-- PASS 1a. ``_constructPrefabClone`` is lifecycle-free; its lifecycle batch is
+	-- collected and deferred to PASS 2 (after the drain).
+	for _, rec in ipairs(placementBuildOrder) do
+		local componentList = self:_constructPrefabClone(
+			rec.placement_clone, rec.prefab, rec.prefab_id, includeScriptId, nil,
+			rec.p_placement_id, true)
+		table.insert(placementLifecycleBatches, componentList)
+	end
+
+	-- gap#4 DRAIN (moved earlier): PASS 1 has now registered every scene comp AND
+	-- every placed-prefab component in ``_componentByInstanceId``. Drain scene-boot
+	-- component refs (e.g. LoadoutState.missionPopup) whose target is one of those
+	-- placed clones -- they resolved to nil at scene-wire time because the
+	-- placement hadn't booted yet. This runs BEFORE any Awake/OnEnable/Start
+	-- (PASS 2 below), restoring the Unity contract "every serialized ref exists
+	-- before any lifecycle". A target that is itself UI-deferred isn't registered
+	-- yet, so its record stays queued and is bound later by
+	-- ``_completeDeferredBatch`` -- no double-resolve.
 	self:_drainPendingPlacementRefs()
+
+	-- gap#4 PASS 2 (lifecycle): run Awake/OnEnable/Start over the collected SCENE
+	-- batches (scene order) THEN the PLACEMENT batches (placement order),
+	-- preserving today's relative scene-batch-then-placement-batch order. Every
+	-- ``Start`` is ``task.defer``'d and ``start()`` never yields, so all batches'
+	-- Awake/OnEnable complete synchronously before any Start fires.
+	for _, sceneBatch in ipairs(sceneLifecycleBatches) do
+		self:_runAwakeEnableStart(sceneBatch)
+	end
+	for _, placementBatch in ipairs(placementLifecycleBatches) do
+		self:_runAwakeEnableStart(placementBatch)
+	end
 
 	-- Step 6: update loops via heartbeat + fixed-step accumulator.
 	if self._services.heartbeat then
