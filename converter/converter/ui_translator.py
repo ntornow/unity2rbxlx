@@ -233,6 +233,48 @@ def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
     return index
 
 
+def _relative_fill_path(
+    slider_node: SceneNode,
+    fill_go_fid: str,
+    node_index: dict[str, SceneNode],
+) -> str | None:
+    """Build the ``/``-separated relative descendant path from the slider
+    GameObject to the fill GameObject, using converted Roblox instance NAMES.
+
+    Walks the fill node's ``parent_file_id`` chain upward, prepending each
+    ``node.name`` segment, until it reaches ``slider_node.file_id`` (success)
+    or runs off the top of the tree / a missing node (failure -> ``None``).
+    The returned path NEVER includes the slider node itself and has no
+    leading/trailing slash; a direct-child fill yields a bare name
+    (e.g. ``"CurHealth"``), a grandchild yields ``"Back/CurHealth"``.
+
+    Returns ``None`` when the fill is not a descendant of the slider (chain
+    hits a root, a missing fileID, or a cycle) so the writer abstains. The
+    loop is bounded by ``len(node_index)`` to defeat a pathological cycle.
+
+    Pure: reads ``node_index`` / ``slider_node`` only, mutates nothing.
+    """
+    fill_node = node_index.get(fill_go_fid)
+    if fill_node is None:
+        return None
+    segments: list[str] = []
+    current: SceneNode | None = fill_node
+    # Bound the walk so a corrupt parent chain (cycle) can't loop forever.
+    for _ in range(len(node_index) + 1):
+        if current is None:
+            return None
+        if current.file_id == slider_node.file_id:
+            # Reached the slider without ever recording it -> path is the
+            # collected descendant segments. Empty means fill IS the slider.
+            if not segments:
+                return None
+            return "/".join(segments)
+        segments.insert(0, current.name)
+        parent_fid = current.parent_file_id
+        current = node_index.get(parent_fid) if parent_fid is not None else None
+    return None
+
+
 def build_component_domain_index(
     roots: list[SceneNode], module_domains: dict[str, str],
 ) -> dict[str, str]:
@@ -299,6 +341,7 @@ def convert_canvas(
     scene_runtime_mode: str = "legacy",
     suppress_static_children_ids: frozenset[str] | None = None,
     component_owner_index: dict[str, str] | None = None,
+    node_index: dict[str, SceneNode] | None = None,
     toggle_bindings: list[ToggleBinding] | None = None,
     click_bindings: list[ClickBinding] | None = None,
     unsupported_click_bindings: list[UnsupportedClickBinding] | None = None,
@@ -385,6 +428,7 @@ def convert_canvas(
                     suppress_ids if suppression_active else frozenset()
                 ),
                 component_owner_index=component_owner_index,
+                node_index=node_index,
                 toggle_bindings=toggle_bindings,
                 click_bindings=click_bindings,
                 unsupported_click_bindings=unsupported_click_bindings,
@@ -491,6 +535,7 @@ def _convert_ui_element(
     node: SceneNode, scene_namespace: str = "",
     suppress_static_children_ids: frozenset[str] = frozenset(),
     component_owner_index: dict[str, str] | None = None,
+    node_index: dict[str, SceneNode] | None = None,
     toggle_bindings: list[ToggleBinding] | None = None,
     click_bindings: list[ClickBinding] | None = None,
     unsupported_click_bindings: list[UnsupportedClickBinding] | None = None,
@@ -649,8 +694,20 @@ def _convert_ui_element(
     # attributes so runtime scripts can read them.
     for comp in node.components:
         ct = comp.component_type
-        if ct == "Slider":
-            _apply_slider_properties(element, comp.properties)
+        if ct == "Slider" or (
+            comp.component_type == "MonoBehaviour" and "m_FillRect" in comp.properties
+        ):
+            # Unity serializes a UI Slider as a MonoBehaviour (m_Script GUID),
+            # never a literal "Slider" component_type — identify it by its
+            # defining ``m_FillRect`` field (mirrors the Toggle ``m_IsOn``
+            # heuristic below). The bare ``ct == "Slider"`` form is dead on
+            # real scenes (kept as a harmless OR for synthetic fixtures).
+            _apply_slider_properties(
+                element, comp.properties,
+                node=node,
+                component_owner_index=component_owner_index,
+                node_index=node_index,
+            )
         elif ct in ("InputField", "TMP_InputField"):
             _apply_inputfield_properties(element, comp.properties)
         elif ct in ("Dropdown", "TMP_Dropdown"):
@@ -696,6 +753,7 @@ def _convert_ui_element(
             child_node, scene_namespace,
             suppress_static_children_ids=suppress_static_children_ids,
             component_owner_index=component_owner_index,
+            node_index=node_index,
             toggle_bindings=toggle_bindings,
             click_bindings=click_bindings,
             unsupported_click_bindings=unsupported_click_bindings,
@@ -1005,8 +1063,25 @@ def _apply_scroll_properties(element: RbxUIElement, props: dict[str, Any]) -> No
     element.attributes["_ScrollVertical"] = bool(int(vertical))
 
 
-def _apply_slider_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
-    """Extract Slider properties as attributes for runtime scripts."""
+def _apply_slider_properties(
+    element: RbxUIElement,
+    props: dict[str, Any],
+    *,
+    node: SceneNode | None = None,
+    component_owner_index: dict[str, str] | None = None,
+    node_index: dict[str, SceneNode] | None = None,
+) -> None:
+    """Extract Slider properties as attributes for runtime scripts.
+
+    In addition to the value/direction attributes, resolves the Unity
+    ``m_FillRect`` (a RectTransform component ref) to its owning GameObject
+    and records the ``/``-separated relative descendant path from the slider
+    Frame to that fill element as the ``SliderFillElement`` attribute. The
+    runtime ``setSliderValue`` resolves the fill by this path instead of
+    guessing a child name. Abstains (no ``SliderFillElement``) when the fill
+    ref is missing / unresolvable / not a descendant, or when the resolution
+    indices are unavailable (legacy / synthetic callers).
+    """
     for key in ("m_MinValue", "m_MaxValue", "m_Value", "m_WholeNumbers"):
         val = props.get(key)
         if val is not None:
@@ -1021,6 +1096,28 @@ def _apply_slider_properties(element: RbxUIElement, props: dict[str, Any]) -> No
         element.attributes["SliderDirection"] = int(direction)
     except (TypeError, ValueError):
         pass
+
+    # Resolve the fill element by the serialized ``m_FillRect`` ref so the
+    # runtime never guesses the child name. Abstain (no attribute) on any
+    # break in the chain.
+    fill_rect = props.get("m_FillRect")
+    if not isinstance(fill_rect, dict):
+        return
+    fill_comp_fid = fill_rect.get("fileID")
+    if fill_comp_fid is None:
+        return
+    fill_comp_fid = str(fill_comp_fid)
+    if not fill_comp_fid or fill_comp_fid == "0":
+        return
+    if node is None or component_owner_index is None or node_index is None:
+        return
+    fill_go_fid = component_owner_index.get(fill_comp_fid)
+    if not fill_go_fid:
+        return
+    path = _relative_fill_path(node, fill_go_fid, node_index)
+    if path is None:
+        return
+    element.attributes["SliderFillElement"] = path
 
 
 def _apply_inputfield_properties(element: RbxUIElement, props: dict[str, Any]) -> None:

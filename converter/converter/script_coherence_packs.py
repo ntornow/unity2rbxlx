@@ -5196,3 +5196,192 @@ def _fix_fps_camera_yaw_from_player_pivot(scripts: list["RbxScript"]) -> int:
                 s.name, len(edits), ", ".join(obj for _, obj in edits),
             )
     return fixes
+
+
+# ---------------------------------------------------------------------------
+# slider_fill_path_resize — rewrite the HUD's guessed-fill ``setSliderValue``
+# to resolve the converter-emitted ``SliderFillElement`` relative path, fail
+# loud (no guessed-name fallback), and resize the fill anchor/direction-aware.
+# ---------------------------------------------------------------------------
+
+# The guessed-fill anchor tokens (any one identifies the buggy body shape).
+_SLIDER_GUESS_FILL_SIGS = (
+    'slider:FindFirstChild("Fill")',
+    'FindFirstChild("Bar")',
+    'FindFirstChild("Foreground")',
+)
+# Idempotency / rewritten marker — the canonical body contains this; the
+# guessed-fill body never does, so detect/apply gate on its ABSENCE.
+_SLIDER_REWRITTEN_SIG = 'slider:GetAttribute("SliderFillElement")'
+
+# The path-aware, fail-loud, anchor/direction-aware replacement body. Generic:
+# reads ``SliderFillElement``/``SliderDirection`` off the slider Frame; no
+# hardcoded child names. Treats the incoming value as a [0,1] fraction (clamp),
+# matching the original guessed body and the AI call site (``cur / max``).
+_CANONICAL_SLIDER_SETTER = '''local function setSliderValue(slider, percentage)
+\tif not slider then return end
+\tslider:SetAttribute("value", percentage)
+
+\t-- Resolve the fill by the converter-emitted relative descendant path.
+\t-- FAIL LOUD: no guessed-name fallback (that fallback IS the original bug).
+\tlocal path = slider:GetAttribute("SliderFillElement")
+\tif type(path) ~= "string" or path == "" then
+\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' has no SliderFillElement attribute; fill not resized")
+\t\treturn
+\tend
+\tlocal fill = slider
+\tfor segment in string.gmatch(path, "[^/]+") do
+\t\tfill = fill and fill:FindFirstChild(segment)
+\tend
+\tif not (fill and fill:IsA("GuiObject")) then
+\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' did not resolve to a GuiObject")
+\t\treturn
+\tend
+
+\t-- Treat the incoming value as a normalized [0,1] fraction and clamp. We do
+\t-- NOT re-normalize by Min/Max: a conditional (t-min)/(max-min) gated on
+\t-- t>1||t<0 mis-renders sliders whose raw domain overlaps [0,1].
+\tlocal t = math.clamp(percentage, 0, 1)
+
+\t-- Anchor/direction-aware Size authoring. The converted fill has Size=(0,0,0,0)
+\t-- and NO AnchorPoint, so author a COMPLETE UDim2 (full cross-axis, scaled
+\t-- main axis) rather than mutating one axis of a zero Size.
+\tlocal dir = slider:GetAttribute("SliderDirection") or 0  -- 0 LTR,1 RTL,2 BTT,3 TTB
+\tif dir == 2 or dir == 3 then
+\t\tfill.Size = UDim2.new(1, 0, t, 0)           -- vertical: scale height
+\t\tif dir == 3 then                             -- TopToBottom: drain from top
+\t\t\tfill.AnchorPoint = Vector2.new(0, 0)
+\t\t\tfill.Position = UDim2.new(0, 0, 0, 0)
+\t\telse                                         -- BottomToTop: drain from bottom
+\t\t\tfill.AnchorPoint = Vector2.new(0, 1)
+\t\t\tfill.Position = UDim2.new(0, 0, 1, 0)
+\t\tend
+\telse
+\t\tfill.Size = UDim2.new(t, 0, 1, 0)           -- horizontal: scale width
+\t\tif dir == 1 then                             -- RightToLeft: drain from right
+\t\t\tfill.AnchorPoint = Vector2.new(1, 0)
+\t\t\tfill.Position = UDim2.new(1, 0, 0, 0)
+\t\telse                                         -- LeftToRight: drain from left
+\t\t\tfill.AnchorPoint = Vector2.new(0, 0)
+\t\t\tfill.Position = UDim2.new(0, 0, 0, 0)
+\t\tend
+\tend
+end'''
+
+
+def _has_guessed_fill(src: str) -> bool:
+    """True if ``src`` contains any guessed-fill anchor token."""
+    return any(sig in src for sig in _SLIDER_GUESS_FILL_SIGS)
+
+
+def _free_function_setter_start(src: str) -> int:
+    """Index of a FREE-FUNCTION ``setSliderValue`` definition start, or -1.
+
+    Covers ``local function setSliderValue`` and ``function setSliderValue``.
+    The apply rewrites ONLY this form, because the canonical replacement body
+    is itself a free function — splicing it over a method-form definition
+    (``function T:setSliderValue``) would break the call contract. A
+    method-form guessed-fill HUD is therefore left for the coverage guard to
+    flag LOUDLY rather than silently mangled.
+    """
+    for anchor in (
+        "local function setSliderValue",
+        "function setSliderValue",
+    ):
+        i = src.find(anchor)
+        if i != -1:
+            return i
+    return -1
+
+
+def _has_slider_setter(src: str) -> bool:
+    """True if ``src`` defines a ``setSliderValue`` in ANY form — free-function
+    (``[local ]function setSliderValue``) OR method (``:setSliderValue``).
+
+    The broadened helper-name anchor shared by the detector and the coverage
+    guard so a method-form HUD is never silently skipped by both.
+    """
+    return (
+        _free_function_setter_start(src) != -1
+        or ":setSliderValue" in src
+    )
+
+
+def _detect_slider_fill_resize(scripts: list["RbxScript"]) -> bool:
+    """Fire when any script defines a guessed-fill ``setSliderValue`` that has
+    not yet been rewritten (free-function OR method form)."""
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _has_slider_setter(src)
+            and _SLIDER_REWRITTEN_SIG not in src
+            and _has_guessed_fill(src)
+        ):
+            return True
+    return False
+
+
+def _guard_slider_fill_coverage(scripts: list["RbxScript"]) -> None:
+    """LOUD non-fire detector. The deterministic upstream signal is a script
+    defining a guessed-fill ``setSliderValue``. If after the pack any such body
+    remains un-rewritten (the AI reshaped the helper enough that the
+    span/identity gate abstained), ``log.warning`` so the silent-abstain is
+    observable rather than shipping a frozen bar.
+
+    Shares the broadened helper-name anchor (free-function AND method form) so
+    a method-form guessed-fill HUD the rewrite missed is LOUDLY flagged, never
+    silently skipped by both."""
+    for s in scripts:
+        src = s.source or ""
+        if not _has_slider_setter(src):
+            continue
+        if _SLIDER_REWRITTEN_SIG in src:
+            continue  # covered (rewritten)
+        if _has_guessed_fill(src):
+            log.warning(
+                "[slider_fill_path_resize] '%s' has a guessed-fill "
+                "setSliderValue the pack did not rewrite (shape drifted); "
+                "slider bar will stay frozen. Inspect the emitted "
+                "setSliderValue.", s.name,
+            )
+
+
+@patch_pack(
+    name="slider_fill_path_resize",
+    description="Rewrite the HUD's guessed-fill setSliderValue to resolve the "
+    "converter-emitted SliderFillElement relative path, fail loud, and resize "
+    "the fill anchor/direction-aware.",
+    detect=_detect_slider_fill_resize,
+)
+def _fix_slider_fill_resize(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if _SLIDER_REWRITTEN_SIG in src:
+            continue  # already rewritten — idempotent
+        start = _free_function_setter_start(src)
+        if start == -1:
+            continue
+        # Function span: from the definition start to its first column-0
+        # ``\nend`` (the function close; inline guards keep their ``end``
+        # mid-line). Same span technique as ``door_player_flag_location``.
+        close = src.find("\nend", start)
+        if close == -1:
+            continue
+        end_idx = close + len("\nend")
+        body = src[start:end_idx]
+        # Identity gate on the GUESSED-FILL shape: only rewrite a body that
+        # actually guesses the fill name; abstain on any other setSliderValue
+        # shape so a future reshape is flagged by the coverage guard, not
+        # silently mangled.
+        if not _has_guessed_fill(body):
+            continue
+        s.source = src[:start] + _CANONICAL_SLIDER_SETTER + src[end_idx:]
+        fixes += 1
+        log.info(
+            "  Rewrote setSliderValue in '%s' to path-aware fail-loud resize",
+            s.name,
+        )
+    # Coverage guard runs on the post-rewrite scripts.
+    _guard_slider_fill_coverage(scripts)
+    return fixes

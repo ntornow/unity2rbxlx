@@ -1691,6 +1691,7 @@ def convert_scene(
             scene_runtime_mode=scene_runtime_mode,
             suppress_static_children_ids=ui_suppress_ids,
             component_owner_index=component_owner_index,
+            node_index=parsed_scene.all_nodes,
             toggle_bindings=toggle_bindings,
             click_bindings=click_bindings,
             unsupported_click_bindings=unsupported_click_bindings,
