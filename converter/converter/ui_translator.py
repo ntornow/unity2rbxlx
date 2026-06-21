@@ -269,6 +269,14 @@ def _relative_fill_path(
             if not segments:
                 return None
             return "/".join(segments)
+        # Un-encodable segment: an empty name or a name containing the path
+        # separator cannot round-trip through the "/"-joined encoding (the
+        # reader's gmatch("[^/]+") would silently skip an empty segment or
+        # split a "/"-bearing name into fakes, mis-resolving to the wrong
+        # element). Abstain (writer emits no SliderFillElement) so the reader
+        # fails loud rather than mis-resolving.
+        if current.name == "" or "/" in current.name:
+            return None
         segments.insert(0, current.name)
         parent_fid = current.parent_file_id
         current = node_index.get(parent_fid) if parent_fid is not None else None

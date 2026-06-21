@@ -4132,7 +4132,8 @@ class TestSliderFillPathResize:
         n = run_packs([s])
         assert n >= 1
         assert 'slider:GetAttribute("SliderFillElement")' in s.source
-        assert 'string.gmatch(path, "[^/]+")' in s.source
+        # Fail-loud segment walk (no silent gmatch skip of empty segments).
+        assert 'string.find(path, "/", cursor, true)' in s.source
         assert "warn(" in s.source
         # Four-direction Size authoring present.
         assert "UDim2.new(t, 0, 1, 0)" in s.source
@@ -4154,9 +4155,13 @@ class TestSliderFillPathResize:
     def test_injected_reader_has_segment_walk(self) -> None:
         s = self._hud_script()
         run_packs([s])
-        # The grandchild path resolve is a gmatch segment walk over FindFirstChild.
-        assert 'for segment in string.gmatch(path, "[^/]+") do' in s.source
+        # The grandchild path resolve is a fail-loud segment walk over
+        # FindFirstChild (split on "/" keeping empty segments so a malformed
+        # path warns rather than silently skipping).
+        assert 'local nextSlash = string.find(path, "/", cursor, true)' in s.source
         assert "fill = fill and fill:FindFirstChild(segment)" in s.source
+        # Empty-segment guard fails loud rather than mis-resolving.
+        assert 'if segment == "" then' in s.source
 
     # --- Criterion 8: coverage guard flags a non-fire. ---
     def test_guard_flags_unrewritten_guessed_fill(self, caplog) -> None:
@@ -4277,3 +4282,68 @@ class TestSliderFillPathResize:
         s = self._hud_script()
         run_packs([s])
         assert packs_module._CANONICAL_SLIDER_SETTER in s.source
+
+    # --- FIX 2: per-direction drain-edge AnchorPoint/Position asserts. ---
+    def test_canonical_setter_emits_correct_per_direction_anchor(self) -> None:
+        """Pin acceptance edge-case #4: each SliderDirection branch emits the
+        CORRECT AnchorPoint/Position/Size so a hand-edit desyncing one
+        direction from the others fails a unit test (not just /e2e).
+
+        LTR(0): AnchorPoint(0,0) + Position(0,0,0,0) + Size(t,0,1,0)
+        RTL(1): AnchorPoint(1,0) + Position(1,0,0,0) + Size(t,0,1,0)
+        BTT(2): AnchorPoint(0,1) + Position(0,0,1,0) + Size(1,0,t,0)
+        TTB(3): AnchorPoint(0,0) + Position(0,0,0,0) + Size(1,0,t,0)
+        """
+        s = self._hud_script()
+        run_packs([s])
+        src = s.source
+        # Horizontal main-axis Size (LTR/RTL) and vertical (BTT/TTB).
+        assert "fill.Size = UDim2.new(t, 0, 1, 0)" in src
+        assert "fill.Size = UDim2.new(1, 0, t, 0)" in src
+        # LTR(0) — anchor/position at the left edge (drain from left).
+        # TTB(3) shares the same anchor/position pair; assert both lines exist.
+        assert "fill.AnchorPoint = Vector2.new(0, 0)" in src
+        assert "fill.Position = UDim2.new(0, 0, 0, 0)" in src
+        # RTL(1) — anchor/position at the right edge (drain from right).
+        assert "fill.AnchorPoint = Vector2.new(1, 0)" in src
+        assert "fill.Position = UDim2.new(1, 0, 0, 0)" in src
+        # BTT(2) — anchor/position at the bottom edge (drain from bottom).
+        assert "fill.AnchorPoint = Vector2.new(0, 1)" in src
+        assert "fill.Position = UDim2.new(0, 0, 1, 0)" in src
+
+    # --- FIX 3: two distinct guessed free-function setters in one file. ---
+    def test_two_free_function_setters_both_rewritten(self) -> None:
+        """Two distinct guessed-fill free-function setSliderValue definitions in
+        ONE file: BOTH are rewritten by the per-setter left-to-right span walk,
+        and a second run_packs is idempotent (0 fixes, byte-identical)."""
+        setter_a = self.REAL_GUESSED_SETTER
+        # A second, syntactically-distinct guessed-fill free-function setter
+        # (different inner shape, still guesses "Bar").
+        setter_b = (
+            "local function setSliderValue(slider, percentage)\n"
+            "\tif not slider then return end\n"
+            '\tlocal fill = slider:FindFirstChild("Bar")\n'
+            "\tif fill then\n"
+            "\t\tfill.Size = UDim2.new(percentage, 0, 1, 0)\n"
+            "\tend\n"
+            "end\n"
+        )
+        src = (
+            "local Players = game:GetService(\"Players\")\n\n"
+            + setter_a
+            + "\n"
+            + setter_b
+        )
+        s = RbxScript(name="HudControl", source=src, script_type="LocalScript")
+        n = run_packs([s])
+        # Both guessed setters rewritten -> two canonical-constant copies.
+        assert n >= 2
+        assert s.source.count('slider:GetAttribute("SliderFillElement")') == 2
+        # No guessed-fill anchor survives.
+        assert 'FindFirstChild("Fill")' not in s.source
+        assert 'FindFirstChild("Bar")' not in s.source
+        # Idempotent second pass.
+        after_first = s.source
+        second = run_packs([s])
+        assert second == 0
+        assert s.source == after_first

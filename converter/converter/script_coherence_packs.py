@@ -5229,9 +5229,31 @@ _CANONICAL_SLIDER_SETTER = '''local function setSliderValue(slider, percentage)
 \t\twarn("[setSliderValue] slider '" .. slider.Name .. "' has no SliderFillElement attribute; fill not resized")
 \t\treturn
 \tend
+\t-- Walk the slash-separated path. FAIL LOUD on a malformed path: split on
+\t-- "/" keeping EMPTY segments (a leading/trailing/double slash means an
+\t-- un-encodable intermediate name leaked through) and bail rather than let
+\t-- gmatch("[^/]+") silently skip the empty segment and mis-resolve.
 \tlocal fill = slider
-\tfor segment in string.gmatch(path, "[^/]+") do
+\tlocal cursor = 1
+\twhile cursor <= #path + 1 do
+\t\tlocal nextSlash = string.find(path, "/", cursor, true)
+\t\tlocal segment
+\t\tif nextSlash then
+\t\t\tsegment = string.sub(path, cursor, nextSlash - 1)
+\t\t\tcursor = nextSlash + 1
+\t\telse
+\t\t\tsegment = string.sub(path, cursor)
+\t\t\tcursor = #path + 2
+\t\tend
+\t\tif segment == "" then
+\t\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' has an empty segment; fill not resized")
+\t\t\treturn
+\t\tend
 \t\tfill = fill and fill:FindFirstChild(segment)
+\t\tif not fill then
+\t\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' did not resolve (segment '" .. segment .. "')")
+\t\t\treturn
+\t\tend
 \tend
 \tif not (fill and fill:IsA("GuiObject")) then
 \t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' did not resolve to a GuiObject")

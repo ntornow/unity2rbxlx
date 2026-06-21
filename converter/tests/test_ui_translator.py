@@ -1816,3 +1816,25 @@ class TestSliderFillElement:
         node_index = {"health": slider}
         # The fill GO IS the slider -> no descendant segments -> None.
         assert _relative_fill_path(slider, "health", node_index) is None
+
+    # --- FIX 4 (pins FIX 1): un-encodable segment names -> abstain (None). ---
+    def test_relative_fill_path_empty_intermediate_name_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        # An intermediate GameObject with an EMPTY name can't round-trip the
+        # "/"-joined encoding (the reader would skip the empty segment and
+        # mis-resolve), so the writer must abstain rather than emit "/CurHealth".
+        slider = self._node("Health", file_id="health")
+        back = self._node("", file_id="back", parent_file_id="health")
+        fill = self._node("CurHealth", file_id="cur", parent_file_id="back")
+        node_index = {"health": slider, "back": back, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) is None
+
+    def test_relative_fill_path_slash_in_name_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        # A segment name containing "/" would split into fake segments; abstain.
+        slider = self._node("Health", file_id="health")
+        fill = self._node("Cur/Health", file_id="cur", parent_file_id="health")
+        node_index = {"health": slider, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) is None
