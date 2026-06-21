@@ -119,8 +119,13 @@ cat >"$PLIST" <<EOF
     <string>$RUNNER_DIR/runner.err.log</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- HOME/.local/bin is where the claude CLI installs. The cold-e2e
+             nightly's AI-on convert has no ANTHROPIC_API_KEY, so the claude CLI
+             is its only AI backend; omitting this dir makes the convert run with
+             zero AI transpiles and ship an all-stub conversion. Keep it first so
+             a user-local claude shadows any system one. -->
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>$HOME</string>
     </dict>
